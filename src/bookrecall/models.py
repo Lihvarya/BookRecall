@@ -42,6 +42,7 @@ class EntityMention:
 class EntityRecord:
     name: str
     first_chapter_number: int
+    aliases: list[str] = field(default_factory=list)
     mentions: list[EntityMention] = field(default_factory=list)
 
 
@@ -54,3 +55,32 @@ class SearchHit:
     child_text: str
     parent_text: str
 
+
+@dataclass(slots=True)
+class BookInfo:
+    book_id: str
+    title: str
+    source_path: str
+    chapter_count: int
+    entity_count: int
+
+
+@dataclass(slots=True)
+class EvidenceCard:
+    chapter_number: int
+    chapter_title: str
+    excerpt: str
+    reason: str
+
+
+@dataclass(slots=True)
+class MemoryCard:
+    question: str
+    intent: str
+    answer: str
+    progress_chapter: int
+    spoiler_blocked: bool = False
+    entity_name: str | None = None
+    summary: str | None = None
+    evidence: list[EvidenceCard] = field(default_factory=list)
+    suggestions: list[str] = field(default_factory=list)

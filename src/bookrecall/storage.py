@@ -1,7 +1,7 @@
 import sqlite3
 from pathlib import Path
 
-from .models import Chapter, ChildChunk, EntityRecord, ParentChunk
+from .models import BookInfo, Chapter, ChildChunk, EntityRecord, ParentChunk
 
 
 def _normalize_entity_name(name: str) -> str:
@@ -25,6 +25,8 @@ class BookRecallStore:
                 book_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 source_path TEXT,
+                chapter_count INTEGER NOT NULL DEFAULT 0,
+                entity_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -74,6 +76,23 @@ class BookRecallStore:
                 position_in_chapter INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS entity_aliases (
+                alias_id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                book_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chapter_summaries (
+                summary_id TEXT PRIMARY KEY,
+                book_id TEXT NOT NULL,
+                chapter_number INTEGER NOT NULL,
+                chapter_title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                UNIQUE(book_id, chapter_number)
+            );
+
             CREATE TABLE IF NOT EXISTS reader_state (
                 book_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
@@ -83,7 +102,15 @@ class BookRecallStore:
             );
             """
         )
+        self._ensure_column("books", "chapter_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("books", "entity_count", "INTEGER NOT NULL DEFAULT 0")
         self.connection.commit()
+
+    def _ensure_column(self, table_name: str, column_name: str, ddl: str) -> None:
+        rows = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        existing_columns = {row["name"] for row in rows}
+        if column_name not in existing_columns:
+            self.connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
     def replace_book(
         self,
@@ -97,11 +124,19 @@ class BookRecallStore:
         entity_records: list[EntityRecord],
     ) -> None:
         cursor = self.connection.cursor()
-        cursor.execute("INSERT OR REPLACE INTO books(book_id, title, source_path) VALUES (?, ?, ?)", (book_id, title, source_path))
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO books(book_id, title, source_path, chapter_count, entity_count)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (book_id, title, source_path, len(chapters), len(entity_records)),
+        )
         cursor.execute("DELETE FROM chapters WHERE book_id = ?", (book_id,))
         cursor.execute("DELETE FROM parent_chunks WHERE book_id = ?", (book_id,))
         cursor.execute("DELETE FROM child_chunks WHERE book_id = ?", (book_id,))
         cursor.execute("DELETE FROM entity_mentions WHERE book_id = ?", (book_id,))
+        cursor.execute("DELETE FROM entity_aliases WHERE book_id = ?", (book_id,))
+        cursor.execute("DELETE FROM chapter_summaries WHERE book_id = ?", (book_id,))
         cursor.execute("DELETE FROM entities WHERE book_id = ?", (book_id,))
 
         cursor.executemany(
@@ -156,6 +191,23 @@ class BookRecallStore:
             ],
         )
 
+        cursor.executemany(
+            """
+            INSERT INTO chapter_summaries(summary_id, book_id, chapter_number, chapter_title, summary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    f"{book_id}:summary:{chapter.number}",
+                    book_id,
+                    chapter.number,
+                    chapter.title,
+                    _chapter_summary(chapter.content),
+                )
+                for chapter in chapters
+            ],
+        )
+
         for record in entity_records:
             entity_id = f"{book_id}:entity:{_normalize_entity_name(record.name)}"
             cursor.execute(
@@ -189,8 +241,62 @@ class BookRecallStore:
                     for index, mention in enumerate(record.mentions, start=1)
                 ],
             )
+            cursor.executemany(
+                """
+                INSERT INTO entity_aliases(alias_id, entity_id, book_id, alias, normalized_alias)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        f"{entity_id}:alias:{index}",
+                        entity_id,
+                        book_id,
+                        alias,
+                        _normalize_entity_name(alias),
+                    )
+                    for index, alias in enumerate(record.aliases, start=1)
+                ],
+            )
 
         self.connection.commit()
+
+    def list_books(self) -> list[BookInfo]:
+        rows = self.connection.execute(
+            """
+            SELECT book_id, title, source_path, chapter_count, entity_count
+            FROM books
+            ORDER BY created_at DESC, book_id ASC
+            """
+        ).fetchall()
+        return [
+            BookInfo(
+                book_id=row["book_id"],
+                title=row["title"],
+                source_path=row["source_path"] or "",
+                chapter_count=int(row["chapter_count"]),
+                entity_count=int(row["entity_count"]),
+            )
+            for row in rows
+        ]
+
+    def get_book(self, book_id: str) -> BookInfo | None:
+        row = self.connection.execute(
+            """
+            SELECT book_id, title, source_path, chapter_count, entity_count
+            FROM books
+            WHERE book_id = ?
+            """,
+            (book_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return BookInfo(
+            book_id=row["book_id"],
+            title=row["title"],
+            source_path=row["source_path"] or "",
+            chapter_count=int(row["chapter_count"]),
+            entity_count=int(row["entity_count"]),
+        )
 
     def list_entities(self, book_id: str) -> list[str]:
         rows = self.connection.execute(
@@ -199,15 +305,87 @@ class BookRecallStore:
         ).fetchall()
         return [row["name"] for row in rows]
 
+    def list_entities_with_aliases(self, book_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT
+                e.name,
+                e.first_chapter_number,
+                e.mention_count,
+                COALESCE(group_concat(a.alias, '、'), '') AS aliases
+            FROM entities e
+            LEFT JOIN entity_aliases a ON e.entity_id = a.entity_id
+            WHERE e.book_id = ?
+            GROUP BY e.entity_id, e.name, e.first_chapter_number, e.mention_count
+            ORDER BY e.first_chapter_number ASC, length(e.name) DESC, e.name ASC
+            """,
+            (book_id,),
+        ).fetchall()
+
     def get_entity(self, book_id: str, entity_name: str) -> sqlite3.Row | None:
+        normalized = _normalize_entity_name(entity_name)
         return self.connection.execute(
             """
             SELECT entity_id, name, first_chapter_number, mention_count
             FROM entities
             WHERE book_id = ? AND normalized_name = ?
             """,
-            (book_id, _normalize_entity_name(entity_name)),
+            (book_id, normalized),
         ).fetchone()
+
+    def resolve_entity_name(self, book_id: str, raw_name: str) -> str | None:
+        normalized = _normalize_entity_name(raw_name)
+        direct = self.connection.execute(
+            "SELECT name FROM entities WHERE book_id = ? AND normalized_name = ?",
+            (book_id, normalized),
+        ).fetchone()
+        if direct is not None:
+            return str(direct["name"])
+        alias = self.connection.execute(
+            """
+            SELECT e.name
+            FROM entity_aliases a
+            JOIN entities e ON a.entity_id = e.entity_id
+            WHERE a.book_id = ? AND a.normalized_alias = ?
+            """,
+            (book_id, normalized),
+        ).fetchone()
+        return None if alias is None else str(alias["name"])
+
+    def match_entity_candidates(self, book_id: str, text: str) -> list[str]:
+        matches: list[str] = []
+        entity_rows = self.connection.execute(
+            "SELECT name FROM entities WHERE book_id = ? ORDER BY length(name) DESC, name ASC",
+            (book_id,),
+        ).fetchall()
+        for row in entity_rows:
+            name = str(row["name"])
+            if name in text and name not in matches:
+                matches.append(name)
+
+        alias_rows = self.connection.execute(
+            """
+            SELECT alias, entity_id
+            FROM entity_aliases
+            WHERE book_id = ?
+            ORDER BY length(alias) DESC, alias ASC
+            """,
+            (book_id,),
+        ).fetchall()
+        for row in alias_rows:
+            alias = str(row["alias"])
+            if alias not in text:
+                continue
+            canonical = self.connection.execute(
+                "SELECT name FROM entities WHERE entity_id = ?",
+                (row["entity_id"],),
+            ).fetchone()
+            if canonical is None:
+                continue
+            canonical_name = str(canonical["name"])
+            if canonical_name not in matches:
+                matches.append(canonical_name)
+        return matches
 
     def get_entity_mentions(
         self,
@@ -268,3 +446,22 @@ class BookRecallStore:
         ).fetchone()
         return int(row["max_chapter"])
 
+    def get_chapter_summaries(self, book_id: str, max_chapter: int | None = None) -> list[sqlite3.Row]:
+        query = """
+            SELECT chapter_number, chapter_title, summary
+            FROM chapter_summaries
+            WHERE book_id = ?
+        """
+        params: list[object] = [book_id]
+        if max_chapter is not None:
+            query += " AND chapter_number <= ?"
+            params.append(max_chapter)
+        query += " ORDER BY chapter_number ASC"
+        return self.connection.execute(query, params).fetchall()
+
+
+def _chapter_summary(text: str, max_chars: int = 140) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip() + "..."

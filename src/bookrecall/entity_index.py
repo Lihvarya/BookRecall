@@ -11,37 +11,52 @@ AUTO_ENTITY_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-def load_entity_lexicon(path: str | None) -> list[str]:
+def load_entity_lexicon(path: str | None) -> dict[str, list[str]]:
     if not path:
-        return []
+        return {}
     entity_file = Path(path)
     if not entity_file.exists():
-        return []
-    entities: list[str] = []
+        return {}
+    entities: dict[str, list[str]] = {}
     for line in entity_file.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
-            entities.append(stripped)
+            if "|" in stripped:
+                canonical, alias_blob = stripped.split("|", 1)
+                aliases = [alias.strip() for alias in re.split(r"[,，]", alias_blob) if alias.strip()]
+                entities[canonical.strip()] = aliases
+            else:
+                entities[stripped] = []
     return entities
 
 
-def auto_discover_entities(text: str) -> list[str]:
+def auto_discover_entities(text: str) -> dict[str, list[str]]:
     found: set[str] = set()
     for pattern in AUTO_ENTITY_PATTERNS:
         for match in pattern.finditer(text):
             candidate = match.group(1).strip()
             if 1 < len(candidate) <= 20:
                 found.add(candidate)
-    return sorted(found, key=lambda item: (-len(item), item))
+    ordered = sorted(found, key=lambda item: (-len(item), item))
+    return {item: [] for item in ordered}
 
 
 def build_entity_records(
     chapters: list[Chapter],
-    entities: list[str],
+    entities: dict[str, list[str]] | list[str],
     settings: ChunkSettings,
 ) -> list[EntityRecord]:
     records: list[EntityRecord] = []
-    unique_entities = sorted({name.strip() for name in entities if name.strip()}, key=lambda item: (-len(item), item))
+    if isinstance(entities, dict):
+        entity_map = {
+            name.strip(): [alias.strip() for alias in aliases if alias.strip()]
+            for name, aliases in entities.items()
+            if name.strip()
+        }
+    else:
+        entity_map = {name.strip(): [] for name in entities if name.strip()}
+
+    unique_entities = sorted(entity_map, key=lambda item: (-len(item), item))
 
     for entity_name in unique_entities:
         mentions: list[EntityMention] = []
@@ -63,10 +78,10 @@ def build_entity_records(
             records.append(
                 EntityRecord(
                     name=entity_name,
+                    aliases=entity_map.get(entity_name, []),
                     first_chapter_number=mentions[0].chapter_number,
                     mentions=mentions,
                 )
             )
 
     return records
-

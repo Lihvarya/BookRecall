@@ -7,6 +7,7 @@ from .config import DEFAULT_CHUNK_SETTINGS
 from .entity_index import auto_discover_entities, build_entity_records, load_entity_lexicon
 from .parser import parse_chapters
 from .storage import BookRecallStore
+from .web import run_server
 
 
 def build_index(args: argparse.Namespace) -> None:
@@ -48,7 +49,7 @@ def ask_question(args: argparse.Namespace) -> None:
     try:
         store.initialize()
         agent = BookRecallAgent(store)
-        answer = agent.ask(
+        card = agent.ask_card(
             book_id=args.book_id,
             question=args.question,
             user_id=args.user,
@@ -56,7 +57,10 @@ def ask_question(args: argparse.Namespace) -> None:
         )
     finally:
         store.close()
-    print(answer)
+    if args.format == "json":
+        print(agent.render_json(card))
+    else:
+        print(agent.render_text(card))
 
 
 def set_progress(args: argparse.Namespace) -> None:
@@ -82,6 +86,45 @@ def show_progress(args: argparse.Namespace) -> None:
     print(f"用户 {args.user} 在 {args.book_id} 的阅读进度：第 {progress} 章。")
 
 
+def list_books(args: argparse.Namespace) -> None:
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        books = store.list_books()
+    finally:
+        store.close()
+    if not books:
+        print("当前还没有任何已建索引的书籍。")
+        return
+    for book in books:
+        print(
+            f"- {book.book_id} | {book.title} | 章节 {book.chapter_count} | "
+            f"实体 {book.entity_count} | {book.source_path}"
+        )
+
+
+def list_entities(args: argparse.Namespace) -> None:
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        rows = store.list_entities_with_aliases(args.book_id)
+    finally:
+        store.close()
+    if not rows:
+        print("当前这本书还没有实体索引。")
+        return
+    for row in rows:
+        alias_text = f" | 别名：{row['aliases']}" if row["aliases"] else ""
+        print(
+            f"- {row['name']} | 首次出现：第 {row['first_chapter_number']} 章 | "
+            f"提及次数：{row['mention_count']}{alias_text}"
+        )
+
+
+def serve_web(args: argparse.Namespace) -> None:
+    run_server(args.host, args.port, args.db)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BookRecall 阅读记忆助手 MVP")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -101,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
     ask_parser_cmd.add_argument("--user", default="default", help="用户 ID")
     ask_parser_cmd.add_argument("--progress", type=int, help="临时覆盖阅读进度章节号")
+    ask_parser_cmd.add_argument("--format", choices=("text", "json"), default="text", help="回答输出格式")
     ask_parser_cmd.set_defaults(func=ask_question)
 
     set_progress_cmd = subparsers.add_parser("set-progress", help="保存阅读进度")
@@ -116,6 +160,21 @@ def build_parser() -> argparse.ArgumentParser:
     show_progress_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
     show_progress_cmd.set_defaults(func=show_progress)
 
+    list_books_cmd = subparsers.add_parser("list-books", help="列出已建索引的书籍")
+    list_books_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    list_books_cmd.set_defaults(func=list_books)
+
+    list_entities_cmd = subparsers.add_parser("list-entities", help="列出一本书的实体索引")
+    list_entities_cmd.add_argument("--book-id", required=True, help="书籍唯一 ID")
+    list_entities_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    list_entities_cmd.set_defaults(func=list_entities)
+
+    serve_cmd = subparsers.add_parser("serve", help="启动本地 Web 界面")
+    serve_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    serve_cmd.add_argument("--host", default="127.0.0.1", help="监听地址")
+    serve_cmd.add_argument("--port", default=8000, type=int, help="监听端口")
+    serve_cmd.set_defaults(func=serve_web)
+
     return parser
 
 
@@ -127,4 +186,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
