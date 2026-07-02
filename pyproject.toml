@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bookrecall"
+version = "0.1.0"
+description = "BookRecall：面向长篇阅读回忆的本地索引 + Agent MVP。"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Codex" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+cloud = []
+full = [
+  "langgraph>=0.2.0",
+  "llama-index>=0.11.0",
+  "faiss-cpu>=1.8.0",
+  "sentence-transformers>=3.0.0",
+  "streamlit>=1.36.0"
+]
+
+[project.scripts]
+bookrecall = "bookrecall.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
