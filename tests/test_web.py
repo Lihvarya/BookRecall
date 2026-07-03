@@ -116,6 +116,13 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("BookRecall", html)
         self.assertIn("唤醒这段记忆", html)
 
+    def test_chapters_endpoint(self) -> None:
+        data = self._get_json("/api/books/sample/chapters")
+        self.assertEqual(data["book_id"], "sample")
+        numbers = [item["chapter_number"] for item in data["chapters"]]
+        self.assertEqual(numbers, [1, 2, 3])
+        self.assertEqual(data["chapters"][0]["title"], "起点")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,9 +3,23 @@ from typing import Iterable
 
 from .models import Chapter
 
+# 标题行最大长度：超过视为正文而非标题。
+HEADING_MAX_LENGTH = 48
+
+# 章节序数标识符（"第" 之后、"标题前缀" 之后的内容）。
+_HEADING_SUFFIX = r"[章节回卷篇部集节]"
+
+# 标题与序数之间的分隔符：半角/全角空格、全角冒号、顿号等——网文里常见 "第一节：魔潮降临"。
+_HEADING_SEP = r"[\s：、:]*"
+
 CHAPTER_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\s*第[0-9零一二三四五六七八九十百千万两〇]+[章节回卷篇部集]\s*.*$"),
+    re.compile(rf"^\s*第[0-9零一二三四五六七八九十百千万两〇]+{_HEADING_SUFFIX}{_HEADING_SEP}.*$"),
     re.compile(r"^\s*(chapter|chap\.)\s+\d+.*$", re.IGNORECASE),
+)
+
+# 匹配行首「第X节/章/...」并捕获序数前缀与其后的标题文本。
+_HEADING_STRIP = re.compile(
+    rf"^\s*(第[0-9零一二三四五六七八九十百千万两〇]+{_HEADING_SUFFIX}){_HEADING_SEP}(.*)$"
 )
 
 
@@ -13,11 +27,37 @@ def normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def is_chapter_heading(line: str) -> bool:
-    stripped = line.strip()
+def _strip_heading(line: str) -> str:
+    # 把半角空白、全角空格(U+3000)、BOM 及其它常见 CJK 缩进一并去掉，
+    # 网文段落标题常以全角空格缩进，而 re 的 \s 默认不匹配 U+3000。
+    return line.strip(" \t\r\n　﻿\v\f")
+
+
+def _looks_like_heading_body(line: str) -> bool:
+    """一个判断：仅当该行**主要是一句标题**而不是夹带大量正文的句子时才视作标题。
+
+    网文里正文常出现「方源是第二十八节的思想」这种把章节标记嵌进长句的情况。
+    要求标题行整体较短（≤ HEADING_MAX_LENGTH），避免把长句误判为章节标题。
+    """
+    stripped = _strip_heading(line)
     if not stripped:
         return False
+    if len(stripped) > HEADING_MAX_LENGTH:
+        return False
     return any(pattern.match(stripped) for pattern in CHAPTER_PATTERNS)
+
+
+def is_chapter_heading(line: str) -> bool:
+    return _looks_like_heading_body(line)
+
+
+def _clean_title(raw_heading: str) -> str:
+    match = _HEADING_STRIP.match(_strip_heading(raw_heading))
+    if match is None:
+        return _strip_heading(raw_heading)
+    prefix = match.group(1)
+    rest = match.group(2).strip()
+    return rest if rest else prefix
 
 
 def _finalize_chapter(
@@ -41,6 +81,7 @@ def _finalize_chapter(
             end_offset=end_offset,
         )
     )
+    # end_offset 之后预留一个换行的空隙。
     return end_offset + 2
 
 
@@ -50,26 +91,30 @@ def parse_chapters(text: str) -> list[Chapter]:
     chapters: list[Chapter] = []
     current_title = ""
     current_lines: list[str] = []
-    current_number = 0
     cursor = 0
+    saw_heading = False
+
+    def _flush() -> None:
+        nonlocal cursor, current_title, current_lines
+        if not current_lines and not current_title:
+            current_title = ""
+            current_lines = []
+            return
+        number = len(chapters) + 1  # 严格按解析顺序递增，与“第X节”真实序号解耦。
+        cursor = _finalize_chapter(chapters, number, current_title, current_lines, cursor)
+        current_title = ""
+        current_lines = []
 
     for line in lines:
-        if is_chapter_heading(line):
-            if current_number > 0 or current_lines:
-                cursor = _finalize_chapter(
-                    chapters,
-                    current_number or 1,
-                    current_title,
-                    current_lines,
-                    cursor,
-                )
-            current_number = len(chapters) + 1
-            current_title = line.strip()
-            current_lines = []
+        if _looks_like_heading_body(line):
+            _flush()
+            saw_heading = True
+            current_title = _clean_title(line)
             continue
         current_lines.append(line)
 
-    if current_number == 0:
+    if not saw_heading:
+        # 全文没有任何章节标题：保留为一个“全文”章节。
         content = normalized.strip()
         return [
             Chapter(
@@ -81,6 +126,5 @@ def parse_chapters(text: str) -> list[Chapter]:
             )
         ]
 
-    _finalize_chapter(chapters, current_number, current_title, current_lines, cursor)
+    _flush()
     return chapters
-

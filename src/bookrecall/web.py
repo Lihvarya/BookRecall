@@ -49,6 +49,22 @@ class BookRecallWebService:
         finally:
             store.close()
 
+    def list_chapters(self, book_id: str, limit: int = 50) -> list[dict[str, object]]:
+        store = self._open_store()
+        try:
+            titles = store.get_chapter_titles(book_id, limit=limit)
+            summaries = {int(r["chapter_number"]): str(r["summary"]) for r in store.get_chapter_summaries(book_id)}
+            return [
+                {
+                    "chapter_number": int(row["chapter_number"]),
+                    "title": row["title"],
+                    "summary": summaries.get(int(row["chapter_number"]), ""),
+                }
+                for row in titles
+            ]
+        finally:
+            store.close()
+
     def get_progress(self, book_id: str, user_id: str) -> dict[str, object]:
         store = self._open_store()
         try:
@@ -120,6 +136,17 @@ class BookRecallHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/books/") and path.endswith("/entities"):
             book_id = path[len("/api/books/") : -len("/entities")].strip("/")
             self._send_json({"book_id": book_id, "entities": self.service.list_entities(book_id)})
+            return
+
+        if path.startswith("/api/books/") and path.endswith("/chapters"):
+            book_id = path[len("/api/books/") : -len("/chapters")].strip("/")
+            query = parse_qs(parsed.query)
+            limit_raw = query.get("limit", ["50"])[0]
+            try:
+                limit = max(1, min(500, int(limit_raw)))
+            except ValueError:
+                limit = 50
+            self._send_json({"book_id": book_id, "chapters": self.service.list_chapters(book_id, limit)})
             return
 
         if path.startswith("/api/books/") and path.endswith("/progress"):
@@ -431,6 +458,13 @@ def _build_index_html() -> str:
         <span class="label">实体索引</span>
         <div class="entities" id="entitiesPanel"></div>
       </div>
+
+      <div class="section">
+        <details>
+          <summary class="label" style="cursor:pointer;list-style:none">章节浏览（点击展开）</summary>
+          <div class="chapters" id="chaptersPanel"></div>
+        </details>
+      </div>
     </aside>
 
     <main class="panel main">
@@ -469,6 +503,7 @@ def _build_index_html() -> str:
     const bookMeta = document.getElementById("bookMeta");
     const booksPanel = document.getElementById("booksPanel");
     const entitiesPanel = document.getElementById("entitiesPanel");
+    const chaptersPanel = document.getElementById("chaptersPanel");
     const answerCard = document.getElementById("answerCard");
 
     function setStatus(text) {
@@ -522,6 +557,19 @@ def _build_index_html() -> str:
           <div>首次出现：第 ${entity.first_chapter_number} 章</div>
           <div>提及次数：${entity.mention_count}</div>
           <div class="muted">${entity.aliases.length ? "别名：" + escapeHtml(entity.aliases.join("、")) : "无别名"}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderChapters(chapters) {
+      if (!chapters.length) {
+        chaptersPanel.innerHTML = '<div class="empty">还没有章节索引。</div>';
+        return;
+      }
+      chaptersPanel.innerHTML = chapters.map((chapter) => `
+        <div class="entity-item">
+          <strong>第 ${chapter.chapter_number} 章 ${escapeHtml(chapter.title)}</strong>
+          <div class="muted">${escapeHtml((chapter.summary || "").slice(0, 60))}${(chapter.summary || "").length > 60 ? "..." : ""}</div>
         </div>
       `).join("");
     }
@@ -597,9 +645,10 @@ def _build_index_html() -> str:
         return;
       }
 
-      const [progress, entityData] = await Promise.all([
+      const [progress, entityData, chapterData] = await Promise.all([
         requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/progress?user=${encodeURIComponent(state.currentUserId)}`),
-        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/entities`)
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/entities`),
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/chapters?limit=30`)
       ]);
 
       progressInput.value = progress.progress_chapter || "";
@@ -608,6 +657,7 @@ def _build_index_html() -> str:
         ? `当前书籍：<strong>${escapeHtml(book.title)}</strong><br>来源：<span class="mono">${escapeHtml(book.source_path)}</span><br>总章节：${book.chapter_count}，当前进度：${progress.progress_chapter || "未设置"}`
         : "未找到当前书籍信息。";
       renderEntities(entityData.entities || []);
+      renderChapters(chapterData.chapters || []);
     }
 
     async function saveProgress() {

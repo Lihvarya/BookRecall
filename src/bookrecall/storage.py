@@ -459,6 +459,53 @@ class BookRecallStore:
         query += " ORDER BY chapter_number ASC"
         return self.connection.execute(query, params).fetchall()
 
+    def get_chapter_titles(self, book_id: str, limit: int | None = None) -> list[sqlite3.Row]:
+        query = "SELECT chapter_number, title FROM chapters WHERE book_id = ? ORDER BY chapter_number ASC"
+        params: list[object] = [book_id]
+        if limit is not None and limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+        return self.connection.execute(query, params).fetchall()
+
+    def get_stats(self, book_id: str) -> dict[str, int]:
+        rows = self.connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM chapters WHERE book_id = ?) AS chapters,
+              (SELECT COUNT(*) FROM parent_chunks WHERE book_id = ?) AS parents,
+              (SELECT COUNT(*) FROM child_chunks WHERE book_id = ?) AS children,
+              (SELECT COUNT(*) FROM entities WHERE book_id = ?) AS entities,
+              (SELECT COUNT(*) FROM entity_mentions WHERE book_id = ?) AS mentions
+            """,
+            (book_id, book_id, book_id, book_id, book_id),
+        ).fetchone()
+        return {
+            "chapters": int(rows["chapters"]),
+            "parent_chunks": int(rows["parents"]),
+            "child_chunks": int(rows["children"]),
+            "entities": int(rows["entities"]),
+            "entity_mentions": int(rows["mentions"]),
+        }
+
+    def delete_book(self, book_id: str) -> int:
+        """删除单本书的全部索引数据，返回被清理的 chunk 数（用于提示）。按表逐个删，保留 db 自身。"""
+        counts = self.get_stats(book_id)
+        cursor = self.connection.cursor()
+        for table in (
+            "entity_mentions",
+            "entity_aliases",
+            "entities",
+            "chapter_summaries",
+            "child_chunks",
+            "parent_chunks",
+            "chapters",
+            "reader_state",
+        ):
+            cursor.execute(f"DELETE FROM {table} WHERE book_id = ?", (book_id,))
+        cursor.execute("DELETE FROM books WHERE book_id = ?", (book_id,))
+        self.connection.commit()
+        return counts["parent_chunks"] + counts["child_chunks"]
+
 
 def _chapter_summary(text: str, max_chars: int = 140) -> str:
     cleaned = " ".join(text.split())

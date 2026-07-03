@@ -125,6 +125,62 @@ def serve_web(args: argparse.Namespace) -> None:
     run_server(args.host, args.port, args.db)
 
 
+def show_stats(args: argparse.Namespace) -> None:
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        if store.get_book(args.book_id) is None:
+            print(f"没有找到 book_id={args.book_id}，可用 list-books 查看已有书籍。")
+            return
+        stats = store.get_stats(args.book_id)
+        max_chapter = store.get_max_chapter(args.book_id)
+    finally:
+        store.close()
+    print(f"book_id={args.book_id} 索引规模：")
+    print(f"- 章节：{stats['chapters']}（最大章节号 {max_chapter}）")
+    print(f"- parent chunks：{stats['parent_chunks']}")
+    print(f"- child chunks：{stats['child_chunks']}")
+    print(f"- 实体：{stats['entities']}")
+    print(f"- 实体出现记录：{stats['entity_mentions']}")
+
+
+def show_chapters(args: argparse.Namespace) -> None:
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        if store.get_book(args.book_id) is None:
+            print(f"没有找到 book_id={args.book_id}，可用 list-books 查看已有书籍。")
+            return
+        rows = store.get_chapter_titles(args.book_id, limit=args.limit)
+    finally:
+        store.close()
+    if not rows:
+        print("这本书还没有章节索引。")
+        return
+    for row in rows:
+        print(f"- 第 {int(row['chapter_number'])} 章 {row['title']}")
+    if args.limit and len(rows) >= args.limit:
+        print(f"（仅显示前 {args.limit} 章，省略后续）")
+
+
+def clear_book(args: argparse.Namespace) -> None:
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        info = store.get_book(args.book_id)
+        if info is None:
+            print(f"没有找到 book_id={args.book_id}，无需清理。")
+            return
+        if not args.yes:
+            print(f"将删除书籍：{info.title}（book_id={info.book_id}，{info.chapter_count} 章，{info.entity_count} 实体）。")
+            print("为防止误删，请加 --yes 确认后再执行。")
+            return
+        removed = store.delete_book(args.book_id)
+    finally:
+        store.close()
+    print(f"已删除 book_id={args.book_id} 的全部索引数据（约 {removed} 条 chunk 记录）。")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BookRecall 阅读记忆助手 MVP")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -174,6 +230,23 @@ def build_parser() -> argparse.ArgumentParser:
     serve_cmd.add_argument("--host", default="127.0.0.1", help="监听地址")
     serve_cmd.add_argument("--port", default=8000, type=int, help="监听端口")
     serve_cmd.set_defaults(func=serve_web)
+
+    stats_cmd = subparsers.add_parser("stats", help="查看某本书的索引规模")
+    stats_cmd.add_argument("--book-id", required=True, help="书籍唯一 ID")
+    stats_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    stats_cmd.set_defaults(func=show_stats)
+
+    chapters_cmd = subparsers.add_parser("chapters", help="列出某本书的章节标题，便于核对章节解析")
+    chapters_cmd.add_argument("--book-id", required=True, help="书籍唯一 ID")
+    chapters_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    chapters_cmd.add_argument("--limit", type=int, default=20, help="只显示前 N 章，默认 20，0 表示全部")
+    chapters_cmd.set_defaults(func=show_chapters)
+
+    clear_cmd = subparsers.add_parser("clear", help="删除某本书的全部本地索引（不删数据库本身）")
+    clear_cmd.add_argument("--book-id", required=True, help="要清理的书籍唯一 ID")
+    clear_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    clear_cmd.add_argument("--yes", action="store_true", help="确认删除（必需，否则只预览）")
+    clear_cmd.set_defaults(func=clear_book)
 
     return parser
 
