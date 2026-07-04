@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -48,6 +49,38 @@ def default_vector_dir(db_path: str) -> Path:
     return db.parent / DEFAULT_EMBEDDING_SETTINGS.vector_dir_name
 
 
+def default_cache_root(db_path: str | Path) -> Path:
+    db = Path(db_path).resolve()
+    if db.parent.name == ".bookrecall":
+        return db.parent.parent / ".cache"
+    return db.parent / ".cache"
+
+
+def default_sentence_transformers_cache_dir(db_path: str | Path) -> Path:
+    return default_cache_root(db_path) / "huggingface" / "sentence-transformers"
+
+
+def configure_local_model_cache(cache_root: str | Path) -> dict[str, str]:
+    root = Path(cache_root)
+    hf_home = root / "huggingface"
+    st_home = hf_home / "sentence-transformers"
+    torch_home = root / "torch"
+
+    st_home.mkdir(parents=True, exist_ok=True)
+    torch_home.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(st_home))
+    os.environ.setdefault("TORCH_HOME", str(torch_home))
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+    return {
+        "HF_HOME": os.environ["HF_HOME"],
+        "SENTENCE_TRANSFORMERS_HOME": os.environ["SENTENCE_TRANSFORMERS_HOME"],
+        "TORCH_HOME": os.environ["TORCH_HOME"],
+    }
+
+
 def safe_book_id(book_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", book_id).strip("_") or "book"
 
@@ -59,7 +92,12 @@ def vector_index_paths(index_dir: str | Path, book_id: str) -> tuple[Path, Path]
 
 
 class SentenceTransformerEmbedder:
-    def __init__(self, model_name: str = DEFAULT_EMBEDDING_SETTINGS.model_name) -> None:
+    def __init__(
+        self,
+        model_name: str = DEFAULT_EMBEDDING_SETTINGS.model_name,
+        *,
+        cache_dir: str | Path | None = None,
+    ) -> None:
         if importlib.util.find_spec("sentence_transformers") is None:
             raise LocalModelError(
                 "缺少 sentence-transformers，无法加载本地 embedding 模型。"
@@ -68,7 +106,13 @@ class SentenceTransformerEmbedder:
         from sentence_transformers import SentenceTransformer
 
         self.model_name = model_name
-        self._model = SentenceTransformer(model_name)
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._model = SentenceTransformer(
+            model_name,
+            cache_folder=str(self.cache_dir) if self.cache_dir is not None else None,
+        )
 
     def encode(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
         vectors = self._model.encode(

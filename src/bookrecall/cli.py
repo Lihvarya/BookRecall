@@ -9,6 +9,9 @@ from .embeddings import (
     LocalModelError,
     SentenceTransformerEmbedder,
     build_embedding_index,
+    configure_local_model_cache,
+    default_cache_root,
+    default_sentence_transformers_cache_dir,
     default_vector_dir,
     dependency_report,
     get_vector_index_info,
@@ -87,7 +90,11 @@ def _make_retriever(args: argparse.Namespace, store: BookRecallStore):
         raise LocalModelError("未找到本书的向量索引。请先运行 embed-build，或改用 --retriever lexical。")
 
     try:
-        embedder = SentenceTransformerEmbedder(info.model_name)
+        configure_local_model_cache(default_cache_root(getattr(args, "db")))
+        embedder = SentenceTransformerEmbedder(
+            info.model_name,
+            cache_dir=default_sentence_transformers_cache_dir(getattr(args, "db")),
+        )
         return EmbeddingRetriever(
             store,
             DEFAULT_SEARCH_SETTINGS,
@@ -221,6 +228,7 @@ def clear_book(args: argparse.Namespace) -> None:
 def show_models(args: argparse.Namespace) -> None:
     report = dependency_report()
     vector_dir = default_vector_dir(args.db)
+    cache_dir = default_sentence_transformers_cache_dir(args.db)
     print("本地小模型能力探测：")
     print(f"- numpy：{'可用' if report['numpy'] else '缺失'}")
     print(f"- sentence-transformers：{'可用' if report['sentence_transformers'] else '缺失'}")
@@ -228,6 +236,7 @@ def show_models(args: argparse.Namespace) -> None:
     print(f"- faiss：{'可用' if report['faiss'] else '缺失'}（当前实现可用 numpy 精确检索，不强制依赖 faiss）")
     print(f"- 推荐 embedding 模型：{report['recommended_embedding_model']}")
     print(f"- 默认向量索引目录：{vector_dir}")
+    print(f"- model cache: {cache_dir}")
     store = BookRecallStore(args.db)
     try:
         store.initialize()
@@ -243,13 +252,17 @@ def show_models(args: argparse.Namespace) -> None:
 
 def build_embeddings(args: argparse.Namespace) -> None:
     index_dir = args.vector_dir or default_vector_dir(args.db)
+    configure_local_model_cache(default_cache_root(args.db))
     store = BookRecallStore(args.db)
     try:
         store.initialize()
         if store.get_book(args.book_id) is None:
             print(f"没有找到 book_id={args.book_id}，请先运行 build。")
             return
-        embedder = SentenceTransformerEmbedder(args.model)
+        embedder = SentenceTransformerEmbedder(
+            args.model,
+            cache_dir=default_sentence_transformers_cache_dir(args.db),
+        )
         info = build_embedding_index(
             store=store,
             book_id=args.book_id,
@@ -270,6 +283,7 @@ def build_embeddings(args: argparse.Namespace) -> None:
 
 def search_embeddings(args: argparse.Namespace) -> None:
     index_dir = args.vector_dir or default_vector_dir(args.db)
+    configure_local_model_cache(default_cache_root(args.db))
     store = BookRecallStore(args.db)
     try:
         store.initialize()
@@ -277,7 +291,10 @@ def search_embeddings(args: argparse.Namespace) -> None:
         if info is None:
             print("还没有向量索引，请先运行 embed-build。")
             return
-        embedder = SentenceTransformerEmbedder(info.model_name)
+        embedder = SentenceTransformerEmbedder(
+            info.model_name,
+            cache_dir=default_sentence_transformers_cache_dir(args.db),
+        )
         retriever = EmbeddingRetriever(store, DEFAULT_SEARCH_SETTINGS, index_dir=index_dir, embedder=embedder)
         hits = retriever.search(args.book_id, args.query, max_chapter=args.progress)
     finally:

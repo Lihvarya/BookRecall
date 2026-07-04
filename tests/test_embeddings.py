@@ -10,7 +10,14 @@ if str(SRC) not in sys.path:
 
 from bookrecall.chunking import build_chunk_hierarchy
 from bookrecall.config import DEFAULT_CHUNK_SETTINGS, DEFAULT_SEARCH_SETTINGS
-from bookrecall.embeddings import EmbeddingRetriever, build_embedding_index, get_vector_index_info
+from bookrecall.embeddings import (
+    EmbeddingRetriever,
+    build_embedding_index,
+    configure_local_model_cache,
+    default_cache_root,
+    default_sentence_transformers_cache_dir,
+    get_vector_index_info,
+)
 from bookrecall.entity_index import build_entity_records
 from bookrecall.parser import parse_chapters
 from bookrecall.storage import BookRecallStore
@@ -122,6 +129,26 @@ class EmbeddingIndexTest(unittest.TestCase):
         )
         hits = retriever.search("sample", "黑袍人再次", max_chapter=2)
         self.assertTrue(all(hit.chapter_number <= 2 for hit in hits))
+
+
+    def test_default_cache_paths_follow_project_layout(self) -> None:
+        db_path = Path(self.tempdir.name) / ".bookrecall" / "bookrecall.db"
+        expected_root = (Path(self.tempdir.name) / ".cache").resolve()
+        self.assertEqual(default_cache_root(db_path), expected_root)
+        self.assertEqual(
+            default_sentence_transformers_cache_dir(db_path),
+            expected_root / "huggingface" / "sentence-transformers",
+        )
+
+    def test_configure_local_model_cache_sets_envs(self) -> None:
+        cache_root = Path(self.tempdir.name) / ".cache"
+        report = configure_local_model_cache(cache_root)
+        self.assertEqual(Path(report["HF_HOME"]), (cache_root / "huggingface").resolve())
+        self.assertEqual(
+            Path(report["SENTENCE_TRANSFORMERS_HOME"]),
+            (cache_root / "huggingface" / "sentence-transformers").resolve(),
+        )
+        self.assertEqual(Path(report["TORCH_HOME"]), (cache_root / "torch").resolve())
 
 
 if __name__ == "__main__":

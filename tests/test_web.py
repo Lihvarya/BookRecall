@@ -113,6 +113,7 @@ class BookRecallWebTest(unittest.TestCase):
     def test_runtime_endpoint(self) -> None:
         data = self._get_json("/api/runtime")
         self.assertIn("dependencies", data)
+        self.assertIn("model_cache_dir", data)
         self.assertIn("vector_indexes", data)
         providers = data["cloud"]["providers"]
         provider_ids = [item["id"] for item in providers]

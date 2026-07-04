@@ -14,6 +14,9 @@ from .embeddings import (
     EmbeddingRetriever,
     LocalModelError,
     SentenceTransformerEmbedder,
+    configure_local_model_cache,
+    default_cache_root,
+    default_sentence_transformers_cache_dir,
     default_vector_dir,
     dependency_report,
     get_vector_index_info,
@@ -58,6 +61,7 @@ class BookRecallWebService:
     def runtime_status(self) -> dict[str, object]:
         report = dependency_report()
         vector_dir = default_vector_dir(self.db_path)
+        cache_dir = default_sentence_transformers_cache_dir(self.db_path)
         store = self._open_store()
         try:
             books = store.list_books()
@@ -84,6 +88,7 @@ class BookRecallWebService:
         return {
             "dependencies": report,
             "vector_dir": str(vector_dir),
+            "model_cache_dir": str(cache_dir),
             "vector_indexes": vector_indexes,
             "cloud": {
                 "env_key_available": bool(os.getenv("BOOKRECALL_API_KEY") or os.getenv("OPENAI_API_KEY")),
@@ -227,7 +232,11 @@ class BookRecallWebService:
             raise LocalModelError("这本书还没有向量索引，请先运行 embed-build，或在网页端选择倒排检索。")
 
         try:
-            embedder = SentenceTransformerEmbedder(info.model_name)
+            configure_local_model_cache(default_cache_root(self.db_path))
+            embedder = SentenceTransformerEmbedder(
+                info.model_name,
+                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
+            )
             return EmbeddingRetriever(store, DEFAULT_SEARCH_SETTINGS, index_dir=vector_dir, embedder=embedder)
         except LocalModelError:
             if mode == "auto":
