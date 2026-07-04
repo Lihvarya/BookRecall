@@ -45,6 +45,7 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
   - 手写 ReAct 状态机
   - 规则策略 `RuleBasedPolicy`
   - 可选云端策略 `LLMReActPolicy`
+  - 原生 tool calling 优先，文本协议回退
   - LangGraph 预留接口
 - Web 可用：
   - 书库总览
@@ -432,7 +433,7 @@ python -m unittest discover -s tests -v
 当前代码状态下测试数量为：
 
 ```text
-40 tests
+44 tests
 ```
 
 ## 项目结构
@@ -481,7 +482,7 @@ examples/
 当前仍然存在这些限制：
 
 - LangGraph 还没有正式接入执行流
-- 还没有原生 function-calling
+- 虽然已经接入原生 tool calling 优先链路，但还没有做更完整的多供应商兼容验证
 - 还没有关系图谱和主题线索层
 - 还没有跨会话 Agent 记忆
 - 还没有真正的 FAISS 后端

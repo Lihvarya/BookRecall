@@ -25,11 +25,12 @@ if TYPE_CHECKING:
 
 _SYSTEM_PROMPT = """你是 BookRecall 的回忆助手。基于给定的工具和已观察证据回答用户关于小说的问题。
 严格规则：
-1) 只能调用工具清单里的工具，任何参数里的章节号不能超过阅读进度。
-2) 任何超出阅读进度的内容都视为剧透，不许在 final_answer 里输出。
-3) 证据不足时继续调用工具（action=工具名）；证据足够时返回最终答案（action=finish）。
-4) 回答必须基于已观察证据，不许虚构章节号或事件。
-请用下面的严格格式输出，不要额外解释：
+1) 优先使用原生 tool calling；如果模型不支持，再回退到文本协议。
+2) 只能调用工具清单里的工具，任何参数里的章节号不能超过阅读进度。
+3) 任何超出阅读进度的内容都视为剧透，不许在最终回答里输出。
+4) 证据不足时继续调用工具；证据足够时返回最终答案。
+5) 回答必须基于已观察证据，不许虚构章节号或事件。
+回退到文本协议时，请用下面的严格格式输出，不要额外解释：
 thought: <一句话思考>
 action: <工具名 或 finish>
 arguments: <JSON 对象，例如 {"entity":"方源"}；finish 时填 {}>
@@ -46,13 +47,22 @@ class LLMReActPolicy(DecisionPolicy):
         return "llm_react"
 
     def next_action(self, state: "AgentState", registry: "ToolRegistry") -> Decision:
-        prompt = self._build_prompt(state, registry)
-        raw = self.reasoner.answer(prompt)
-        if not raw:
+        response = self.reasoner.chat(
+            messages=self._build_messages(state, registry),
+            tools=registry.describe_for_openai_tools(),
+            tool_choice="auto",
+        )
+        if not response:
             return Decision(is_terminal=False, tool_call=None)  # 无效决策，由 core 重试/回退
+        tool_calls = response.get("tool_calls") or []
+        if isinstance(tool_calls, list) and tool_calls:
+            return _decision_from_tool_calls(tool_calls, registry)
+        raw = str(response.get("content") or "").strip()
+        if not raw:
+            return Decision(is_terminal=False, tool_call=None)
         parsed = _parse_react(raw)
         if parsed is None:
-            return Decision(is_terminal=False, tool_call=None)
+            return Decision(is_terminal=True, answer=raw, summary=None, suggestions=None)
         action = parsed.get("action", "").strip().lower()
         if action == "finish" or action == "":
             return Decision(
@@ -73,7 +83,7 @@ class LLMReActPolicy(DecisionPolicy):
             tool_call=ToolCall(name=action, arguments=arguments, thought=parsed.get("thought", "")),
         )
 
-    def _build_prompt(self, state: "AgentState", registry: "ToolRegistry") -> str:
+    def _build_messages(self, state: "AgentState", registry: "ToolRegistry") -> list[dict[str, str]]:
         trace_lines = [
             f"- step{tr.step} {tr.tool_name}({tr.arguments}) => 命中{tr.hit_count}条, spoiler_blocked={tr.spoiler_blocked}"
             for tr in state.trace
@@ -81,7 +91,7 @@ class LLMReActPolicy(DecisionPolicy):
         trace_text = "\n".join(trace_lines) if trace_lines else "（尚未调用任何工具）"
         evidence_chapters = [e.chapter_number for e in state.evidence]
         tools_json = json.dumps(registry.describe_for_llm(), ensure_ascii=False, indent=2)
-        return (
+        prompt = (
             f"{_SYSTEM_PROMPT}\n"
             f"问题：{state.question}\n"
             f"阅读进度：第 {state.progress_chapter} 章（任何章节号都不许超过它）\n"
@@ -90,6 +100,37 @@ class LLMReActPolicy(DecisionPolicy):
             f"当前累积证据章节：{evidence_chapters}\n\n"
             f"可用工具：\n{tools_json}\n"
         )
+        return [
+            {"role": "system", "content": "你是 BookRecall 的回忆助手。优先使用 tools 完成多步检索；如果证据已经足够，可以直接给出最终回答。回答必须基于证据，不得剧透超过阅读进度的内容。"},
+            {"role": "user", "content": prompt},
+        ]
+
+
+def _decision_from_tool_calls(tool_calls: list[object], registry: "ToolRegistry") -> Decision:
+    first = tool_calls[0]
+    if not isinstance(first, dict):
+        return Decision(is_terminal=False, tool_call=None)
+    tool_name = str(first.get("name") or "").strip()
+    if not tool_name or registry.get(tool_name) is None:
+        return Decision(is_terminal=False, tool_call=None)
+    arguments = _parse_tool_arguments(first.get("arguments"))
+    return Decision(
+        is_terminal=False,
+        tool_call=ToolCall(name=tool_name, arguments=arguments, thought="tool_call"),
+    )
+
+
+def _parse_tool_arguments(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
 
 
 def _parse_react(raw: str) -> dict | None:

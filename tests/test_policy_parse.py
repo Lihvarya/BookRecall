@@ -9,7 +9,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from bookrecall.agent.policies.llm_react import _parse_react
+from bookrecall.agent.policies.base import ToolCall
+from bookrecall.agent.policies.llm_react import LLMReActPolicy, _parse_react
+from bookrecall.agent.state import AgentState
+from bookrecall.agent.tools import Tool, ToolRegistry, ToolSchema
 
 
 class ReactParseTest(unittest.TestCase):
@@ -44,6 +47,63 @@ class ReactParseTest(unittest.TestCase):
     def test_parse_garbage_returns_none(self) -> None:
         self.assertIsNone(_parse_react("这不是任何格式的输出"))
         self.assertIsNone(_parse_react(""))
+
+    def test_policy_prefers_native_tool_calls(self) -> None:
+        class FakeReasoner:
+            def chat(self, *, messages, tools=None, tool_choice="auto"):
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "name": "lookup_timeline",
+                            "arguments": "{\"entity\": \"方源\"}",
+                        }
+                    ],
+                }
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                schema=ToolSchema(
+                    name="lookup_timeline",
+                    description="test tool",
+                    parameters={"entity": {"type": "str", "required": True}},
+                ),
+                run=lambda state, args: {},
+            )
+        )
+        state = AgentState(book_id="sample", question="方源后来还出现过吗？", progress_chapter=10)
+        decision = LLMReActPolicy(FakeReasoner()).next_action(state, registry)
+        self.assertFalse(decision.is_terminal)
+        self.assertEqual(
+            decision.tool_call,
+            ToolCall(name="lookup_timeline", arguments={"entity": "方源"}, thought="tool_call"),
+        )
+
+    def test_policy_falls_back_to_text_protocol(self) -> None:
+        class FakeReasoner:
+            def chat(self, *, messages, tools=None, tool_choice="auto"):
+                return {
+                    "content": "thought: 先查实体轨迹\naction: lookup_timeline\narguments: {\"entity\": \"方源\"}\n",
+                    "tool_calls": [],
+                }
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                schema=ToolSchema(
+                    name="lookup_timeline",
+                    description="test tool",
+                    parameters={"entity": {"type": "str", "required": True}},
+                ),
+                run=lambda state, args: {},
+            )
+        )
+        state = AgentState(book_id="sample", question="方源后来还出现过吗？", progress_chapter=10)
+        decision = LLMReActPolicy(FakeReasoner()).next_action(state, registry)
+        self.assertFalse(decision.is_terminal)
+        self.assertEqual(decision.tool_call.name, "lookup_timeline")
+        self.assertEqual(decision.tool_call.arguments, {"entity": "方源"})
 
 
 if __name__ == "__main__":

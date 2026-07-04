@@ -21,19 +21,36 @@ class OpenAICompatibleReasoner:
         return bool(self.api_key)
 
     def answer(self, prompt: str) -> str | None:
+        response = self.chat(
+            messages=[
+                {"role": "system", "content": "你是 BookRecall 的云端推理助手。回答必须基于提供证据，避免虚构。"},
+                {"role": "user", "content": prompt},
+            ]
+        )
+        if not response:
+            return None
+        content = response.get("content")
+        return None if content is None else str(content).strip()
+
+    def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+    ) -> dict[str, object] | None:
         if not self.enabled:
             return None
 
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": "你是 BookRecall 的云端推理助手。回答必须基于提供证据，避免虚构。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2,
-            }
-        ).encode("utf-8")
+        payload_obj: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+        }
+        if tools:
+            payload_obj["tools"] = tools
+            payload_obj["tool_choice"] = tool_choice
+        payload = json.dumps(payload_obj).encode("utf-8")
 
         request = urllib.request.Request(
             self.endpoint,
@@ -51,7 +68,29 @@ class OpenAICompatibleReasoner:
             return None
 
         try:
-            return body["choices"][0]["message"]["content"].strip()
+            message = body["choices"][0]["message"]
         except (KeyError, IndexError, TypeError):
             return None
-
+        content = message.get("content")
+        tool_calls_raw = message.get("tool_calls") or []
+        parsed_tool_calls: list[dict[str, object]] = []
+        if isinstance(tool_calls_raw, list):
+            for item in tool_calls_raw:
+                if not isinstance(item, dict):
+                    continue
+                function = item.get("function") or {}
+                name = function.get("name")
+                if not name:
+                    continue
+                parsed_tool_calls.append(
+                    {
+                        "id": item.get("id"),
+                        "name": str(name),
+                        "arguments": function.get("arguments", "{}"),
+                    }
+                )
+        return {
+            "content": "" if content is None else str(content),
+            "tool_calls": parsed_tool_calls,
+            "raw": body,
+        }

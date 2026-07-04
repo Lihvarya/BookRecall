@@ -61,6 +61,46 @@ class ToolRegistry:
             )
         return items
 
+    def describe_for_openai_tools(self) -> list[dict]:
+        tools: list[dict] = []
+        for tool in self._tools.values():
+            schema = tool.schema
+            properties: dict[str, dict[str, object]] = {}
+            required: list[str] = []
+            for name, meta in schema.parameters.items():
+                type_name = str(meta.get("type", "str"))
+                json_type = {
+                    "str": "string",
+                    "int": "integer",
+                    "float": "number",
+                    "bool": "boolean",
+                    "list": "array",
+                    "dict": "object",
+                }.get(type_name, "string")
+                prop: dict[str, object] = {"type": json_type}
+                desc = meta.get("desc")
+                if desc:
+                    prop["description"] = str(desc)
+                properties[name] = prop
+                if bool(meta.get("required")):
+                    required.append(name)
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": schema.name,
+                        "description": schema.description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": properties,
+                            "required": required,
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+        return tools
+
 
 # ---------- helpers ----------
 
