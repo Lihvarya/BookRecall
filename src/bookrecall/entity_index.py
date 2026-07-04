@@ -3,7 +3,16 @@ from collections import Counter
 from pathlib import Path
 
 from .config import ChunkSettings
-from .models import Chapter, EntityMention, EntityRecord
+from .models import (
+    Chapter,
+    EntityMention,
+    EntityRecord,
+    EventRecord,
+    RelationMention,
+    RelationRecord,
+    ThemeMention,
+    ThemeRecord,
+)
 
 AUTO_ENTITY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"【([^】]{1,20})】"),
@@ -21,6 +30,37 @@ _STOPWORDS: set[str] = {
     "一些", "所有", "这是", "不是", "不得", "但也", "不论", "以上", "以下", "以为",
     "一时", "一方", "大事", "大事", "之中", "之间", "之内", "之外", "以后", "以前",
 }
+
+DEFAULT_THEME_TERMS: tuple[str, ...] = (
+    "自由意志",
+    "命运",
+    "选择",
+    "自由",
+    "权力",
+    "秩序",
+    "混乱",
+    "信仰",
+    "人性",
+    "神性",
+    "文明",
+    "记忆",
+    "身份",
+    "牺牲",
+    "救赎",
+    "复仇",
+    "成长",
+    "孤独",
+    "真相",
+    "谎言",
+)
+
+EVENT_TYPE_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("获得/失去", ("拿到", "得到", "获得", "失去", "夺走", "交出", "打开")),
+    ("冲突/危机", ("对峙", "追杀", "争斗", "袭击", "背叛", "怀疑", "危机")),
+    ("揭示/真相", ("发现", "揭开", "真相", "意识到", "明白", "提到", "告诉")),
+    ("选择/决定", ("决定", "选择", "相信", "拒绝", "承认", "承担")),
+    ("协作/同行", ("一起", "同行", "帮助", "救", "穿过", "合作")),
+)
 
 # 仅保留同时出现在多种上下（高频专名往往不局限在标点里），简单用“包含至少一个 CJK 字符”过滤。
 
@@ -86,6 +126,11 @@ def load_entity_lexicon(path: str | None) -> dict[str, list[str]]:
     return entities
 
 
+def load_theme_lexicon(path: str | None) -> dict[str, list[str]]:
+    """读取主题词表，格式与实体词表一致：标准名|别名1,别名2。"""
+    return load_entity_lexicon(path)
+
+
 def auto_discover_entities(text: str, *, top_k: int = 60) -> dict[str, list[str]]:
     """自动挖掘候选实体：强调符实体（【】《》「」）+ 高频 n-gram 专名。
 
@@ -102,6 +147,25 @@ def auto_discover_entities(text: str, *, top_k: int = 60) -> dict[str, list[str]
     found.update(frequency_based.keys())
     ordered = sorted(found, key=lambda item: (-len(item), item))
     return {item: [] for item in ordered}
+
+
+def auto_discover_themes(text: str, *, extra_terms: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
+    """自动发现第一版主题词。
+
+    主题不像人物/道具那样适合纯 n-gram 自动挖掘，所以 MVP 先用一组常见主题词，
+    再合并用户主题词表。这样“自由意志/命运/权力”类问题可以走结构化索引，
+    同时避免把大量普通名词误当主题。
+    """
+    themes: dict[str, list[str]] = {}
+    for term in DEFAULT_THEME_TERMS:
+        if term in text:
+            themes[term] = []
+    if extra_terms:
+        for name, aliases in extra_terms.items():
+            cleaned = name.strip()
+            if cleaned:
+                themes[cleaned] = [alias.strip() for alias in aliases if alias.strip()]
+    return dict(sorted(themes.items(), key=lambda item: (-len(item[0]), item[0])))
 
 
 def build_entity_records(
@@ -148,3 +212,188 @@ def build_entity_records(
             )
 
     return records
+
+
+def build_theme_records(
+    chapters: list[Chapter],
+    themes: dict[str, list[str]] | list[str],
+    settings: ChunkSettings,
+) -> list[ThemeRecord]:
+    records: list[ThemeRecord] = []
+    if isinstance(themes, dict):
+        theme_map = {
+            name.strip(): [alias.strip() for alias in aliases if alias.strip()]
+            for name, aliases in themes.items()
+            if name.strip()
+        }
+    else:
+        theme_map = {name.strip(): [] for name in themes if name.strip()}
+
+    for theme_name in sorted(theme_map, key=lambda item: (-len(item), item)):
+        mentions: list[ThemeMention] = []
+        terms = [theme_name, *theme_map.get(theme_name, [])]
+        unique_terms = []
+        for term in terms:
+            if term and term not in unique_terms:
+                unique_terms.append(term)
+        for chapter in chapters:
+            chapter_mentions: list[ThemeMention] = []
+            for term in unique_terms:
+                pattern = re.compile(re.escape(term))
+                for match in pattern.finditer(chapter.content):
+                    start = max(0, match.start() - settings.max_excerpt_chars // 2)
+                    end = min(len(chapter.content), match.end() + settings.max_excerpt_chars // 2)
+                    excerpt = chapter.content[start:end].strip().replace("\n", " ")
+                    chapter_mentions.append(
+                        ThemeMention(
+                            theme_name=theme_name,
+                            chapter_number=chapter.number,
+                            excerpt=excerpt,
+                            position_in_chapter=match.start(),
+                        )
+                    )
+            chapter_mentions.sort(key=lambda item: item.position_in_chapter)
+            mentions.extend(chapter_mentions)
+        if mentions:
+            records.append(
+                ThemeRecord(
+                    name=theme_name,
+                    aliases=theme_map.get(theme_name, []),
+                    first_chapter_number=mentions[0].chapter_number,
+                    mentions=mentions,
+                )
+            )
+    return records
+
+
+def build_relation_records(
+    chapters: list[Chapter],
+    entity_records: list[EntityRecord],
+    settings: ChunkSettings,
+) -> list[RelationRecord]:
+    mentions_by_chapter: dict[int, dict[str, list[EntityMention]]] = {}
+    for record in entity_records:
+        for mention in record.mentions:
+            mentions_by_chapter.setdefault(mention.chapter_number, {}).setdefault(record.name, []).append(mention)
+
+    relation_mentions: dict[tuple[str, str, str], list[RelationMention]] = {}
+    chapter_by_number = {chapter.number: chapter for chapter in chapters}
+
+    for chapter_number, entity_map in mentions_by_chapter.items():
+        names = sorted(entity_map)
+        if len(names) < 2:
+            continue
+        chapter = chapter_by_number.get(chapter_number)
+        content = chapter.content if chapter is not None else ""
+        for left_index, source in enumerate(names):
+            for target in names[left_index + 1 :]:
+                source_pos = entity_map[source][0].position_in_chapter
+                target_pos = entity_map[target][0].position_in_chapter
+                excerpt = _relation_excerpt(content, source_pos, target_pos, settings.max_excerpt_chars)
+                relation_type = _infer_relation_type(excerpt)
+                ordered_source, ordered_target = sorted((source, target))
+                key = (ordered_source, ordered_target, relation_type)
+                relation_mentions.setdefault(key, []).append(
+                    RelationMention(
+                        source_entity=ordered_source,
+                        target_entity=ordered_target,
+                        relation_type=relation_type,
+                        chapter_number=chapter_number,
+                        excerpt=excerpt,
+                    )
+                )
+
+    records: list[RelationRecord] = []
+    for (source, target, relation_type), mentions in sorted(relation_mentions.items()):
+        mentions.sort(key=lambda item: item.chapter_number)
+        records.append(
+            RelationRecord(
+                source_entity=source,
+                target_entity=target,
+                relation_type=relation_type,
+                first_chapter_number=mentions[0].chapter_number,
+                mentions=mentions,
+            )
+        )
+    return records
+
+
+def build_event_records(
+    chapters: list[Chapter],
+    entity_records: list[EntityRecord],
+    settings: ChunkSettings,
+) -> list[EventRecord]:
+    entity_names = [record.name for record in entity_records]
+    records: list[EventRecord] = []
+    seen: set[tuple[int, str]] = set()
+    for chapter in chapters:
+        for sentence in _iter_event_sentences(chapter.content):
+            event_type = _infer_event_type(sentence)
+            entities = [name for name in entity_names if name in sentence]
+            if event_type == "事件" and len(entities) < 2:
+                continue
+            key = (chapter.number, sentence)
+            if key in seen:
+                continue
+            seen.add(key)
+            excerpt = sentence
+            if len(excerpt) > settings.max_excerpt_chars:
+                excerpt = excerpt[: settings.max_excerpt_chars].rstrip() + "..."
+            records.append(
+                EventRecord(
+                    chapter_number=chapter.number,
+                    chapter_title=chapter.title,
+                    event_type=event_type,
+                    summary=_event_summary(sentence),
+                    excerpt=excerpt,
+                    entities=entities,
+                )
+            )
+    return records
+
+
+def _iter_event_sentences(content: str) -> list[str]:
+    parts = re.split(r"(?<=[。！？!?])\s*|\n+", content)
+    sentences: list[str] = []
+    for part in parts:
+        cleaned = " ".join(part.split()).strip()
+        if 8 <= len(cleaned) <= 220:
+            sentences.append(cleaned)
+    return sentences
+
+
+def _infer_event_type(sentence: str) -> str:
+    for event_type, keywords in EVENT_TYPE_KEYWORDS:
+        if any(keyword in sentence for keyword in keywords):
+            return event_type
+    return "事件"
+
+
+def _event_summary(sentence: str, max_chars: int = 72) -> str:
+    cleaned = sentence.strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip() + "..."
+
+
+def _relation_excerpt(content: str, source_pos: int, target_pos: int, max_chars: int) -> str:
+    if not content:
+        return ""
+    start_pos = min(source_pos, target_pos)
+    end_pos = max(source_pos, target_pos)
+    padding = max_chars // 2
+    start = max(0, start_pos - padding)
+    end = min(len(content), end_pos + padding)
+    return content[start:end].strip().replace("\n", " ")
+
+
+def _infer_relation_type(excerpt: str) -> str:
+    if any(token in excerpt for token in ("师父", "师尊", "弟子", "传授", "教导")):
+        return "师徒/传承"
+    if any(token in excerpt for token in ("敌", "追杀", "背叛", "杀", "冲突", "争斗", "对峙")):
+        return "冲突"
+    if any(token in excerpt for token in ("朋友", "同伴", "一起", "同行", "帮助", "救")):
+        return "同伴/协作"
+    if any(token in excerpt for token in ("父", "母", "兄", "姐", "弟", "妹", "家族")):
+        return "亲缘/家族"
+    return "共现/关联"

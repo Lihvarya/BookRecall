@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -16,12 +17,12 @@ from bookrecall.embeddings import (
     configure_local_model_cache,
     default_cache_root,
     default_sentence_transformers_cache_dir,
+    faiss_index_paths,
     get_vector_index_info,
 )
 from bookrecall.entity_index import build_entity_records
 from bookrecall.parser import parse_chapters
 from bookrecall.storage import BookRecallStore
-
 
 SAMPLE_TEXT = """第1章 起点
 
@@ -53,6 +54,45 @@ class TinyEmbedder:
         return vectors
 
 
+class FakeFaissIndex:
+    def __init__(self, dimension: int) -> None:
+        self.dimension = dimension
+        self.vectors: list[list[float]] = []
+        self.ntotal = 0
+
+    def add(self, matrix) -> None:
+        self.vectors = matrix.tolist()
+        self.ntotal = len(self.vectors)
+
+    def search(self, matrix, top_k: int):
+        query = matrix[0].tolist()
+        scored = []
+        for idx, row in enumerate(self.vectors):
+            score = sum(a * b for a, b in zip(row, query))
+            scored.append((score, idx))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        picked = scored[:top_k]
+        scores = [[item[0] for item in picked] + [-1.0] * max(0, top_k - len(picked))]
+        indices = [[item[1] for item in picked] + [-1] * max(0, top_k - len(picked))]
+        import numpy as np
+
+        return np.asarray(scores, dtype=np.float32), np.asarray(indices, dtype=np.int64)
+
+
+class FakeFaissModule:
+    IndexFlatIP = FakeFaissIndex
+
+    def __init__(self) -> None:
+        self._saved: dict[str, FakeFaissIndex] = {}
+
+    def write_index(self, index: FakeFaissIndex, path: str) -> None:
+        self._saved[path] = index
+        Path(path).write_text("fake-faiss", encoding="utf-8")
+
+    def read_index(self, path: str) -> FakeFaissIndex:
+        return self._saved[path]
+
+
 class EmbeddingIndexTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -82,27 +122,47 @@ class EmbeddingIndexTest(unittest.TestCase):
         self.store.close()
         self.tempdir.cleanup()
 
-    def test_build_and_read_vector_index_info(self) -> None:
+    def test_build_and_read_numpy_vector_index_info(self) -> None:
         info = build_embedding_index(
             store=self.store,
             book_id="sample",
             index_dir=self.vector_dir,
             embedder=TinyEmbedder(),
+            prefer_backend="numpy",
         )
         self.assertEqual(info.book_id, "sample")
         self.assertEqual(info.dimension, 3)
+        self.assertEqual(info.backend, "numpy")
         self.assertTrue(Path(info.path).exists())
 
         loaded = get_vector_index_info(self.vector_dir, "sample")
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.model_name, "test-tiny-embedder")
+        self.assertEqual(loaded.backend, "numpy")
 
-    def test_embedding_retriever_searches_saved_vectors(self) -> None:
+    def test_build_faiss_index_when_module_available(self) -> None:
+        fake_faiss = FakeFaissModule()
+        info = build_embedding_index(
+            store=self.store,
+            book_id="sample",
+            index_dir=self.vector_dir,
+            embedder=TinyEmbedder(),
+            prefer_backend="faiss",
+            faiss_module=fake_faiss,
+        )
+        index_path, chunk_meta_path, _ = faiss_index_paths(self.vector_dir, "sample")
+        self.assertEqual(info.backend, "faiss")
+        self.assertTrue(index_path.exists())
+        self.assertTrue(chunk_meta_path.exists())
+        self.assertTrue(json.loads(chunk_meta_path.read_text(encoding="utf-8")))
+
+    def test_embedding_retriever_searches_saved_numpy_vectors(self) -> None:
         build_embedding_index(
             store=self.store,
             book_id="sample",
             index_dir=self.vector_dir,
             embedder=TinyEmbedder(),
+            prefer_backend="numpy",
         )
         retriever = EmbeddingRetriever(
             self.store,
@@ -114,12 +174,34 @@ class EmbeddingIndexTest(unittest.TestCase):
         self.assertTrue(hits)
         self.assertEqual(hits[0].chapter_number, 2)
 
+    def test_embedding_retriever_searches_saved_faiss_vectors(self) -> None:
+        fake_faiss = FakeFaissModule()
+        build_embedding_index(
+            store=self.store,
+            book_id="sample",
+            index_dir=self.vector_dir,
+            embedder=TinyEmbedder(),
+            prefer_backend="faiss",
+            faiss_module=fake_faiss,
+        )
+        retriever = EmbeddingRetriever(
+            self.store,
+            DEFAULT_SEARCH_SETTINGS,
+            index_dir=self.vector_dir,
+            embedder=TinyEmbedder(),
+            faiss_module=fake_faiss,
+        )
+        hits = retriever.search("sample", "黑袍人出现", max_chapter=3)
+        self.assertTrue(hits)
+        self.assertEqual(hits[0].chapter_number, 2)
+
     def test_embedding_retriever_respects_progress(self) -> None:
         build_embedding_index(
             store=self.store,
             book_id="sample",
             index_dir=self.vector_dir,
             embedder=TinyEmbedder(),
+            prefer_backend="numpy",
         )
         retriever = EmbeddingRetriever(
             self.store,
@@ -129,7 +211,6 @@ class EmbeddingIndexTest(unittest.TestCase):
         )
         hits = retriever.search("sample", "黑袍人再次", max_chapter=2)
         self.assertTrue(all(hit.chapter_number <= 2 for hit in hits))
-
 
     def test_default_cache_paths_follow_project_layout(self) -> None:
         db_path = Path(self.tempdir.name) / ".bookrecall" / "bookrecall.db"

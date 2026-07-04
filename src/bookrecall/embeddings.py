@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from .config import DEFAULT_EMBEDDING_SETTINGS, SearchSettings
 from .models import SearchHit
@@ -91,6 +92,12 @@ def vector_index_paths(index_dir: str | Path, book_id: str) -> tuple[Path, Path]
     return root / f"{stem}.npz", root / f"{stem}.json"
 
 
+def faiss_index_paths(index_dir: str | Path, book_id: str) -> tuple[Path, Path, Path]:
+    root = Path(index_dir)
+    stem = safe_book_id(book_id)
+    return root / f"{stem}.faiss", root / f"{stem}.chunks.json", root / f"{stem}.json"
+
+
 class SentenceTransformerEmbedder:
     def __init__(
         self,
@@ -132,6 +139,13 @@ def _require_numpy():
     return np
 
 
+def _load_faiss_module() -> Any | None:
+    spec = importlib.util.find_spec("faiss")
+    if spec is None:
+        return None
+    return importlib.import_module("faiss")
+
+
 def _normalize_rows(vectors):
     np = _require_numpy()
     array = np.asarray(vectors, dtype=np.float32)
@@ -150,6 +164,8 @@ def build_embedding_index(
     embedder: Embedder,
     batch_size: int = DEFAULT_EMBEDDING_SETTINGS.batch_size,
     limit_chunks: int | None = None,
+    prefer_backend: str = "auto",
+    faiss_module: Any | None = None,
 ) -> VectorIndexInfo:
     np = _require_numpy()
     rows = store.iter_search_rows(book_id, max_chapter=None)
@@ -158,18 +174,58 @@ def build_embedding_index(
     if not rows:
         raise LocalModelError(f"book_id={book_id} 没有 child chunk，无法构建向量索引。")
 
-    chunk_ids: list[str] = []
-    texts: list[str] = []
-    for row in rows:
-        chunk_ids.append(str(row["chunk_id"]))
-        texts.append(str(row["text"]))
+    chunk_ids = [str(row["chunk_id"]) for row in rows]
+    texts = [str(row["text"]) for row in rows]
 
     vectors: list[list[float]] = []
     for start in range(0, len(texts), batch_size):
-        batch = texts[start:start + batch_size]
+        batch = texts[start : start + batch_size]
         vectors.extend(embedder.encode(batch, batch_size=batch_size))
     matrix = _normalize_rows(vectors)
 
+    backend = _resolve_backend(prefer_backend, faiss_module)
+    if backend == "faiss":
+        return _build_faiss_index(
+            book_id=book_id,
+            index_dir=index_dir,
+            embedder=embedder,
+            chunk_ids=chunk_ids,
+            matrix=matrix,
+            faiss_module=faiss_module or _load_faiss_module(),
+        )
+    return _build_numpy_index(
+        book_id=book_id,
+        index_dir=index_dir,
+        embedder=embedder,
+        chunk_ids=chunk_ids,
+        matrix=matrix,
+        np=np,
+    )
+
+
+def _resolve_backend(prefer_backend: str, faiss_module: Any | None) -> str:
+    normalized = (prefer_backend or "auto").strip().lower()
+    if normalized not in {"auto", "numpy", "faiss"}:
+        raise LocalModelError("未知向量后端，请选择 auto、numpy 或 faiss。")
+    if normalized == "numpy":
+        return "numpy"
+    available_faiss = faiss_module is not None or _load_faiss_module() is not None
+    if normalized == "faiss":
+        if not available_faiss:
+            raise LocalModelError("指定了 faiss 后端，但当前环境没有安装 faiss。")
+        return "faiss"
+    return "faiss" if available_faiss else "numpy"
+
+
+def _build_numpy_index(
+    *,
+    book_id: str,
+    index_dir: str | Path,
+    embedder: Embedder,
+    chunk_ids: list[str],
+    matrix,
+    np,
+) -> VectorIndexInfo:
     index_path, meta_path = vector_index_paths(index_dir, book_id)
     index_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(index_path, chunk_ids=np.asarray(chunk_ids), vectors=matrix)
@@ -177,7 +233,38 @@ def build_embedding_index(
     info = VectorIndexInfo(
         book_id=book_id,
         model_name=embedder.model_name,
-        backend="sentence-transformers",
+        backend="numpy",
+        chunk_count=len(chunk_ids),
+        dimension=int(matrix.shape[1]),
+        path=str(index_path),
+    )
+    meta_path.write_text(json.dumps(asdict(info), ensure_ascii=False, indent=2), encoding="utf-8")
+    return info
+
+
+def _build_faiss_index(
+    *,
+    book_id: str,
+    index_dir: str | Path,
+    embedder: Embedder,
+    chunk_ids: list[str],
+    matrix,
+    faiss_module: Any | None,
+) -> VectorIndexInfo:
+    if faiss_module is None:
+        raise LocalModelError("当前环境没有可用的 faiss 模块。")
+    index_path, chunk_meta_path, meta_path = faiss_index_paths(index_dir, book_id)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+
+    index = faiss_module.IndexFlatIP(int(matrix.shape[1]))
+    index.add(matrix)
+    faiss_module.write_index(index, str(index_path))
+    chunk_meta_path.write_text(json.dumps(chunk_ids, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    info = VectorIndexInfo(
+        book_id=book_id,
+        model_name=embedder.model_name,
+        backend="faiss",
         chunk_count=len(chunk_ids),
         dimension=int(matrix.shape[1]),
         path=str(index_path),
@@ -187,18 +274,20 @@ def build_embedding_index(
 
 
 def get_vector_index_info(index_dir: str | Path, book_id: str) -> VectorIndexInfo | None:
-    index_path, meta_path = vector_index_paths(index_dir, book_id)
-    if not index_path.exists() or not meta_path.exists():
-        return None
-    raw = json.loads(meta_path.read_text(encoding="utf-8"))
-    return VectorIndexInfo(
-        book_id=str(raw["book_id"]),
-        model_name=str(raw["model_name"]),
-        backend=str(raw["backend"]),
-        chunk_count=int(raw["chunk_count"]),
-        dimension=int(raw["dimension"]),
-        path=str(raw["path"]),
-    )
+    _, meta_path = vector_index_paths(index_dir, book_id)
+    _, _, faiss_meta_path = faiss_index_paths(index_dir, book_id)
+    for candidate in (meta_path, faiss_meta_path):
+        if candidate.exists():
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+            return VectorIndexInfo(
+                book_id=str(raw["book_id"]),
+                model_name=str(raw["model_name"]),
+                backend=str(raw.get("backend") or "numpy"),
+                chunk_count=int(raw["chunk_count"]),
+                dimension=int(raw["dimension"]),
+                path=str(raw["path"]),
+            )
+    return None
 
 
 class EmbeddingRetriever:
@@ -209,59 +298,66 @@ class EmbeddingRetriever:
         *,
         index_dir: str | Path,
         embedder: Embedder,
+        faiss_module: Any | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
         self.index_dir = Path(index_dir)
         self.embedder = embedder
-        self._loaded: dict[str, tuple[object, list[str]]] = {}
+        self.faiss_module = faiss_module
+        self._loaded: dict[str, tuple[str, Any, list[str]]] = {}
 
-    def _load(self, book_id: str):
+    def _load(self, book_id: str) -> tuple[str, Any, list[str]]:
         if book_id in self._loaded:
             return self._loaded[book_id]
-        np = _require_numpy()
-        index_path, meta_path = vector_index_paths(self.index_dir, book_id)
-        if not index_path.exists() or not meta_path.exists():
+        info = get_vector_index_info(self.index_dir, book_id)
+        if info is None:
             raise LocalModelError(f"book_id={book_id} 还没有向量索引，请先运行 embed-build。")
+        if info.backend == "faiss":
+            loaded = self._load_faiss_index(book_id)
+        else:
+            loaded = self._load_numpy_index(book_id)
+        self._loaded[book_id] = loaded
+        return loaded
+
+    def _load_numpy_index(self, book_id: str) -> tuple[str, Any, list[str]]:
+        np = _require_numpy()
+        index_path, _ = vector_index_paths(self.index_dir, book_id)
         data = np.load(index_path, allow_pickle=False)
         vectors = data["vectors"].astype(np.float32)
         chunk_ids = [str(item) for item in data["chunk_ids"].tolist()]
-        self._loaded[book_id] = (vectors, chunk_ids)
-        return vectors, chunk_ids
+        return "numpy", vectors, chunk_ids
+
+    def _load_faiss_index(self, book_id: str) -> tuple[str, Any, list[str]]:
+        faiss_module = self.faiss_module or _load_faiss_module()
+        if faiss_module is None:
+            raise LocalModelError("检测到 faiss 索引，但当前环境无法加载 faiss。")
+        index_path, chunk_meta_path, _ = faiss_index_paths(self.index_dir, book_id)
+        chunk_ids = json.loads(chunk_meta_path.read_text(encoding="utf-8"))
+        index = faiss_module.read_index(str(index_path))
+        return "faiss", index, [str(item) for item in chunk_ids]
 
     def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
         np = _require_numpy()
-        vectors, chunk_ids = self._load(book_id)
+        backend, index_data, chunk_ids = self._load(book_id)
         query_vector = _normalize_rows(self.embedder.encode([query], batch_size=1))[0]
-        scores = vectors @ query_vector
-        if scores.size == 0:
-            return []
-
-        candidate_count = min(
-            scores.size,
-            max(self.settings.top_k_children * 8, self.settings.top_k_parents * 12, 32),
-        )
-        if candidate_count < scores.size:
-            candidate_indices = np.argpartition(scores, -candidate_count)[-candidate_count:]
-            candidate_indices = candidate_indices[np.argsort(scores[candidate_indices])[::-1]]
-        else:
-            candidate_indices = np.argsort(scores)[::-1]
+        scores, candidate_indices = self._search_candidates(backend, index_data, query_vector, np=np)
 
         rows = self.store.iter_search_rows(book_id, max_chapter=None)
         rows_by_id = {str(row["chunk_id"]): row for row in rows}
         hits: list[SearchHit] = []
-        for index in candidate_indices:
-            chunk_id = chunk_ids[int(index)]
-            row = rows_by_id.get(chunk_id)
+        for score, index in zip(scores, candidate_indices):
+            if index < 0 or index >= len(chunk_ids):
+                continue
+            row = rows_by_id.get(chunk_ids[index])
             if row is None:
                 continue
             chapter_number = int(row["chapter_number"])
             if max_chapter is not None and chapter_number > max_chapter:
                 continue
-            score = float(scores[int(index)])
             hits.append(
                 SearchHit(
-                    score=score,
+                    score=float(score),
                     chapter_number=chapter_number,
                     chapter_title=str(row["chapter_title"]),
                     parent_id=str(row["parent_id"]),
@@ -275,4 +371,25 @@ class EmbeddingRetriever:
             existing = parent_best.get(hit.parent_id)
             if existing is None or hit.score > existing.score:
                 parent_best[hit.parent_id] = hit
-        return sorted(parent_best.values(), key=lambda item: (-item.score, item.chapter_number))[: self.settings.top_k_parents]
+        return sorted(parent_best.values(), key=lambda item: (-item.score, item.chapter_number))[
+            : self.settings.top_k_parents
+        ]
+
+    def _search_candidates(self, backend: str, index_data: Any, query_vector, *, np) -> tuple[list[float], list[int]]:
+        candidate_count = max(self.settings.top_k_children * 8, self.settings.top_k_parents * 12, 32)
+        if backend == "faiss":
+            search_count = min(candidate_count, getattr(index_data, "ntotal", candidate_count))
+            scores, indices = index_data.search(query_vector.reshape(1, -1), search_count)
+            return scores[0].tolist(), [int(i) for i in indices[0].tolist()]
+
+        vectors = index_data
+        scores = vectors @ query_vector
+        if scores.size == 0:
+            return [], []
+        candidate_count = min(scores.size, candidate_count)
+        if candidate_count < scores.size:
+            selected = np.argpartition(scores, -candidate_count)[-candidate_count:]
+            ordered = selected[np.argsort(scores[selected])[::-1]]
+        else:
+            ordered = np.argsort(scores)[::-1]
+        return [float(scores[int(i)]) for i in ordered.tolist()], [int(i) for i in ordered.tolist()]

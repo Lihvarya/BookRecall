@@ -158,6 +158,86 @@ class BookRecallWebService:
         finally:
             store.close()
 
+    def get_book_stats(self, book_id: str) -> dict[str, int]:
+        store = self._open_store()
+        try:
+            return store.get_stats(book_id)
+        finally:
+            store.close()
+
+    def list_themes(self, book_id: str) -> list[dict[str, object]]:
+        store = self._open_store()
+        try:
+            rows = store.list_themes_with_aliases(book_id)
+            return [
+                {
+                    "name": row["name"],
+                    "first_chapter_number": int(row["first_chapter_number"]),
+                    "mention_count": int(row["mention_count"]),
+                    "aliases": row["aliases"].split("、") if row["aliases"] else [],
+                }
+                for row in rows
+            ]
+        finally:
+            store.close()
+
+    def list_events(
+        self,
+        book_id: str,
+        *,
+        entity_name: str | None = None,
+        max_chapter: int | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        store = self._open_store()
+        try:
+            rows = store.search_events(
+                book_id,
+                entity_name=entity_name,
+                max_chapter=max_chapter,
+                limit=limit,
+            )
+            return [
+                {
+                    "chapter_number": int(row["chapter_number"]),
+                    "chapter_title": row["chapter_title"],
+                    "event_type": row["event_type"],
+                    "summary": row["summary"],
+                    "excerpt": row["excerpt"],
+                    "entities": row["entities"].split("、") if row["entities"] else [],
+                }
+                for row in rows
+            ]
+        finally:
+            store.close()
+
+    def list_relations(
+        self,
+        book_id: str,
+        *,
+        entity_name: str | None = None,
+        max_chapter: int | None = None,
+        limit: int = 40,
+    ) -> list[dict[str, object]]:
+        store = self._open_store()
+        try:
+            if entity_name:
+                rows = store.list_relations_for_entity(book_id, entity_name, max_chapter=max_chapter)
+            else:
+                rows = store.list_relations(book_id, max_chapter=max_chapter, limit=limit)
+            return [
+                {
+                    "source_entity": row["source_entity"],
+                    "target_entity": row["target_entity"],
+                    "relation_type": row["relation_type"],
+                    "first_chapter_number": int(row["first_chapter_number"]),
+                    "mention_count": int(row["mention_count"]),
+                }
+                for row in rows[:limit]
+            ]
+        finally:
+            store.close()
+
     def get_progress(self, book_id: str, user_id: str) -> dict[str, object]:
         store = self._open_store()
         try:
@@ -186,12 +266,33 @@ class BookRecallWebService:
         finally:
             store.close()
 
+    def get_session_history(
+        self,
+        book_id: str,
+        user_id: str,
+        session_id: str,
+        *,
+        limit: int = 10,
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            turns = store.list_agent_turns(book_id, user_id, session_id, limit=limit)
+        finally:
+            store.close()
+        return {
+            "book_id": book_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "turns": turns,
+        }
+
     def ask(
         self,
         *,
         book_id: str,
         question: str,
         user_id: str = "default",
+        session_id: str | None = None,
         progress_chapter: int | None = None,
         retriever_mode: str = "lexical",
         cloud_config: dict[str, object] | None = None,
@@ -205,6 +306,7 @@ class BookRecallWebService:
                 book_id=book_id,
                 question=question,
                 user_id=user_id,
+                session_id=session_id,
                 progress_chapter=progress_chapter,
             )
             payload = agent.to_payload(card)
@@ -214,6 +316,18 @@ class BookRecallWebService:
                 "cloud_reasoner_enabled": reasoner.enabled,
                 "cloud_model": reasoner.model if reasoner.enabled else None,
             }
+            if session_id:
+                session_data = {
+                    "book_id": book_id,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "turns": store.list_agent_turns(book_id, user_id, session_id, limit=10),
+                }
+                payload["session"] = session_data
+                payload["trace"] = session_data["turns"][-1]["trace"] if session_data["turns"] else []
+            else:
+                payload["session"] = None
+                payload["trace"] = []
             return payload
         finally:
             store.close()
@@ -292,11 +406,84 @@ class BookRecallHandler(BaseHTTPRequestHandler):
             self._send_json({"book_id": book_id, "chapters": self.service.list_chapters(book_id, limit)})
             return
 
+        if path.startswith("/api/books/") and path.endswith("/stats"):
+            book_id = path[len("/api/books/") : -len("/stats")].strip("/")
+            self._send_json({"book_id": book_id, "stats": self.service.get_book_stats(book_id)})
+            return
+
+        if path.startswith("/api/books/") and path.endswith("/themes"):
+            book_id = path[len("/api/books/") : -len("/themes")].strip("/")
+            self._send_json({"book_id": book_id, "themes": self.service.list_themes(book_id)})
+            return
+
+        if path.startswith("/api/books/") and path.endswith("/events"):
+            book_id = path[len("/api/books/") : -len("/events")].strip("/")
+            query = parse_qs(parsed.query)
+            entity_name = query.get("entity", [""])[0].strip() or None
+            limit_raw = query.get("limit", ["20"])[0]
+            max_chapter_raw = query.get("max_chapter", [""])[0]
+            try:
+                limit = max(1, min(100, int(limit_raw)))
+                max_chapter = int(max_chapter_raw) if max_chapter_raw else None
+            except ValueError:
+                limit = 20
+                max_chapter = None
+            self._send_json(
+                {
+                    "book_id": book_id,
+                    "events": self.service.list_events(
+                        book_id,
+                        entity_name=entity_name,
+                        max_chapter=max_chapter,
+                        limit=limit,
+                    ),
+                }
+            )
+            return
+
+        if path.startswith("/api/books/") and path.endswith("/relations"):
+            book_id = path[len("/api/books/") : -len("/relations")].strip("/")
+            query = parse_qs(parsed.query)
+            entity_name = query.get("entity", [""])[0].strip() or None
+            limit_raw = query.get("limit", ["40"])[0]
+            max_chapter_raw = query.get("max_chapter", [""])[0]
+            try:
+                limit = max(1, min(100, int(limit_raw)))
+                max_chapter = int(max_chapter_raw) if max_chapter_raw else None
+            except ValueError:
+                limit = 40
+                max_chapter = None
+            self._send_json(
+                {
+                    "book_id": book_id,
+                    "relations": self.service.list_relations(
+                        book_id,
+                        entity_name=entity_name,
+                        max_chapter=max_chapter,
+                        limit=limit,
+                    ),
+                }
+            )
+            return
+
         if path.startswith("/api/books/") and path.endswith("/progress"):
             book_id = path[len("/api/books/") : -len("/progress")].strip("/")
             query = parse_qs(parsed.query)
             user_id = query.get("user", ["default"])[0]
             self._send_json(self.service.get_progress(book_id, user_id))
+            return
+
+        if path.startswith("/api/books/") and path.endswith("/session"):
+            book_id = path[len("/api/books/") : -len("/session")].strip("/")
+            query = parse_qs(parsed.query)
+            user_id = query.get("user", ["default"])[0]
+            session_id = query.get("session", ["default-session"])[0]
+            limit_raw = query.get("limit", ["10"])[0]
+            try:
+                limit = max(1, min(50, int(limit_raw)))
+            except ValueError:
+                limit = 10
+            self._send_json(self.service.get_session_history(book_id, user_id, session_id, limit=limit))
             return
 
         if path == "/health":
@@ -315,6 +502,7 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 book_id = str(payload.get("book_id", "")).strip()
                 question = str(payload.get("question", "")).strip()
                 user_id = str(payload.get("user_id", "default")).strip() or "default"
+                session_id = str(payload.get("session_id", "")).strip() or None
                 retriever_mode = str(payload.get("retriever", "lexical")).strip() or "lexical"
                 progress_raw = payload.get("progress_chapter")
                 progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
@@ -329,6 +517,7 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                         book_id=book_id,
                         question=question,
                         user_id=user_id,
+                        session_id=session_id,
                         progress_chapter=progress_chapter,
                         retriever_mode=retriever_mode,
                         cloud_config=cloud_config,
@@ -546,7 +735,7 @@ def _build_index_html() -> str:
       align-items: start;
       margin-bottom: 18px;
     }
-    .status, .mini-card, .book-item, .entity-item, .evidence-item, .suggestion-item {
+    .status, .mini-card, .book-item, .entity-item, .evidence-item, .suggestion-item, .quick-item {
       border: 1px solid var(--line);
       background: rgba(255, 255, 255, 0.68);
       border-radius: 18px;
@@ -557,7 +746,8 @@ def _build_index_html() -> str:
       line-height: 1.6;
     }
     .stack { display: grid; gap: 10px; }
-    .books, .entities, .chapters, .model-list, .evidence, .suggestions { display: grid; gap: 10px; }
+    .books, .entities, .chapters, .themes, .events, .relations, .model-list, .evidence, .suggestions, .quick-actions { display: grid; gap: 10px; }
+    .turns, .trace-list { display: grid; gap: 10px; }
     .book-item strong, .entity-item strong, .mini-card strong { display: block; margin-bottom: 4px; }
     .muted { color: var(--muted); }
     .mono { font-family: var(--mono); font-size: 12px; }
@@ -583,11 +773,46 @@ def _build_index_html() -> str:
     }
     .answer-head { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
     .answer-text { font-size: 18px; line-height: 1.75; margin: 0; white-space: pre-wrap; }
+    .turn-item, .trace-item {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.68);
+      border-radius: 18px;
+      padding: 13px 15px;
+    }
+    .trace-item code, .turn-item code {
+      font-family: var(--mono);
+      font-size: 12px;
+    }
     .grid-two {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 12px;
       margin-top: 16px;
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .stat-cell {
+      padding: 10px;
+      border-radius: 14px;
+      background: rgba(41, 91, 69, 0.08);
+    }
+    .stat-cell strong {
+      display: block;
+      font-size: 18px;
+    }
+    .quick-actions {
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+    }
+    .quick-item {
+      color: var(--green);
+      background: rgba(255, 255, 255, 0.56);
+      box-shadow: none;
+      border: 1px solid rgba(41, 91, 69, 0.16);
+      padding: 11px 10px;
+      font-size: 13px;
     }
     .empty {
       padding: 24px 16px;
@@ -614,7 +839,7 @@ def _build_index_html() -> str:
       .settings { grid-column: 1 / -1; }
     }
     @media (max-width: 820px) {
-      .shell { grid-template-columns: 1fr; }
+      .shell, .quick-actions { grid-template-columns: 1fr; }
       .hero, .grid-two, .inline { grid-template-columns: 1fr; }
     }
   </style>
@@ -636,6 +861,11 @@ def _build_index_html() -> str:
       </div>
 
       <div class="section">
+        <label class="label" for="sessionInput">会话 ID</label>
+        <input id="sessionInput" value="default-session" placeholder="同一会话内支持连续追问">
+      </div>
+
+      <div class="section">
         <label class="label" for="progressInput">阅读进度</label>
         <div class="inline">
           <input id="progressInput" type="number" min="1" step="1" placeholder="已读章节">
@@ -649,8 +879,36 @@ def _build_index_html() -> str:
 
       <div class="section">
         <details open>
+          <summary class="label">索引雷达</summary>
+          <div class="stats-grid" id="statsPanel"></div>
+        </details>
+      </div>
+
+      <div class="section">
+        <details open>
           <summary class="label">实体索引</summary>
           <div class="entities" id="entitiesPanel"></div>
+        </details>
+      </div>
+
+      <div class="section">
+        <details>
+          <summary class="label">主题线索</summary>
+          <div class="themes" id="themesPanel"></div>
+        </details>
+      </div>
+
+      <div class="section">
+        <details>
+          <summary class="label">事件链</summary>
+          <div class="events" id="eventsPanel"></div>
+        </details>
+      </div>
+
+      <div class="section">
+        <details>
+          <summary class="label">关系索引</summary>
+          <div class="relations" id="relationsPanel"></div>
         </details>
       </div>
 
@@ -682,11 +940,36 @@ def _build_index_html() -> str:
       </div>
 
       <div class="section">
+        <span class="label">快捷提问模板</span>
+        <div class="quick-actions">
+          <button class="quick-item" type="button" data-template="{entity}第一次出现在哪一章？">首次出现</button>
+          <button class="quick-item" type="button" data-template="{entity}后来还有出现过吗？">轨迹追踪</button>
+          <button class="quick-item" type="button" data-template="{entity}还和谁有关？">关系回忆</button>
+          <button class="quick-item" type="button" data-template="{theme}前后有什么变化？">主题变化</button>
+          <button class="quick-item" type="button" data-template="{entity}涉及哪些关键事件？">关键事件</button>
+        </div>
+      </div>
+
+      <div class="section">
         <button id="askBtn" type="button">唤醒这段记忆</button>
       </div>
 
       <section class="answer-card" id="answerCard">
         <div class="empty">先选择一本书并提出问题。这里会显示结构化记忆卡片、证据片段和继续追问方向。</div>
+      </section>
+
+      <section class="section">
+        <span class="label">会话历史</span>
+        <div class="turns" id="sessionPanel">
+          <div class="empty">当前会话还没有历史记录。</div>
+        </div>
+      </section>
+
+      <section class="section">
+        <span class="label">本轮工具轨迹</span>
+        <div class="trace-list" id="tracePanel">
+          <div class="empty">提问后会显示本轮工具调用轨迹。</div>
+        </div>
       </section>
 
       <section class="section">
@@ -752,19 +1035,29 @@ def _build_index_html() -> str:
       runtime: null,
       providers: {},
       currentBookId: "",
-      currentUserId: "default"
+      currentUserId: "default",
+      currentSessionId: "default-session",
+      entities: [],
+      themes: []
     };
 
     const els = {
       bookSelect: document.getElementById("bookSelect"),
       userInput: document.getElementById("userInput"),
+      sessionInput: document.getElementById("sessionInput"),
       progressInput: document.getElementById("progressInput"),
       questionInput: document.getElementById("questionInput"),
       statusBar: document.getElementById("statusBar"),
       bookMeta: document.getElementById("bookMeta"),
       booksPanel: document.getElementById("booksPanel"),
+      statsPanel: document.getElementById("statsPanel"),
       entitiesPanel: document.getElementById("entitiesPanel"),
+      themesPanel: document.getElementById("themesPanel"),
+      eventsPanel: document.getElementById("eventsPanel"),
+      relationsPanel: document.getElementById("relationsPanel"),
       chaptersPanel: document.getElementById("chaptersPanel"),
+      sessionPanel: document.getElementById("sessionPanel"),
+      tracePanel: document.getElementById("tracePanel"),
       answerCard: document.getElementById("answerCard"),
       retrieverSelect: document.getElementById("retrieverSelect"),
       retrieverPill: document.getElementById("retrieverPill"),
@@ -869,6 +1162,72 @@ def _build_index_html() -> str:
       `).join("");
     }
 
+    function renderStats(stats) {
+      const items = [
+        ["章节", stats.chapters || 0],
+        ["实体", stats.entities || 0],
+        ["实体提及", stats.entity_mentions || 0],
+        ["关系", stats.relations || 0],
+        ["主题", stats.themes || 0],
+        ["事件", stats.events || 0]
+      ];
+      els.statsPanel.innerHTML = items.map(([label, value]) => `
+        <div class="stat-cell">
+          <strong>${escapeHtml(value)}</strong>
+          <span class="muted tiny">${escapeHtml(label)}</span>
+        </div>
+      `).join("");
+    }
+
+    function renderThemes(themes) {
+      if (!themes.length) {
+        els.themesPanel.innerHTML = '<div class="empty">这本书还没有主题索引。可在 build 时传入 --themes。</div>';
+        return;
+      }
+      els.themesPanel.innerHTML = themes.slice(0, 12).map((theme) => `
+        <div class="entity-item">
+          <strong>${escapeHtml(theme.name)}</strong>
+          <div>首次出现：第 ${theme.first_chapter_number} 章</div>
+          <div>线索数：${theme.mention_count}</div>
+          <div class="muted">${theme.aliases.length ? "别名：" + escapeHtml(theme.aliases.join("、")) : "无别名"}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderEvents(events) {
+      if (!events.length) {
+        els.eventsPanel.innerHTML = '<div class="empty">这本书还没有事件链索引。</div>';
+        return;
+      }
+      els.eventsPanel.innerHTML = events.slice(0, 12).map((event) => `
+        <div class="entity-item">
+          <div class="pill-row">
+            <span class="pill">第 ${event.chapter_number} 章</span>
+            <span class="pill">${escapeHtml(event.event_type)}</span>
+          </div>
+          <strong>${escapeHtml(event.summary)}</strong>
+          <div class="muted tiny">${escapeHtml((event.entities || []).join("、"))}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderRelations(relations) {
+      if (!relations.length) {
+        els.relationsPanel.innerHTML = '<div class="empty">这本书还没有关系索引。</div>';
+        return;
+      }
+      els.relationsPanel.innerHTML = relations.slice(0, 12).map((relation) => `
+        <div class="entity-item">
+          <strong>${escapeHtml(relation.source_entity)} ↔ ${escapeHtml(relation.target_entity)}</strong>
+          <div class="pill-row">
+            <span class="pill">${escapeHtml(relation.relation_type)}</span>
+            <span class="pill">第 ${relation.first_chapter_number} 章起</span>
+            <span class="pill">${relation.mention_count} 条证据</span>
+          </div>
+        </div>
+      `).join("");
+    }
+
     function renderChapters(chapters) {
       if (!chapters.length) {
         els.chaptersPanel.innerHTML = '<div class="empty">还没有章节索引。</div>';
@@ -878,6 +1237,48 @@ def _build_index_html() -> str:
         <div class="entity-item">
           <strong>第 ${chapter.chapter_number} 章 ${escapeHtml(chapter.title)}</strong>
           <div class="muted">${escapeHtml((chapter.summary || "").slice(0, 70))}${(chapter.summary || "").length > 70 ? "..." : ""}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderSession(turns) {
+      if (!turns || !turns.length) {
+        els.sessionPanel.innerHTML = '<div class="empty">当前会话还没有历史记录。</div>';
+        return;
+      }
+      els.sessionPanel.innerHTML = turns.slice().reverse().map((turn) => `
+        <div class="turn-item">
+          <div class="pill-row">
+            <span class="pill">第 ${escapeHtml(turn.turn_index)} 轮</span>
+            ${turn.entity_name ? `<span class="pill">实体：${escapeHtml(turn.entity_name)}</span>` : ""}
+            <span class="pill">进度：第 ${escapeHtml(turn.progress_chapter)} 章</span>
+          </div>
+          <p><strong>问：</strong>${escapeHtml(turn.question || "")}</p>
+          <p><strong>答：</strong>${escapeHtml(turn.answer || "")}</p>
+          ${turn.summary ? `<div class="muted tiny">${escapeHtml(turn.summary)}</div>` : ""}
+        </div>
+      `).join("");
+    }
+
+    function renderTrace(trace) {
+      if (!trace || !trace.length) {
+        els.tracePanel.innerHTML = '<div class="empty">提问后会显示本轮工具调用轨迹。</div>';
+        return;
+      }
+      els.tracePanel.innerHTML = trace.map((item) => `
+        <div class="trace-item">
+          <div class="pill-row">
+            <span class="pill">step ${escapeHtml(item.step)}</span>
+            <span class="pill">${escapeHtml(item.tool_name || "unknown")}</span>
+            ${item.spoiler_blocked ? '<span class="pill warn">触发防剧透</span>' : ""}
+            <span class="pill">hits: ${escapeHtml(item.hit_count ?? 0)}</span>
+          </div>
+          <div class="tiny"><strong>thought</strong></div>
+          <div class="muted">${escapeHtml(item.thought || "")}</div>
+          <div class="tiny"><strong>arguments</strong></div>
+          <code>${escapeHtml(JSON.stringify(item.arguments || {}, null, 2))}</code>
+          <div class="tiny"><strong>observation</strong></div>
+          <div class="muted">${escapeHtml(item.observation_summary || "")}</div>
         </div>
       `).join("");
     }
@@ -924,6 +1325,8 @@ def _build_index_html() -> str:
           askQuestion();
         });
       });
+      renderSession(card.session ? (card.session.turns || []) : []);
+      renderTrace(card.trace || []);
     }
 
     function updatePills() {
@@ -984,6 +1387,16 @@ def _build_index_html() -> str:
       };
     }
 
+    function applyQuestionTemplate(template) {
+      const entity = state.entities[0]?.name || "黑衣人";
+      const theme = state.themes[0]?.name || "自由意志";
+      els.questionInput.value = template
+        .replaceAll("{entity}", entity)
+        .replaceAll("{theme}", theme);
+      els.questionInput.focus();
+      setStatus("已填入快捷问题，可以直接提问。");
+    }
+
     async function loadBooks() {
       const [booksData, runtime] = await Promise.all([
         requestJson("/api/books"),
@@ -1020,13 +1433,26 @@ def _build_index_html() -> str:
         <div>章节 ${book.chapter_count} · 实体 ${book.entity_count}</div>
         <div class="muted mono">${escapeHtml(book.book_id)}</div>
       `;
-      const [entitiesData, chaptersData, progressData] = await Promise.all([
+      const [entitiesData, chaptersData, progressData, sessionData, statsData, themesData, eventsData, relationsData] = await Promise.all([
         requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/entities`),
         requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/chapters?limit=60`),
-        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/progress?user=${encodeURIComponent(state.currentUserId)}`)
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/progress?user=${encodeURIComponent(state.currentUserId)}`),
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session?user=${encodeURIComponent(state.currentUserId)}&session=${encodeURIComponent(state.currentSessionId)}&limit=10`),
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/stats`),
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/themes`),
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/events?limit=20`),
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/relations?limit=40`)
       ]);
+      state.entities = entitiesData.entities || [];
+      state.themes = themesData.themes || [];
       renderEntities(entitiesData.entities || []);
+      renderStats(statsData.stats || {});
+      renderThemes(themesData.themes || []);
+      renderEvents(eventsData.events || []);
+      renderRelations(relationsData.relations || []);
       renderChapters(chaptersData.chapters || []);
+      renderSession(sessionData.turns || []);
+      renderTrace([]);
       els.progressInput.value = progressData.progress_chapter || progressData.max_chapter || "";
       setStatus(`已加载《${book.title}》。`);
     }
@@ -1065,6 +1491,7 @@ def _build_index_html() -> str:
       const payload = {
         book_id: state.currentBookId,
         user_id: state.currentUserId,
+        session_id: state.currentSessionId,
         question,
         progress_chapter: els.progressInput.value ? Number(els.progressInput.value) : null,
         retriever: els.retrieverSelect.value,
@@ -1086,6 +1513,10 @@ def _build_index_html() -> str:
       state.currentUserId = els.userInput.value.trim() || "default";
       await loadBookDetails();
     });
+    els.sessionInput.addEventListener("change", () => {
+      state.currentSessionId = els.sessionInput.value.trim() || "default-session";
+      loadBookDetails().catch((err) => setStatus(err.message));
+    });
     els.retrieverSelect.addEventListener("change", updatePills);
     els.cloudEnabledInput.addEventListener("change", updatePills);
     els.apiModelInput.addEventListener("input", updatePills);
@@ -1103,6 +1534,9 @@ def _build_index_html() -> str:
       els.rememberApiInput.checked = false;
       applyProvider(els.providerSelect.value);
       setStatus("已清除浏览器保存的 API 设置。");
+    });
+    document.querySelectorAll("[data-template]").forEach((btn) => {
+      btn.addEventListener("click", () => applyQuestionTemplate(btn.dataset.template || ""));
     });
 
     loadBooks().catch((err) => {

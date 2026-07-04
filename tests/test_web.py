@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from urllib.parse import quote
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,7 +14,7 @@ if str(SRC) not in sys.path:
 
 from bookrecall.chunking import build_chunk_hierarchy
 from bookrecall.config import DEFAULT_CHUNK_SETTINGS
-from bookrecall.entity_index import build_entity_records
+from bookrecall.entity_index import build_entity_records, build_event_records, build_relation_records, build_theme_records
 from bookrecall.parser import parse_chapters
 from bookrecall.storage import BookRecallStore
 from bookrecall.web import make_server
@@ -24,11 +25,11 @@ SAMPLE_TEXT = """第1章 起点
 
 第2章 阴影
 
-黑衣人在雨里出现。
+黑衣人在雨里出现，林澈与黑衣人对峙。
 
 第3章 回声
 
-黑衣人再次提到【星辰之匙】。
+黑衣人再次提到【星辰之匙】，林澈决定追查自由意志的真相。
 """
 
 
@@ -43,9 +44,12 @@ class BookRecallWebTest(unittest.TestCase):
         parents, children = build_chunk_hierarchy("sample", chapters, DEFAULT_CHUNK_SETTINGS)
         entity_records = build_entity_records(
             chapters,
-            {"星辰之匙": ["钥匙"], "黑衣人": ["黑袍人"]},
+            {"林澈": [], "星辰之匙": ["钥匙"], "黑衣人": ["黑袍人"]},
             DEFAULT_CHUNK_SETTINGS,
         )
+        relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+        theme_records = build_theme_records(chapters, {"自由意志": ["真相"]}, DEFAULT_CHUNK_SETTINGS)
+        event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
         store.replace_book(
             book_id="sample",
             title="测试书",
@@ -54,6 +58,9 @@ class BookRecallWebTest(unittest.TestCase):
             parent_chunks=parents,
             child_chunks=children,
             entity_records=entity_records,
+            relation_records=relation_records,
+            theme_records=theme_records,
+            event_records=event_records,
         )
         store.close()
 
@@ -120,6 +127,39 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("deepseek", provider_ids)
         self.assertEqual(data["retrievers"][0]["id"], "lexical")
 
+    def test_stats_themes_events_and_relations_endpoints(self) -> None:
+        stats = self._get_json("/api/books/sample/stats")
+        self.assertGreaterEqual(stats["stats"]["themes"], 1)
+        self.assertGreaterEqual(stats["stats"]["events"], 1)
+        self.assertGreaterEqual(stats["stats"]["relations"], 1)
+
+        themes = self._get_json("/api/books/sample/themes")
+        self.assertEqual(themes["themes"][0]["name"], "自由意志")
+
+        encoded_entity = quote("黑衣人")
+        events = self._get_json(f"/api/books/sample/events?entity={encoded_entity}&limit=10")
+        self.assertTrue(events["events"])
+        self.assertTrue(any("黑衣人" in item["entities"] for item in events["events"]))
+
+        relations = self._get_json(f"/api/books/sample/relations?entity={encoded_entity}&limit=10")
+        self.assertTrue(relations["relations"])
+        self.assertTrue(
+            any("黑衣人" in {item["source_entity"], item["target_entity"]} for item in relations["relations"])
+        )
+
+    def test_event_chain_question_via_api(self) -> None:
+        answer = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "event-thread",
+                "question": "黑衣人涉及哪些关键事件？",
+            },
+        )
+        self.assertEqual(answer["intent"], "事件链回忆")
+        self.assertTrue(any(item["tool_name"] == "search_events" for item in answer["trace"]))
+
     def test_ask_accepts_runtime_options(self) -> None:
         answer = self._post_json(
             "/api/ask",
@@ -140,11 +180,58 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertFalse(answer["runtime"]["cloud_reasoner_enabled"])
         self.assertIn("rendered_text", answer)
 
+    def test_session_memory_via_api(self) -> None:
+        first = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "thread-1",
+                "question": "黑袍人第一次出现在哪一章？",
+            },
+        )
+        second = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "thread-1",
+                "question": "后来还有出现过吗？",
+            },
+        )
+        self.assertEqual(first["entity_name"], "黑衣人")
+        self.assertEqual(second["entity_name"], "黑衣人")
+        self.assertIn("第 2 章", second["answer"])
+        self.assertIn("第 3 章", second["answer"])
+        self.assertEqual(second["session"]["session_id"], "thread-1")
+        self.assertEqual(len(second["session"]["turns"]), 2)
+        self.assertTrue(second["trace"])
+
+    def test_session_endpoint(self) -> None:
+        self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "thread-2",
+                "question": "黑袍人第一次出现在哪一章？",
+            },
+        )
+        data = self._get_json("/api/books/sample/session?user=alice&session=thread-2&limit=10")
+        self.assertEqual(data["session_id"], "thread-2")
+        self.assertEqual(len(data["turns"]), 1)
+        self.assertEqual(data["turns"][0]["entity_name"], "黑衣人")
+        self.assertTrue(data["turns"][0]["trace"])
+
     def test_index_page(self) -> None:
         with urllib.request.urlopen(f"{self.base_url}/") as response:
             html = response.read().decode("utf-8")
         self.assertIn("BookRecall", html)
-        self.assertIn("唤醒这段记忆", html)
+        self.assertIn("会话历史", html)
+        self.assertIn("本轮工具轨迹", html)
+        self.assertIn("主题线索", html)
+        self.assertIn("事件链", html)
+        self.assertIn("快捷提问模板", html)
 
     def test_chapters_endpoint(self) -> None:
         data = self._get_json("/api/books/sample/chapters")

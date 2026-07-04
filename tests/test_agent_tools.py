@@ -17,7 +17,13 @@ from bookrecall.agent.state import AgentState
 from bookrecall.agent.tools import build_default_registry
 from bookrecall.chunking import build_chunk_hierarchy
 from bookrecall.config import DEFAULT_CHUNK_SETTINGS, DEFAULT_SEARCH_SETTINGS
-from bookrecall.entity_index import build_entity_records
+from bookrecall.entity_index import (
+    auto_discover_themes,
+    build_entity_records,
+    build_event_records,
+    build_relation_records,
+    build_theme_records,
+)
 from bookrecall.parser import parse_chapters
 from bookrecall.retrieval import LocalRetriever
 from bookrecall.storage import BookRecallStore
@@ -48,9 +54,14 @@ class AgentToolsTest(unittest.TestCase):
             {"星辰之匙": ["钥匙"], "黑衣人": ["黑袍人"], "林澈": []},
             DEFAULT_CHUNK_SETTINGS,
         )
+        relation_records = build_relation_records(chapters, records, DEFAULT_CHUNK_SETTINGS)
+        theme_records = build_theme_records(chapters, auto_discover_themes(SAMPLE), DEFAULT_CHUNK_SETTINGS)
+        event_records = build_event_records(chapters, records, DEFAULT_CHUNK_SETTINGS)
         self.store.replace_book(
             book_id="b", title="测", source_path="mem",
-            chapters=chapters, parent_chunks=parents, child_chunks=children, entity_records=records,
+            chapters=chapters, parent_chunks=parents, child_chunks=children,
+            entity_records=records, relation_records=relation_records,
+            theme_records=theme_records, event_records=event_records,
         )
         self.retriever = LocalRetriever(self.store, DEFAULT_SEARCH_SETTINGS)
         self.registry = build_default_registry(self.store, self.retriever)
@@ -109,6 +120,37 @@ class AgentToolsTest(unittest.TestCase):
         self.assertEqual(r["canonical_name"], "黑衣人")
         self.assertIn("黑袍人", r["aliases"])
 
+    def test_lookup_relations(self) -> None:
+        r = self.run_tool(
+            "lookup_relations",
+            self._state(3, "林澈和黑衣人是什么关系？"),
+            {"source_entity": "林澈", "target_entity": "黑衣人"},
+        )
+        self.assertTrue(r["found"])
+        self.assertGreaterEqual(r["count"], 1)
+        self.assertIn("fragments", r["relations"][0])
+
+    def test_search_theme(self) -> None:
+        r = self.run_tool(
+            "search_theme",
+            self._state(3, "自由意志的观点前后有什么变化？"),
+            {"theme": "自由意志"},
+        )
+        self.assertTrue(r["found"])
+        self.assertEqual(r["theme_name"], "自由意志")
+        self.assertEqual(r["chapters"], [2, 3])
+        self.assertGreaterEqual(r["count"], 2)
+
+    def test_search_events(self) -> None:
+        r = self.run_tool(
+            "search_events",
+            self._state(3, "星辰之匙涉及哪些关键事件？"),
+            {"query": "星辰之匙关键事件", "entity": "星辰之匙"},
+        )
+        self.assertTrue(r["found"])
+        self.assertGreaterEqual(r["count"], 2)
+        self.assertIn("chain_summary", r)
+
     def test_get_chapter_summary(self) -> None:
         r = self.run_tool("get_chapter_summary", self._state(3), {"chapter": 1})
         self.assertTrue(r["found"])
@@ -125,10 +167,11 @@ class AgentToolsTest(unittest.TestCase):
 
     def test_registry_describe_for_llm(self) -> None:
         desc = self.registry.describe_for_llm()
-        self.assertEqual(len(desc), 6)
+        self.assertEqual(len(desc), 9)
         names = {d["name"] for d in desc}
         self.assertEqual(names, {
             "lookup_first_appearance", "lookup_timeline", "search_evidence",
+            "lookup_relations", "search_theme", "search_events",
             "lookup_entity_aliases", "get_chapter_summary", "list_entities",
         })
 

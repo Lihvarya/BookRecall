@@ -89,6 +89,7 @@ class LLMReActPolicy(DecisionPolicy):
             for tr in state.trace
         ]
         trace_text = "\n".join(trace_lines) if trace_lines else "（尚未调用任何工具）"
+        recent_turns_text = self._format_recent_turns(state)
         evidence_chapters = [e.chapter_number for e in state.evidence]
         tools_json = json.dumps(registry.describe_for_llm(), ensure_ascii=False, indent=2)
         prompt = (
@@ -96,6 +97,8 @@ class LLMReActPolicy(DecisionPolicy):
             f"问题：{state.question}\n"
             f"阅读进度：第 {state.progress_chapter} 章（任何章节号都不许超过它）\n"
             f"已识别实体：{state.matched_entities} / 规范名：{state.primary_entity}\n"
+            f"已识别主题：{state.matched_themes}\n"
+            f"同会话最近几轮：\n{recent_turns_text}\n"
             f"已调用工具：\n{trace_text}\n"
             f"当前累积证据章节：{evidence_chapters}\n\n"
             f"可用工具：\n{tools_json}\n"
@@ -104,6 +107,19 @@ class LLMReActPolicy(DecisionPolicy):
             {"role": "system", "content": "你是 BookRecall 的回忆助手。优先使用 tools 完成多步检索；如果证据已经足够，可以直接给出最终回答。回答必须基于证据，不得剧透超过阅读进度的内容。"},
             {"role": "user", "content": prompt},
         ]
+
+    @staticmethod
+    def _format_recent_turns(state: "AgentState") -> str:
+        if not state.recent_turns:
+            return "（无）"
+        lines: list[str] = []
+        for turn in state.recent_turns[-3:]:
+            question = str(turn.get("question", "")).strip()
+            entity = str(turn.get("entity_name", "")).strip()
+            answer = str(turn.get("answer", "")).strip()
+            short_answer = answer[:120] + ("..." if len(answer) > 120 else "")
+            lines.append(f"- 问：{question} | 实体：{entity or '无'} | 答：{short_answer}")
+        return "\n".join(lines)
 
 
 def _decision_from_tool_calls(tool_calls: list[object], registry: "ToolRegistry") -> Decision:

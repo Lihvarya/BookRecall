@@ -22,6 +22,9 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
 - 可选本地 embedding：支持 `sentence-transformers` 本地语义检索。
 - 可选外部大模型：支持 OpenAI-compatible API，例如 DeepSeek。
 - 内置网页端：可以查看书库、设置阅读进度、切换检索器、配置外部 API、查看本地模型状态。
+- 人物关系第一版：基于同章共现和关键词粗分类，支持按阶段回答“谁和谁是什么关系/后来如何变化”。
+- 主题线索第一版：支持自动发现/手工指定主题词，并按阶段回答“某个观点前后有什么变化”。
+- 事件链第一版：基于实体共现和事件关键词抽取关键事件，支持回答“某个实体涉及哪些关键事件/主线发生了什么”。
 
 ## 当前能力
 
@@ -34,6 +37,7 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
   - `show-progress`
   - `list-books`
   - `list-entities`
+  - `list-themes`
   - `chapters`
   - `stats`
   - `clear`
@@ -46,12 +50,23 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
   - 规则策略 `RuleBasedPolicy`
   - 可选云端策略 `LLMReActPolicy`
   - 原生 tool calling 优先，文本协议回退
+  - 会话级连续追问记忆
+  - 关系查询意图 `relation_lookup`
+  - 主题线索意图 `theme_explore`
+  - 事件链回忆意图 `event_chain`
   - LangGraph 预留接口
 - Web 可用：
   - 书库总览
+  - 索引规模统计
   - 实体索引浏览
+  - 主题线索浏览
+  - 事件链浏览
+  - 关系索引浏览
   - 章节概览
   - 阅读进度管理
+  - 会话级连续追问
+  - 本轮工具 trace
+  - 快捷提问模板
   - 问答卡片
   - 检索器切换
   - DeepSeek / OpenAI-compatible API 设置
@@ -60,6 +75,7 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
   - `sentence-transformers`
   - 推荐模型：`BAAI/bge-small-zh-v1.5`
   - 本地向量索引保存到 `.bookrecall/vectors/`
+  - 支持 `numpy / faiss` 双后端，环境无 `faiss` 时自动回退
 
 如果你想看“已经实现了什么、还差什么”，请看 [AGENT_STATUS.md](/D:/BookRecall/AGENT_STATUS.md)。
 
@@ -78,6 +94,9 @@ BookRecall Agent
    |- Tools
    |  |- lookup_first_appearance
    |  |- lookup_timeline
+   |  |- lookup_relations
+   |  |- search_theme
+   |  |- search_events
    |  |- search_evidence
    |  |- lookup_entity_aliases
    |  |- get_chapter_summary
@@ -97,7 +116,11 @@ Local Storage Layer
    |- parent_chunks
    |- child_chunks
    |- entities / aliases / mentions
-   `- reader_state
+   |- relations / relation_mentions
+   |- themes / theme_aliases / theme_mentions
+   |- events / event_entities
+   |- reader_state
+   `- agent_memory
 
 Optional Cloud Layer
    `- OpenAI-compatible Chat Completions
@@ -188,6 +211,16 @@ python bookrecall.py build \
   --entities examples/sample_entities.txt
 ```
 
+如果你有主题词表，也可以加：
+
+```bash
+python bookrecall.py build \
+  --book-id sample \
+  --input examples/sample_book.txt \
+  --entities examples/sample_entities.txt \
+  --themes examples/sample_themes.txt
+```
+
 ### 2. 设置阅读进度
 
 ```bash
@@ -205,6 +238,30 @@ python bookrecall.py ask \
   --question "黑袍人第一次出现在哪一章？"
 ```
 
+也可以询问两个实体的关系和阶段变化：
+
+```bash
+python bookrecall.py ask \
+  --book-id sample \
+  --question "林澈和黑衣人是什么关系？"
+```
+
+也可以询问主题线索：
+
+```bash
+python bookrecall.py ask \
+  --book-id sample \
+  --question "自由意志的观点前后有什么变化？"
+```
+
+也可以询问事件链：
+
+```bash
+python bookrecall.py ask \
+  --book-id sample \
+  --question "星辰之匙涉及哪些关键事件？"
+```
+
 ### 4. 输出 JSON 卡片
 
 ```bash
@@ -213,6 +270,26 @@ python bookrecall.py ask \
   --format json \
   --question "黑袍人第一次出现在哪一章？"
 ```
+
+### 5. 在同一会话里连续追问
+
+```bash
+python bookrecall.py ask \
+  --book-id sample \
+  --session demo-thread \
+  --question "黑袍人第一次出现在哪一章？"
+
+python bookrecall.py ask \
+  --book-id sample \
+  --session demo-thread \
+  --question "后来还有出现过吗？"
+```
+
+说明：
+
+- `--session` 是可选参数。
+- 只要 `book_id + user + session_id` 一致，Agent 就会复用同一会话最近几轮的上下文。
+- 当前第一版主要复用“最近主实体”和简短问答摘要，适合连续追问“后来呢”“那他还有出现吗”这类问题。
 
 ## Web 界面
 
@@ -233,9 +310,15 @@ http://127.0.0.1:8000
 - 选择书籍
 - 查看书库统计
 - 查看实体索引
+- 查看主题线索
+- 查看事件链
+- 查看关系索引
 - 查看章节概览
 - 设置用户阅读进度
+- 输入会话 ID
 - 提交问答
+- 查看会话历史和本轮工具 trace
+- 使用“首次出现 / 轨迹追踪 / 关系回忆 / 主题变化 / 关键事件”快捷提问模板
 - 选择检索器：`lexical / embedding / auto`
 - 查看本地模型依赖状态
 - 查看每本书是否已有向量索引
@@ -262,6 +345,12 @@ python bookrecall.py embed-build \
   --book-id sample \
   --model BAAI/bge-small-zh-v1.5
 ```
+
+说明：
+
+- 如果当前环境可用 `faiss`，索引会优先构建为 `faiss` 后端。
+- 如果没有 `faiss`，会自动回退为 `numpy` 后端，不影响使用。
+- `python bookrecall.py models` 和 `embed-build` 输出里会显示实际使用的 backend。
 
 可选参数：
 
@@ -364,6 +453,8 @@ export BOOKRECALL_MODEL="deepseek-chat"
   - 提问并输出记忆卡片
 - `list-entities`
   - 查看实体索引
+- `list-themes`
+  - 查看主题线索索引
 - `models`
   - 查看本地模型状态
 - `embed-build`
@@ -396,6 +487,18 @@ export BOOKRECALL_MODEL="deepseek-chat"
 
 如果不传 `--entities`，系统会尝试自动发现实体。
 
+## 主题词表格式
+
+主题词表格式与实体词表一致：
+
+```text
+自由意志|自主选择,自由选择
+命运
+权力
+```
+
+如果不传 `--themes`，系统会用内置常见主题词做轻量自动发现，例如“自由意志、命运、选择、权力、信仰、人性”等。
+
 ## 输出结构
 
 BookRecall 的核心输出是一个结构化记忆卡片，包含：
@@ -427,13 +530,15 @@ python -m unittest discover -s tests -v
 - embedding 索引构建与检索
 - Agent 核心问答
 - Agent 工具层
+- 人物关系索引、阶段摘要与 `lookup_relations`
+- 主题线索索引、阶段摘要与 `search_theme`
 - LLM ReAct 文本解析
 - Web API
 
 当前代码状态下测试数量为：
 
 ```text
-44 tests
+60 tests
 ```
 
 ## 项目结构
@@ -483,9 +588,10 @@ examples/
 
 - LangGraph 还没有正式接入执行流
 - 虽然已经接入原生 tool calling 优先链路，但还没有做更完整的多供应商兼容验证
-- 还没有关系图谱和主题线索层
-- 还没有跨会话 Agent 记忆
-- 还没有真正的 FAISS 后端
+- 人物关系第一版已接入，能做阶段摘要，但还不是事件级高质量关系图谱
+- 主题线索第一版已接入，能做阶段摘要，但还不是完整深层主题演化分析
+- 跨会话 Agent 记忆已有第一版，但长期偏好和摘要压缩还没完成
+- FAISS 是可选后端，真实大规模性能还没有系统压测
 - Web 仍然是单页零依赖控制台，不是完整产品前端
 
 更详细的现状和路线见 [AGENT_STATUS.md](/D:/BookRecall/AGENT_STATUS.md)。

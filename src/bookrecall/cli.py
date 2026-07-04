@@ -16,7 +16,16 @@ from .embeddings import (
     dependency_report,
     get_vector_index_info,
 )
-from .entity_index import auto_discover_entities, build_entity_records, load_entity_lexicon
+from .entity_index import (
+    auto_discover_entities,
+    auto_discover_themes,
+    build_entity_records,
+    build_event_records,
+    build_relation_records,
+    build_theme_records,
+    load_entity_lexicon,
+    load_theme_lexicon,
+)
 from .parser import parse_chapters
 from .retrieval import LocalRetriever
 from .storage import BookRecallStore
@@ -34,6 +43,10 @@ def build_index(args: argparse.Namespace) -> None:
     if not entity_names:
         entity_names = auto_discover_entities(text)
     entity_records = build_entity_records(chapters, entity_names, DEFAULT_CHUNK_SETTINGS)
+    relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+    theme_names = auto_discover_themes(text, extra_terms=load_theme_lexicon(args.themes))
+    theme_records = build_theme_records(chapters, theme_names, DEFAULT_CHUNK_SETTINGS)
+    event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
 
     store = BookRecallStore(args.db)
     try:
@@ -46,6 +59,9 @@ def build_index(args: argparse.Namespace) -> None:
             parent_chunks=parent_chunks,
             child_chunks=child_chunks,
             entity_records=entity_records,
+            relation_records=relation_records,
+            theme_records=theme_records,
+            event_records=event_records,
         )
     finally:
         store.close()
@@ -53,7 +69,8 @@ def build_index(args: argparse.Namespace) -> None:
     print(
         f"建索引完成：book_id={args.book_id}，章节数={len(chapters)}，"
         f"parent_chunks={len(parent_chunks)}，child_chunks={len(child_chunks)}，"
-        f"实体数={len(entity_records)}"
+        f"实体数={len(entity_records)}，关系数={len(relation_records)}，"
+        f"主题数={len(theme_records)}，事件数={len(event_records)}"
     )
 
 
@@ -68,6 +85,7 @@ def ask_question(args: argparse.Namespace) -> None:
             question=args.question,
             user_id=args.user,
             progress_chapter=args.progress,
+            session_id=args.session,
         )
     finally:
         store.close()
@@ -165,6 +183,24 @@ def list_entities(args: argparse.Namespace) -> None:
         )
 
 
+def list_themes(args: argparse.Namespace) -> None:
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        rows = store.list_themes_with_aliases(args.book_id)
+    finally:
+        store.close()
+    if not rows:
+        print("当前这本书还没有主题索引。")
+        return
+    for row in rows:
+        alias_text = f" | 别名：{row['aliases']}" if row["aliases"] else ""
+        print(
+            f"- {row['name']} | 首次出现：第 {row['first_chapter_number']} 章 | "
+            f"提及次数：{row['mention_count']}{alias_text}"
+        )
+
+
 def serve_web(args: argparse.Namespace) -> None:
     run_server(args.host, args.port, args.db)
 
@@ -186,6 +222,10 @@ def show_stats(args: argparse.Namespace) -> None:
     print(f"- child chunks：{stats['child_chunks']}")
     print(f"- 实体：{stats['entities']}")
     print(f"- 实体出现记录：{stats['entity_mentions']}")
+    print(f"- 实体关系：{stats['relations']}")
+    print(f"- 主题：{stats['themes']}")
+    print(f"- 主题线索记录：{stats['theme_mentions']}")
+    print(f"- 事件：{stats['events']}")
 
 
 def show_chapters(args: argparse.Namespace) -> None:
@@ -246,7 +286,7 @@ def show_models(args: argparse.Namespace) -> None:
     for book in books:
         info = get_vector_index_info(vector_dir, book.book_id)
         status = "已构建" if info else "未构建"
-        suffix = f"，model={info.model_name}，chunks={info.chunk_count}" if info else ""
+        suffix = f"，backend={info.backend}，model={info.model_name}，chunks={info.chunk_count}" if info else ""
         print(f"- {book.book_id}：{status}{suffix}")
 
 
@@ -275,6 +315,7 @@ def build_embeddings(args: argparse.Namespace) -> None:
         store.close()
     print("本地向量索引构建完成：")
     print(f"- book_id：{info.book_id}")
+    print(f"- backend：{info.backend}")
     print(f"- model：{info.model_name}")
     print(f"- chunks：{info.chunk_count}")
     print(f"- dimension：{info.dimension}")
@@ -317,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
     build_parser_cmd.add_argument("--title", help="书名，默认使用文件名")
     build_parser_cmd.add_argument("--entities", help="实体词表路径，每行一个实体")
+    build_parser_cmd.add_argument("--themes", help="主题词表路径，格式同实体词表；不传时自动发现常见主题词")
     build_parser_cmd.add_argument("--encoding", default="utf-8", help="文本编码，默认 utf-8")
     build_parser_cmd.set_defaults(func=build_index)
 
@@ -325,6 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser_cmd.add_argument("--question", required=True, help="用户问题")
     ask_parser_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
     ask_parser_cmd.add_argument("--user", default="default", help="用户 ID")
+    ask_parser_cmd.add_argument("--session", help="会话 ID；同一会话下会复用最近几轮问答上下文")
     ask_parser_cmd.add_argument("--progress", type=int, help="临时覆盖阅读进度章节号")
     ask_parser_cmd.add_argument("--format", choices=("text", "json"), default="text", help="回答输出格式")
     ask_parser_cmd.add_argument("--retriever", choices=("lexical", "embedding", "auto"), default="lexical", help="检索器：默认倒排检索；embedding 需要先构建本地向量索引")
@@ -352,6 +395,11 @@ def build_parser() -> argparse.ArgumentParser:
     list_entities_cmd.add_argument("--book-id", required=True, help="书籍唯一 ID")
     list_entities_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
     list_entities_cmd.set_defaults(func=list_entities)
+
+    list_themes_cmd = subparsers.add_parser("list-themes", help="列出一本书的主题线索索引")
+    list_themes_cmd.add_argument("--book-id", required=True, help="书籍唯一 ID")
+    list_themes_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    list_themes_cmd.set_defaults(func=list_themes)
 
     serve_cmd = subparsers.add_parser("serve", help="启动本地 Web 界面")
     serve_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")

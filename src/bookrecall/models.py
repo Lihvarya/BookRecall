@@ -47,6 +47,50 @@ class EntityRecord:
 
 
 @dataclass(slots=True)
+class RelationMention:
+    source_entity: str
+    target_entity: str
+    relation_type: str
+    chapter_number: int
+    excerpt: str
+
+
+@dataclass(slots=True)
+class RelationRecord:
+    source_entity: str
+    target_entity: str
+    relation_type: str
+    first_chapter_number: int
+    mentions: list[RelationMention] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ThemeMention:
+    theme_name: str
+    chapter_number: int
+    excerpt: str
+    position_in_chapter: int
+
+
+@dataclass(slots=True)
+class ThemeRecord:
+    name: str
+    first_chapter_number: int
+    aliases: list[str] = field(default_factory=list)
+    mentions: list[ThemeMention] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class EventRecord:
+    chapter_number: int
+    chapter_title: str
+    event_type: str
+    summary: str
+    excerpt: str
+    entities: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class SearchHit:
     score: float
     chapter_number: int

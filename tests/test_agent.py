@@ -105,6 +105,28 @@ class BookRecallAgentTest(unittest.TestCase):
         self.assertIn('"intent"', payload)
         self.assertIn('"evidence"', payload)
 
+    def test_session_memory_reuses_recent_entity(self) -> None:
+        first = self.agent.ask_card(
+            book_id="sample",
+            question="黑袍人第一次出现在哪一章？",
+            progress_chapter=3,
+            session_id="s1",
+        )
+        second = self.agent.ask_card(
+            book_id="sample",
+            question="后来还有出现过吗？",
+            progress_chapter=3,
+            session_id="s1",
+        )
+        turns = self.store.list_agent_turns("sample", "default", "s1", limit=10)
+
+        self.assertEqual(first.entity_name, "黑衣人")
+        self.assertEqual(second.entity_name, "黑衣人")
+        self.assertIn("第 2 章", second.answer)
+        self.assertIn("第 3 章", second.answer)
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[-1]["entity_name"], "黑衣人")
+
 
 if __name__ == "__main__":
     unittest.main()
