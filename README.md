@@ -1,287 +1,491 @@
-# BookRecall · 书之回响
+# BookRecall
 
-> 一个**对抗"阅读遗忘"的本地记忆 Agent**——你都读过，只是想不起来了。它帮你 1 秒找回人物首次登场、道具出现轨迹、某个观点前后变化，并给出**可追溯的原文证据**，绝不剧透你没读到的章节。
+BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
 
-专为**长篇大部头**设计：已在真实 **840 万字、2340 章的网文《蛊真人》**上端到端跑通——2347 章解析、3.5 万切分块、10 万+ 实体出现记录，提问亚秒级返回。
+它的目标不是“替你读书”，而是帮你在读完很久之后，仍然能快速找回：
 
----
+- 某个人物第一次出现在哪一章
+- 某个道具后来还出现过没有
+- 某条线索在你已读范围内是怎么发展的
+- 某个主题在前后章节里发生了什么变化
 
-## 为什么需要它
+和普通 RAG 不同，BookRecall 不是只靠向量检索。它把结构化实体索引、章节级上下文、细粒度证据片段和一个可控的 ReAct Agent 组合起来，优先解决“第一次出现”“有没有再出现”“不要剧透”这类阅读回忆问题。
 
-读完一部 1000 万字的长篇，过阵子你会卡在这些问题上：
+## 项目特点
 
-- 「【星辰之匙】第一次出现在哪一章？」
-- 「主角最后是怎么拿到星辰之匙的？」
-- 「第 50 章那个黑衣人，后来还有出现过吗？」
-- 「关于"自由意志"的观点前后有什么变化？」
+- 本地三层索引：章节解析 -> parent/child chunk -> 结构化实体索引。
+- 强顺序问题可精确回答：例如“第一次出现在哪一章”。
+- 三重防剧透：用户阅读进度会限制检索、工具调用和最终证据输出。
+- 默认零运行时依赖：核心链路只用 Python 标准库。
+- 可选本地 embedding：支持 `sentence-transformers` 本地语义检索。
+- 可选外部大模型：支持 OpenAI-compatible API，例如 DeepSeek。
+- 内置网页端：可以查看书库、设置阅读进度、切换检索器、配置外部 API、查看本地模型状态。
 
-普通 RAG 把全文切片做向量检索、再让大模型回答——但它答不好**强顺序性问题**（"第一次"），还会**剧透你没读到的部分**。BookRecall 的不同在于：
+## 当前能力
 
-| 普通向量 RAG | BookRecall |
-| --- | --- |
-| 全文切片 → 语义近似 → 生成 | 实体索引 + 分层检索 + 元数据过滤 → **结构化记忆卡片** |
-| 难以精准回答"第一次出现在哪" | 实体索引 **100% 精准**命中首次章节 |
-| 不感知你的阅读进度，容易剧透 | **三重防剧透**：进度内才取证，越界证据一律剪枝 |
-| 只给一段话 | 给【结论 + 原文摘录 + 章节定位 + 追问方向】的卡片 |
-| 强依赖向量模型与 GPU | **零运行时依赖**，纯 Python 标准库即可跑 |
+截至当前代码状态，BookRecall 已经具备以下能力：
 
----
+- CLI 可用：
+  - `build`
+  - `ask`
+  - `set-progress`
+  - `show-progress`
+  - `list-books`
+  - `list-entities`
+  - `chapters`
+  - `stats`
+  - `clear`
+  - `serve`
+  - `models`
+  - `embed-build`
+  - `embed-search`
+- Agent 可用：
+  - 手写 ReAct 状态机
+  - 规则策略 `RuleBasedPolicy`
+  - 可选云端策略 `LLMReActPolicy`
+  - LangGraph 预留接口
+- Web 可用：
+  - 书库总览
+  - 实体索引浏览
+  - 章节概览
+  - 阅读进度管理
+  - 问答卡片
+  - 检索器切换
+  - DeepSeek / OpenAI-compatible API 设置
+  - 本地 embedding 与向量索引状态查看
+- 本地 embedding 可用：
+  - `sentence-transformers`
+  - 推荐模型：`BAAI/bge-small-zh-v1.5`
+  - 本地向量索引保存到 `.bookrecall/vectors/`
 
-## 核心特性
+如果你想看“已经实现了什么、还差什么”，请看 [AGENT_STATUS.md](/D:/BookRecall/AGENT_STATUS.md)。
 
-- 🔍 **本地三层索引**：细粒度 child 块 + 章节级 parent 块 + 结构化实体索引，结构化索引专治"首次出现 / 出现轨迹"这类向量检索答不好的强顺序问题。
-- ⚡ **倒排表加速检索（纯标准库）**：首次 2340 章 × 百 chunk 规模，从全库 O(n) 扫描升级为 O(命中)，打分语义不变、结果等价。
-- 🧠 **可选本地小模型语义检索**：新增 `sentence-transformers` embedding 通道，推荐 `BAAI/bge-small-zh-v1.5`；向量索引独立保存在 `.bookrecall/vectors/`，没有可选依赖时自动保留零依赖倒排检索。
-- 🤖 **LangAgent 架构**：手写轻量 **ReAct 状态机**——6 个可调用工具 + 可插拔决策策略（规则版默认 / LLM-ReAct 可选 / LangGraph 预留），支持"先查轨迹→聚焦末章→总结"这类多步推理。
-- 🛡️ **三重防剧透**：工具内部进度限制 → `_clamp_max_chapter` 二次钳制 → `_prune_evidence` 兜底，**即便 LLM 乱传章节号也无法越界**。
-- 🏷️ **实体别名**：`黑衣人|黑袍人,黑衣客`——提问用任一别名都能解析回规范名。
-- 🧹 **高频 n-gram 实体自动挖掘**：强化符 `【】《》「」` + 全文 2/3/4-gram 词频，没有手工词表也能快速建索引。
-- 💳 **结构化记忆卡片**：每次回答都是 `结论 + 证据片段 + 章节定位 + 追问建议`，JSON 与文本双格式，方便接入前端。
-- 🌐 **零依赖本地 Web**：书库总览 / 实体索引 / 章节浏览 / 进度管理 / 问答卡片，一页搞定，无需 Streamlit。
-- ☁️ **可选云端推理**：设了 OpenAI 兼容 API Key 即启用 LLM-ReAct 决策；没有则全程本地规则合成，**离线可用**。
-
----
-
-## 架构
+## 技术架构
 
 ```text
-                         ┌──────────────────────────┐
-                         │       User Query         │
-                         └────────────┬─────────────┘
-                                      ▼
-                         ┌──────────────────────────┐
-                         │   LangAgent (ReAct Loop)  │
-                         │   state + policy + tools  │
-                         └─────┬──────────────┬───────┘
-              decision/observe│              │ terminal
-                               ▼              ▼
-   ┌─────────────────────────────┐   ┌──────────────────────┐
-   │   Local Indexing Layer       │   │  Cloud LLM (可选)    │
-   │   • entity index (SQLite)    │   │  OpenAI 兼容接口      │
-   │   • parent/child chunks      │   │  LLMReActPolicy 决策 │
-   │   • inverted index retrieval │   └──────────────────────┘
-   │   • metadata filter(进度)    │
-   └─────────────────────────────┘
+User Question
+   |
+   v
+BookRecall Agent
+   |- Policy
+   |  |- RuleBasedPolicy
+   |  |- LLMReActPolicy (optional)
+   |  `- LangGraphPolicy (placeholder)
+   |
+   |- Tools
+   |  |- lookup_first_appearance
+   |  |- lookup_timeline
+   |  |- search_evidence
+   |  |- lookup_entity_aliases
+   |  |- get_chapter_summary
+   |  `- list_entities
+   |
+   |- Retriever
+   |  |- LocalRetriever
+   |  `- EmbeddingRetriever (optional)
+   |
+   `- Render
+      |- text
+      `- json
+
+Local Storage Layer
+   |- SQLite
+   |- chapters
+   |- parent_chunks
+   |- child_chunks
+   |- entities / aliases / mentions
+   `- reader_state
+
+Optional Cloud Layer
+   `- OpenAI-compatible Chat Completions
 ```
 
-**三重防剧透**贯穿全链路：`progress_chapter` 在入口锁定，每次工具调用的 `max_chapter` 都不许超过它；任何越界证据在 `_prune_evidence` 被剪掉并标记 `spoiler_blocked`。
+## 依赖说明
 
----
+### 核心模式
 
-## 三步上手
+核心模式默认没有第三方运行时依赖。
 
-> 前置：Python 3.11+。**无需 pip install 任何依赖**（云端推理为可选增强）。
+- Python `>=3.11`
+- SQLite 使用 Python 标准库内置模块
+- Web 使用 Python 标准库 `http.server`
+- 云端 API 调用使用 Python 标准库 `urllib`
+
+也就是说，最基础的 `build / ask / serve` 可以不安装任何额外包。
+
+### 可选依赖
+
+`pyproject.toml` 中目前定义了这些可选依赖组：
+
+- `embedding`
+  - `numpy>=1.26.0`
+  - `sentence-transformers>=3.0.0`
+- `full`
+  - `numpy>=1.26.0`
+  - `langgraph>=0.2.0`
+  - `llama-index>=0.11.0`
+  - `faiss-cpu>=1.8.0`
+  - `sentence-transformers>=3.0.0`
+  - `streamlit>=1.36.0`
+
+注意：
+
+- 当前代码已经实际使用的是 `embedding` 这一组。
+- `full` 里的很多能力还没有全部在代码中接通，它更像未来路线预留。
+- `cloud` 依赖组目前为空，因为云端 API 走的是标准库。
+
+## 安装方式
+
+### 方式一：直接运行仓库
 
 ```bash
-git clone <repo-url> BookRecall && cd BookRecall
+git clone <your-repo-url>
+cd BookRecall
+python bookrecall.py --help
+```
 
-# 1) 给样书建索引（含精选实体词表）
+这是最简单的方式，不需要先安装成包。
+
+### 方式二：开发模式安装
+
+```bash
+git clone <your-repo-url>
+cd BookRecall
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+安装后可以直接使用：
+
+```bash
+bookrecall --help
+```
+
+### 安装本地 embedding 能力
+
+```bash
+pip install -e .[embedding]
+```
+
+如果你在 Windows + NVIDIA GPU 上使用，也可以手动先装好适配你 CUDA 版本的 `torch`，再安装：
+
+```bash
+pip install sentence-transformers
+```
+
+## 快速开始
+
+### 1. 用示例书建索引
+
+```bash
 python bookrecall.py build \
   --book-id sample \
   --input examples/sample_book.txt \
   --entities examples/sample_entities.txt
-
-# 2) 设置阅读进度（防剧透以此为界）
-python bookrecall.py set-progress --book-id sample --chapter 3
-
-# 3) 提问
-python bookrecall.py ask --book-id sample --question "星辰之匙第一次出现在哪一章？"
 ```
 
-输出长这样：
-
-```text
-问题类型：实体首次出现
-阅读进度保护：已限制到第 3 章
-关联实体：星辰之匙
-结论："星辰之匙"第一次出现于第 1 章。
-证据定位：
-- 第 1 章《灰塔来信》：林澈在灰塔的旧书库里翻出一封没有署名的信。信里第一次提到了【星辰之匙】...
-你接下来还可以问：
-- 星辰之匙后来还有出现过吗？
-- 星辰之匙最后是怎么被拿到或使用的？
-```
-
-JSON 记忆卡片（接前端用）：
+### 2. 设置阅读进度
 
 ```bash
-python bookrecall.py ask --book-id sample --format json \
+python bookrecall.py set-progress \
+  --book-id sample \
+  --user default \
+  --chapter 3
+```
+
+### 3. 提问
+
+```bash
+python bookrecall.py ask \
+  --book-id sample \
   --question "黑袍人第一次出现在哪一章？"
 ```
 
----
+### 4. 输出 JSON 卡片
 
-## 命令一览
+```bash
+python bookrecall.py ask \
+  --book-id sample \
+  --format json \
+  --question "黑袍人第一次出现在哪一章？"
+```
 
-| 命令 | 作用 |
-| --- | --- |
-| `build` | 为一本书建立本地索引（章节解析 → 分层分块 → 实体索引 → 倒排表 → SQLite） |
-| `ask` | 提问，输出结构化记忆卡片（`--format json` / `--progress N` 临时覆盖进度） |
-| `set-progress` / `show-progress` | 记录 / 查看阅读进度 |
-| `list-books` / `list-entities` | 查看书库与某书的实体索引 |
-| `chapters` | 列出章节标题，核对章节解析是否正确 |
-| `stats` | 查看索引规模（章节 / chunk / 实体 / 出现记录） |
-| `models` | 探测本地小模型依赖与各书向量索引状态 |
-| `embed-build` | 用本地 embedding 小模型为已有书籍构建向量索引 |
-| `embed-search` | 直接用本地向量索引检索证据片段 |
-| `clear` | 删除某本书的全部索引（需 `--yes` 二次确认，不删数据库文件） |
-| `serve` | 启动零依赖本地 Web 界面 |
+## Web 界面
 
-Web 界面：
+启动本地网页：
 
 ```bash
 python bookrecall.py serve --host 127.0.0.1 --port 8000
-# 浏览器打开 http://127.0.0.1:8000
 ```
 
----
+浏览器打开：
 
-## 可选：本地小模型语义检索
+```text
+http://127.0.0.1:8000
+```
 
-默认检索器仍是零依赖倒排检索。若本机已安装 `sentence-transformers` 与 `numpy`，可以为已有书籍构建本地 embedding 索引：
+网页端当前支持：
+
+- 选择书籍
+- 查看书库统计
+- 查看实体索引
+- 查看章节概览
+- 设置用户阅读进度
+- 提交问答
+- 选择检索器：`lexical / embedding / auto`
+- 查看本地模型依赖状态
+- 查看每本书是否已有向量索引
+- 直接配置外部 OpenAI-compatible API
+- 快速套用 DeepSeek / OpenAI 预设
+
+说明：
+
+- API Key 不会保存在服务端文件中。
+- 如果勾选“保存”，只会保存在当前浏览器的 `localStorage`。
+
+## 本地 embedding 用法
+
+### 查看模型状态
 
 ```bash
 python bookrecall.py models
+```
 
-python bookrecall.py embed-build --book-id sample \
+### 构建向量索引
+
+```bash
+python bookrecall.py embed-build \
+  --book-id sample \
   --model BAAI/bge-small-zh-v1.5
+```
 
-python bookrecall.py embed-search --book-id sample \
-  --query "黑袍人第一次出现在哪一章？" \
+可选参数：
+
+- `--batch-size`
+- `--vector-dir`
+- `--limit-chunks`
+
+### 直接做 embedding 检索
+
+```bash
+python bookrecall.py embed-search \
+  --book-id sample \
+  --query "黑袍人后来还出现过吗？" \
   --progress 3
+```
 
-python bookrecall.py ask --book-id sample \
+### 在问答里启用 embedding 检索
+
+```bash
+python bookrecall.py ask \
+  --book-id sample \
   --retriever embedding \
-  --question "黑袍人第一次出现在哪一章？"
+  --question "这本书前面关于自由意志的观点是什么？"
 ```
 
-在没有安装可选依赖时，`models` 会报告缺失项，`ask --retriever auto` 会自动回退到倒排检索：
+也可以用自动模式：
 
 ```bash
-python bookrecall.py ask --book-id sample \
+python bookrecall.py ask \
+  --book-id sample \
   --retriever auto \
-  --question "黑袍人第一次出现在哪一章？"
+  --question "这本书前面关于自由意志的观点是什么？"
 ```
 
-建议的本地小模型路线：
+自动模式的行为是：
 
-- `BAAI/bge-small-zh-v1.5`：中文长篇小说优先，体积小，适合 3060 6GB。
-- `BAAI/bge-m3`：效果更强但更重，适合后续作为增强选项。
-- 当前向量检索使用 `numpy` 精确余弦相似度，FAISS 不是必需依赖；后续可把 FAISS 接成更大规模索引后端。
+- 如果该书已有向量索引且本地依赖可用，则使用 embedding 检索。
+- 否则自动回退到倒排检索。
 
----
+## 外部 API 用法
 
-## 实体词表
+BookRecall 支持 OpenAI-compatible Chat Completions 接口。
 
-实体索引是回答"首次出现 / 轨迹"的基石。两种来源，准确度由高到低：
-
-1. **手工词表**（推荐）：每行一个实体，支持 `标准名|别名1,别名2`：
-   ```text
-   星辰之匙|钥匙,星匙
-   黑衣人|黑袍人,黑衣客
-   自由意志
-   ```
-2. **自动挖掘**：`build` 时不传 `--entities`，系统自动从 `【】《》「」` 强调符 + 高频 n-gram 挖候选。看 `examples/蛊真人_entities_auto.txt` 即自动产物，`蛊真人_entities.txt` 是手工精选。
-
----
-
-## 可选：云端推理
-
-设了 API Key 即启用 `LLMReActPolicy`，由大模型决定调哪个工具 + 直接给出 final answer；没设则全程本地规则合成（离线可用）。
+默认读取这些环境变量：
 
 ```bash
-export BOOKRECALL_API_KEY="sk-..."
-# 可选：
-export BOOKRECALL_API_ENDPOINT="https://api.openai.com/v1/chat/completions"
-export BOOKRECALL_MODEL="gpt-4o-mini"
+BOOKRECALL_API_KEY
+BOOKRECALL_API_ENDPOINT
+BOOKRECALL_MODEL
 ```
 
-> 兼容任何 OpenAI Chat Completions 格式的端点。决策失败 2 次自动回退规则版，不会卡死。
-
----
-
-## 真实大书验证：《蛊真人》
-
-840 万字、2340 个「第X节」标题的网文，是检验索引管线鲁棒性的硬样本：
+例如：
 
 ```bash
-python bookrecall.py build --book-id guzhenshuo \
-  --input "book/蛊真人错别字修改版4.0.txt" \
-  --entities examples/蛊真人_entities.txt
-# → 章节数=2347、parent=6147、child=34791、实体=26、实体出现记录≈10 万
-
-python bookrecall.py chapters --book-id guzhenshuo --limit 5
-python bookrecall.py stats    --book-id guzhenshuo
-
-# 首次出现（多步：别名解析 → lookup_first_appearance）
-python bookrecall.py ask --book-id guzhenshuo --progress 100 --question "方源第一次出现在哪一节？"
-
-# 防剧透：方源第3章才出现，进度设2 → 触发 spoiler_blocked，不暴露章节
-python bookrecall.py ask --book-id guzhenshuo --progress 2  --question "方源第一次出现在哪一节？"
-
-# 轨迹追踪（多步：别名 → lookup_timeline）
-python bookrecall.py ask --book-id guzhenshuo --progress 100 --question "方源后来还有出现过吗？"
+export BOOKRECALL_API_KEY="sk-xxx"
+export BOOKRECALL_API_ENDPOINT="https://api.deepseek.com/v1/chat/completions"
+export BOOKRECALL_MODEL="deepseek-chat"
 ```
 
-> 《蛊真人》的「第X节」标题用全角冒号 `：` 分隔、行首缩进，普通章节正则会全部漏判——`parser.py` 已针对网文格式做了容错。
+或者在网页端直接填写：
 
----
+- Endpoint
+- Model
+- API Key
+- 启用外部大模型 ReAct 规划
+
+当前云端模型主要用于：
+
+- 复杂问题的多步规划
+- 对多个证据片段做综合
+- 给出更自然的最终总结
+
+它不会替代本地索引层，也不会绕过防剧透限制。
+
+## CLI 命令总览
+
+### 索引与书库
+
+- `build`
+  - 为一本书建立 SQLite 索引
+- `list-books`
+  - 查看当前书库
+- `stats`
+  - 查看索引规模
+- `chapters`
+  - 查看章节标题
+- `clear`
+  - 删除某本书的索引，需要 `--yes`
+
+### 阅读状态
+
+- `set-progress`
+  - 保存阅读进度
+- `show-progress`
+  - 查看阅读进度
+
+### 问答与检索
+
+- `ask`
+  - 提问并输出记忆卡片
+- `list-entities`
+  - 查看实体索引
+- `models`
+  - 查看本地模型状态
+- `embed-build`
+  - 构建向量索引
+- `embed-search`
+  - 直接做向量检索
+
+### Web
+
+- `serve`
+  - 启动本地 Web 控制台
+
+## 实体词表格式
+
+支持手工实体词表，每行一个实体。
+
+格式：
+
+```text
+标准名|别名1,别名2
+```
+
+例如：
+
+```text
+星辰之匙|钥匙,星匙
+黑衣人|黑袍人,黑衣客
+自由意志
+```
+
+如果不传 `--entities`，系统会尝试自动发现实体。
+
+## 输出结构
+
+BookRecall 的核心输出是一个结构化记忆卡片，包含：
+
+- `question`
+- `intent`
+- `answer`
+- `progress_chapter`
+- `spoiler_blocked`
+- `entity_name`
+- `summary`
+- `evidence`
+- `suggestions`
+
+这使它既适合 CLI，也适合 Web 或未来接前端应用。
+
+## 测试
+
+运行全部测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+当前测试覆盖：
+
+- 章节解析
+- 倒排检索
+- embedding 索引构建与检索
+- Agent 核心问答
+- Agent 工具层
+- LLM ReAct 文本解析
+- Web API
+
+当前代码状态下测试数量为：
+
+```text
+40 tests
+```
 
 ## 项目结构
 
 ```text
+bookrecall.py
 src/bookrecall/
-  agent/            # LangAgent：手写 ReAct 状态机
-    core.py          #   ReAct 循环 + 三重防剧透 + 输出契约
-    state.py         #   运行态
-    tools.py         #   6 个工具 + 注册表 + LLM 函数描述
-    render.py        #   记忆卡片渲染（契约不变）
-    policies/        #   RuleBased(默认) / LLMReAct(可选) / LangGraph(预留)
-  parser.py         # 章节解析（节/章/回/卷/篇/部/集，全角容错）
-  chunking.py       # Parent/Child 分层切块
-  entity_index.py   # 词表 + auto_discover(强调符+n-gram) + 出现记录
-  retrieval.py      # 倒排表检索（纯标准库）
-  storage.py        # SQLite 存储
-  cloud.py          # 可选 OpenAI 兼容接口
-  cli.py / web.py   # 命令行 / 零依赖 Web
-tests/              # 38 个单测
-examples/           # 样书 + 词表（手工精选 / 自动挖掘）
+  agent/
+    core.py
+    state.py
+    tools.py
+    render.py
+    policies/
+  parser.py
+  chunking.py
+  entity_index.py
+  retrieval.py
+  embeddings.py
+  storage.py
+  cloud.py
+  web.py
+  cli.py
+tests/
+examples/
 ```
 
----
+## 适用场景
 
-## 测试
+适合：
 
-```bash
-python -m unittest discover -s tests -v   # 38 tests, all green
-```
+- 长篇小说回忆
+- 网文追更回顾
+- 学术著作章节线索定位
+- 需要强顺序和防剧透控制的阅读助手
 
-覆盖：章节解析误判防御 · 倒排表与全库扫描语义等价 · 6 工具的入参出参与防剧透 · LLM 文本解析器 · Web 全接口 · Agent 5 条回归基线。
+不适合：
 
----
+- 直接替代通用聊天机器人
+- 不建索引就即时读整本大书
+- 需要完整知识图谱和复杂编辑工作流的场景
 
-## 路线图
+## 当前限制
 
-`agent/` 已是 ReAct 状态机，但仍是**零依赖 MVP**。距离一个"完整的 Agent 工具项目"还有明确差距。详见 **[AGENT_STATUS.md](AGENT_STATUS.md)**：
+这个项目已经能用，但还不是最终形态。
 
-- [x] 本地索引 / 倒排检索 / LangAgent ReAct / 防剧透 / 多步推理 / Web / CLI
-- [x] 可选本地 embedding 通道（sentence-transformers + numpy 精确向量检索）
-- [ ] FAISS 加速向量后端与大规模持久化调优
-- [ ] LangGraph 原生编排（已预留接口）
-- [ ] 原生 function-calling（当前用文本协议解析）
-- [ ] 人物关系图 / 自动主题线索 / 章节级笔记
-- [ ] Streamlit / 评论式前端
+当前仍然存在这些限制：
 
----
+- LangGraph 还没有正式接入执行流
+- 还没有原生 function-calling
+- 还没有关系图谱和主题线索层
+- 还没有跨会话 Agent 记忆
+- 还没有真正的 FAISS 后端
+- Web 仍然是单页零依赖控制台，不是完整产品前端
 
-## 设计原则
-
-1. **零运行时依赖优先**——纯 Python 标准库即可跑通核心链路，重型能力（向量模型、LangGraph、Streamlit）一律走"可选增强"通道。
-2. **结构化优于生成**——能精确查的（首次出现、轨迹）绝不模糊生成；LLM 只用于真正需要综合因果的部分。
-3. **防剧透是一等公民**——三重保险，越界证据一律丢弃并明示，宁可少答不可剧透。
-4. **对外契约稳定**——`ask` / `ask_card` / 记忆卡片结构跨重构保持一致，上层调用方零改动。
-
----
+更详细的现状和路线见 [AGENT_STATUS.md](/D:/BookRecall/AGENT_STATUS.md)。
 
 ## License
 
