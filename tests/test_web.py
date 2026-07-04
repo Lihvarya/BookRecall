@@ -3,8 +3,10 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from urllib.parse import quote
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +33,24 @@ SAMPLE_TEXT = """第1章 起点
 
 黑衣人再次提到【星辰之匙】，林澈决定追查自由意志的真相。
 """
+
+
+class TinyWebEmbedder:
+    def __init__(self, model_name: str, *, cache_dir: str | Path | None = None) -> None:
+        self.model_name = model_name
+        self.cache_dir = cache_dir
+
+    def encode(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            vectors.append(
+                [
+                    float(text.count("星辰之匙") + text.count("钥匙")),
+                    float(text.count("黑衣人") + text.count("黑袍人")),
+                    float(text.count("林澈")),
+                ]
+            )
+        return vectors
 
 
 class BookRecallWebTest(unittest.TestCase):
@@ -147,6 +167,69 @@ class BookRecallWebTest(unittest.TestCase):
             any("黑衣人" in {item["source_entity"], item["target_entity"]} for item in relations["relations"])
         )
 
+    def test_build_book_endpoint_from_pasted_text(self) -> None:
+        created = self._post_json(
+            "/api/books/build",
+            {
+                "book_id": "web-built",
+                "title": "网页导入书",
+                "text": SAMPLE_TEXT,
+                "entities": "黑衣人|黑袍人\n星辰之匙|钥匙\n林澈",
+                "themes": "自由意志|真相",
+            },
+        )
+        self.assertEqual(created["book"]["book_id"], "web-built")
+        self.assertGreaterEqual(created["book"]["entities"], 3)
+        self.assertGreaterEqual(created["book"]["events"], 1)
+
+        books = self._get_json("/api/books")
+        self.assertIn("web-built", [item["book_id"] for item in books["books"]])
+
+        answer = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "web-built",
+                "question": "黑袍人第一次出现在哪一章？",
+            },
+        )
+        self.assertEqual(answer["entity_name"], "黑衣人")
+        self.assertIn("第 2 章", answer["answer"])
+
+    def test_build_book_endpoint_requires_overwrite_for_existing_book(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self._post_json(
+                "/api/books/build",
+                {
+                    "book_id": "sample",
+                    "title": "重复书",
+                    "text": SAMPLE_TEXT,
+                },
+            )
+        self.assertEqual(context.exception.code, 400)
+
+    def test_build_vector_index_endpoint(self) -> None:
+        with patch("bookrecall.web.SentenceTransformerEmbedder", TinyWebEmbedder):
+            data = self._post_json(
+                "/api/books/sample/vectors",
+                {
+                    "model": "test-web-embedder",
+                    "backend": "numpy",
+                    "limit_chunks": 2,
+                },
+            )
+
+        info = data["vector_index"]
+        self.assertEqual(info["book_id"], "sample")
+        self.assertEqual(info["model_name"], "test-web-embedder")
+        self.assertEqual(info["backend"], "numpy")
+        self.assertEqual(info["chunk_count"], 2)
+        self.assertTrue(Path(info["path"]).exists())
+
+        runtime = self._get_json("/api/runtime")
+        sample_index = next(item for item in runtime["vector_indexes"] if item["book_id"] == "sample")
+        self.assertTrue(sample_index["built"])
+        self.assertEqual(sample_index["model_name"], "test-web-embedder")
+
     def test_event_chain_question_via_api(self) -> None:
         answer = self._post_json(
             "/api/ask",
@@ -227,11 +310,28 @@ class BookRecallWebTest(unittest.TestCase):
         with urllib.request.urlopen(f"{self.base_url}/") as response:
             html = response.read().decode("utf-8")
         self.assertIn("BookRecall", html)
+        self.assertIn('/assets/app.css', html)
+        self.assertIn('/assets/app.js', html)
         self.assertIn("会话历史", html)
         self.assertIn("本轮工具轨迹", html)
         self.assertIn("主题线索", html)
         self.assertIn("事件链", html)
         self.assertIn("快捷提问模板", html)
+        self.assertIn("导入书籍并建索引", html)
+        self.assertIn("构建当前书向量索引", html)
+
+    def test_static_assets(self) -> None:
+        with urllib.request.urlopen(f"{self.base_url}/assets/app.css") as response:
+            css = response.read().decode("utf-8")
+            self.assertIn("text/css", response.headers["Content-Type"])
+        self.assertIn("--green", css)
+        self.assertIn(".answer-card", css)
+
+        with urllib.request.urlopen(f"{self.base_url}/assets/app.js") as response:
+            js = response.read().decode("utf-8")
+            self.assertIn("javascript", response.headers["Content-Type"])
+        self.assertIn("loadBooks", js)
+        self.assertIn("askQuestion", js)
 
     def test_chapters_endpoint(self) -> None:
         data = self._get_json("/api/books/sample/chapters")

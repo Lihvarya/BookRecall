@@ -57,6 +57,7 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
   - LangGraph 预留接口
 - Web 可用：
   - 书库总览
+  - 粘贴正文创建本地索引
   - 索引规模统计
   - 实体索引浏览
   - 主题线索浏览
@@ -71,6 +72,7 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
   - 检索器切换
   - DeepSeek / OpenAI-compatible API 设置
   - 本地 embedding 与向量索引状态查看
+  - 当前书向量索引构建
 - 本地 embedding 可用：
   - `sentence-transformers`
   - 推荐模型：`BAAI/bge-small-zh-v1.5`
@@ -307,6 +309,9 @@ http://127.0.0.1:8000
 
 网页端当前支持：
 
+- 粘贴书籍正文并创建本地索引
+- 填写实体词表和主题词表
+- 可选覆盖同名 `book_id` 的已有索引
 - 选择书籍
 - 查看书库统计
 - 查看实体索引
@@ -322,6 +327,7 @@ http://127.0.0.1:8000
 - 选择检索器：`lexical / embedding / auto`
 - 查看本地模型依赖状态
 - 查看每本书是否已有向量索引
+- 为当前书构建本地向量索引
 - 直接配置外部 OpenAI-compatible API
 - 快速套用 DeepSeek / OpenAI 预设
 
@@ -329,6 +335,63 @@ http://127.0.0.1:8000
 
 - API Key 不会保存在服务端文件中。
 - 如果勾选“保存”，只会保存在当前浏览器的 `localStorage`。
+- 网页端“导入书籍并建索引”不会自动下载 embedding 模型；它只构建 SQLite 本地结构化索引。
+- 如果要使用本地 embedding 检索，可以在网页端点击“构建当前书向量索引”，也可以继续用 CLI 的 `embed-build`。
+- 构建向量索引会加载本地 embedding 模型；如果本地缓存不存在，`sentence-transformers` 可能联网下载模型。
+
+### Web 前端结构
+
+当前 Web 端已经从 `web.py` 内部的大字符串拆分为静态资源：
+
+- `src/bookrecall/web_assets/index.html`
+- `src/bookrecall/web_assets/app.css`
+- `src/bookrecall/web_assets/app.js`
+
+服务端仍然使用 Python 标准库 `http.server` 提供页面、静态资源和 JSON API，所以不需要 Node.js、Vite 或 npm 构建步骤。
+
+暂时没有引入前端框架，原因是：
+
+- 当前项目的核心优势是本地零依赖启动，直接 `python bookrecall.py serve` 就能运行。
+- 现有交互还可以由原生 HTML/CSS/JS 稳定承担。
+- 如果后续出现多页面路由、复杂组件复用、拖拽式图谱或大型状态管理，再迁移到 Vite + React/Svelte 会更合适。
+
+### Web API 快速参考
+
+常用接口：
+
+- `GET /api/books`
+- `POST /api/books/build`
+- `GET /api/books/{book_id}/stats`
+- `GET /api/books/{book_id}/entities`
+- `GET /api/books/{book_id}/themes`
+- `GET /api/books/{book_id}/events`
+- `GET /api/books/{book_id}/relations`
+- `POST /api/books/{book_id}/vectors`
+- `POST /api/ask`
+- `POST /api/progress`
+
+`POST /api/books/build` 请求体示例：
+
+```json
+{
+  "book_id": "sample",
+  "title": "示例书",
+  "text": "第1章 起点\n\n正文...",
+  "entities": "黑衣人|黑袍人\n星辰之匙|钥匙",
+  "themes": "自由意志|选择",
+  "overwrite": false
+}
+```
+
+`POST /api/books/{book_id}/vectors` 请求体示例：
+
+```json
+{
+  "model": "BAAI/bge-small-zh-v1.5",
+  "backend": "auto",
+  "limit_chunks": null
+}
+```
 
 ## 本地 embedding 用法
 
