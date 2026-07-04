@@ -11,7 +11,7 @@ from __future__ import annotations
 from ..cloud import OpenAICompatibleReasoner
 from ..config import DEFAULT_SEARCH_SETTINGS
 from ..models import EvidenceCard, MemoryCard
-from ..retrieval import LocalRetriever
+from ..retrieval import LocalRetriever, Retriever
 from ..storage import BookRecallStore
 from .render import render_json, render_text, to_payload
 from .state import AgentState
@@ -26,7 +26,7 @@ class BookRecallAgent:
         store: BookRecallStore,
         *,
         policy: DecisionPolicy | None = None,
-        retriever: LocalRetriever | None = None,
+        retriever: Retriever | None = None,
         reasoner: OpenAICompatibleReasoner | None = None,
     ) -> None:
         self.store = store

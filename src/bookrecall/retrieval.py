@@ -1,5 +1,6 @@
 import math
 import re
+from typing import Protocol
 
 from .config import SearchSettings
 from .models import SearchHit
@@ -26,6 +27,11 @@ def lexical_score(query: str, document: str) -> float:
     density = len(query_tokens & doc_tokens) / math.sqrt(len(doc_tokens))
     phrase_bonus = 0.25 if query.replace(" ", "") in document.replace(" ", "") else 0.0
     return overlap + density + phrase_bonus
+
+
+class Retriever(Protocol):
+    def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+        ...
 
 
 class LocalRetriever:

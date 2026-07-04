@@ -14,8 +14,13 @@ authors = [
 dependencies = []
 
 [project.optional-dependencies]
+embedding = [
+  "numpy>=1.26.0",
+  "sentence-transformers>=3.0.0"
+]
 cloud = []
 full = [
+  "numpy>=1.26.0",
   "langgraph>=0.2.0",
   "llama-index>=0.11.0",
   "faiss-cpu>=1.8.0",
@@ -31,4 +36,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

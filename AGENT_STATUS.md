@@ -2,7 +2,7 @@
 
 > 本文档以**代码为准**，记录 LangAgent 当前的真实能力边界、距离一个"完整的 Agent 工具项目"的差距，以及分层的完善路径。配套 README 使用——README 面向访客，本文档面向想继续推进该项目的人。
 
-更新时间：2026-07-03（LangAgent 重构完成、35 测试全绿、《蛊真人》端到端验证通过之后）。
+更新时间：2026-07-04（接入可选本地 embedding 通道、38 测试全绿、《蛊真人》端到端索引仍可用之后）。
 
 ---
 
@@ -22,6 +22,7 @@
 | 能力 | 实现 | 边界 |
 | --- | --- | --- |
 | 倒排表 | `retrieval.py` 建一次 `{token: set[child_chunk_id]}` 常驻缓存，查询取 token 交集候选再打分 | **语义仅词法级**：汉字单字 + bigram + 英文词，无向量化。结果是"含相同字形片段"的命中，不是"语义相近"。 |
+| 本地 embedding 通道 | `embeddings.py` 已接入 `sentence-transformers` 可选后端，向量索引以 `.npz + .json` 保存到 `.bookrecall/vectors/`，CLI 提供 `models / embed-build / embed-search / ask --retriever embedding|auto` | 当前环境若未安装 `sentence-transformers/torch` 只能探测与回退；向量后端使用 numpy 精确相似度，尚未接 FAISS。 |
 | 打分 | `overlap + density + phrase_bonus`（纯函数，不变） | 纯词频启发式，远不如向量余弦。同义词/换名提问召回会弱。 |
 | 进度过滤 | `max_chapter` 在 SQL 层（旧）与候选过滤（新）双重兜底 | 仅按章节号过滤，无"段落级"粒度。 |
 | 等价性 | 倒排表结果 == 全库扫描结果（有单测保证） | 无候选时退回全库扫描，行为与旧版一致。 |
@@ -72,7 +73,7 @@
 
 ### 1.5 测试与验证
 
-- **35 个单测全绿**：`test_parser` / `test_retrieval_inverted`（倒排与全库语义等价）/ `test_agent`（5 条回归基线）/ `test_agent_tools`（6 工具）/ `test_policy_parse`（LLM 文本解析器）/ `test_web`（全接口）。
+- **38 个单测全绿**：`test_parser` / `test_retrieval_inverted`（倒排与全库语义等价）/ `test_embeddings`（本地向量索引构建与检索）/ `test_agent`（5 条回归基线）/ `test_agent_tools`（6 工具）/ `test_policy_parse`（LLM 文本解析器）/ `test_web`（全接口）。
 - **真实书端到端**：《蛊真人》建库 → chapters/stats 核对 → 首次出现 / 轨迹 / 防剧透 / 因果多步 / JSON 卡片 全链路通过。
 
 ---
@@ -83,7 +84,7 @@
 
 ### 2.1 检索层 ⚠️
 
-- ❌ **无向量化语义检索**。当前是汉字 bigram 倒排表，召回本质是"字形重叠"。问"主角兵器"无法召回正文写"那把剑"的段落，无法处理同义/换名提问。
+- ⚠️ **已有可选向量化语义检索入口，但还不是最终形态**。`embed-build` 可用 `BAAI/bge-small-zh-v1.5` 等本地小模型构建向量索引；当前环境缺少可选依赖时会回退倒排。尚未接 FAISS 后端，也未在真实大书上构建 embedding 索引。
 - ❌ **无 chunk 级召回**，倒排表打分只到 child 文本，未做 query 扩写、未做 MMR 去冗余。
 - ⚠️ 章节摘要只是正文前 140 字，非语义摘要。
 
@@ -113,7 +114,7 @@
 ### 2.5 工程化 ❌（MVP 通病）
 
 - ❌ **无打包发布**：仍 `python bookrecall.py` 直跑，未做 `pip install bookrecall` / Console entry。
-- ❌ **无 CI**：35 测试只在本地跑。
+- ❌ **无 CI**：38 测试只在本地跑。
 - ⚠️ **无配置文件**：分块参数、检索 top_k 硬编码在 `config.py`，无用户 config。
 - ❌ **无增量建索引**：改了实体词表要 `clear` 全删重建，840 万字重建代价高。
 - ⚠️ **无观测**：无 agent 调用链日志、无检索召回率可视化。
@@ -209,7 +210,7 @@ class EmbeddingRetriever: # bge-small-zh-v1.5 + FAISS，可选
         self._index = None  # faiss.IndexFlatIP，建库时建
 ```
 
-`build` 时若检测到可选依赖就建向量索引（存 `.bookrecall/<book_id>/vectors.faiss`），否则落回倒排表。**SQLite 元数据过滤与防剧透逻辑完全复用**，只换打分层。`config.py` 增 `retriever: lexical|embedding`。
+当前已提供独立的 `embed-build` 命令构建向量索引（存 `.bookrecall/vectors/<book_id>.npz` + 元数据 JSON），`ask --retriever embedding|auto` 可切换语义检索。下一步再接 FAISS 后端与构建时自动化策略。**SQLite 元数据过滤与防剧透逻辑完全复用**，只换打分层。
 
 3060 6GB 上 `bge-small-zh` 构建约几分钟、占 ~1.2GB 显存，可接受；纯 CPU 也能跑，慢些。
 
@@ -267,4 +268,4 @@ class EmbeddingRetriever: # bge-small-zh-v1.5 + FAISS，可选
 
 ## 四、一句话总结
 
-BookRecall 当下是**一个工程化扎实、零依赖、真书验证过的 Agent MVP**——它已经把"对抗阅读遗忘"的核心价值链路（结构化索引 + 防剧透 + 多步 ReAct + 记忆卡片）完整跑通。但它是**手写轻量 ReAct**而非 LangGraph 编排、是**词法倒排**而非真向量、是**单页零依赖**而非富前端、是**直跑脚本**而非可安装包。完善路径清晰：Agent 层接 function-calling + 跨会话记忆 + 真 LangGraph，检索层接 BGE+FAISS 作可选通道，索引层补关系图与主题，交互层上 REPL/Streamlit，工程层补打包/CI/评测——每一步都在现有契约内增量演进，**对外 `ask`/`MemoryCard` 契约自始至终不变**。
+BookRecall 当下是**一个工程化扎实、零依赖默认、真书验证过的 Agent MVP**——它已经把"对抗阅读遗忘"的核心价值链路（结构化索引 + 防剧透 + 多步 ReAct + 记忆卡片）完整跑通，并开始接入本地小模型 embedding 通道。但它仍是**手写轻量 ReAct**而非 LangGraph 编排、是**倒排默认 + 可选 numpy 向量**而非 FAISS 大规模语义索引、是**单页零依赖**而非富前端、是**直跑脚本**而非可安装包。完善路径清晰：Agent 层接 function-calling + 跨会话记忆 + 真 LangGraph，检索层把 BGE embedding 通道继续推进到 FAISS，索引层补关系图与主题，交互层上 REPL/Streamlit，工程层补打包/CI/评测——每一步都在现有契约内增量演进，**对外 `ask`/`MemoryCard` 契约自始至终不变**。

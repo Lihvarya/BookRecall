@@ -31,6 +31,7 @@
 
 - 🔍 **本地三层索引**：细粒度 child 块 + 章节级 parent 块 + 结构化实体索引，结构化索引专治"首次出现 / 出现轨迹"这类向量检索答不好的强顺序问题。
 - ⚡ **倒排表加速检索（纯标准库）**：首次 2340 章 × 百 chunk 规模，从全库 O(n) 扫描升级为 O(命中)，打分语义不变、结果等价。
+- 🧠 **可选本地小模型语义检索**：新增 `sentence-transformers` embedding 通道，推荐 `BAAI/bge-small-zh-v1.5`；向量索引独立保存在 `.bookrecall/vectors/`，没有可选依赖时自动保留零依赖倒排检索。
 - 🤖 **LangAgent 架构**：手写轻量 **ReAct 状态机**——6 个可调用工具 + 可插拔决策策略（规则版默认 / LLM-ReAct 可选 / LangGraph 预留），支持"先查轨迹→聚焦末章→总结"这类多步推理。
 - 🛡️ **三重防剧透**：工具内部进度限制 → `_clamp_max_chapter` 二次钳制 → `_prune_evidence` 兜底，**即便 LLM 乱传章节号也无法越界**。
 - 🏷️ **实体别名**：`黑衣人|黑袍人,黑衣客`——提问用任一别名都能解析回规范名。
@@ -120,6 +121,9 @@ python bookrecall.py ask --book-id sample --format json \
 | `list-books` / `list-entities` | 查看书库与某书的实体索引 |
 | `chapters` | 列出章节标题，核对章节解析是否正确 |
 | `stats` | 查看索引规模（章节 / chunk / 实体 / 出现记录） |
+| `models` | 探测本地小模型依赖与各书向量索引状态 |
+| `embed-build` | 用本地 embedding 小模型为已有书籍构建向量索引 |
+| `embed-search` | 直接用本地向量索引检索证据片段 |
 | `clear` | 删除某本书的全部索引（需 `--yes` 二次确认，不删数据库文件） |
 | `serve` | 启动零依赖本地 Web 界面 |
 
@@ -129,6 +133,41 @@ Web 界面：
 python bookrecall.py serve --host 127.0.0.1 --port 8000
 # 浏览器打开 http://127.0.0.1:8000
 ```
+
+---
+
+## 可选：本地小模型语义检索
+
+默认检索器仍是零依赖倒排检索。若本机已安装 `sentence-transformers` 与 `numpy`，可以为已有书籍构建本地 embedding 索引：
+
+```bash
+python bookrecall.py models
+
+python bookrecall.py embed-build --book-id sample \
+  --model BAAI/bge-small-zh-v1.5
+
+python bookrecall.py embed-search --book-id sample \
+  --query "黑袍人第一次出现在哪一章？" \
+  --progress 3
+
+python bookrecall.py ask --book-id sample \
+  --retriever embedding \
+  --question "黑袍人第一次出现在哪一章？"
+```
+
+在没有安装可选依赖时，`models` 会报告缺失项，`ask --retriever auto` 会自动回退到倒排检索：
+
+```bash
+python bookrecall.py ask --book-id sample \
+  --retriever auto \
+  --question "黑袍人第一次出现在哪一章？"
+```
+
+建议的本地小模型路线：
+
+- `BAAI/bge-small-zh-v1.5`：中文长篇小说优先，体积小，适合 3060 6GB。
+- `BAAI/bge-m3`：效果更强但更重，适合后续作为增强选项。
+- 当前向量检索使用 `numpy` 精确余弦相似度，FAISS 不是必需依赖；后续可把 FAISS 接成更大规模索引后端。
 
 ---
 
@@ -205,7 +244,7 @@ src/bookrecall/
   storage.py        # SQLite 存储
   cloud.py          # 可选 OpenAI 兼容接口
   cli.py / web.py   # 命令行 / 零依赖 Web
-tests/              # 35 个单测
+tests/              # 38 个单测
 examples/           # 样书 + 词表（手工精选 / 自动挖掘）
 ```
 
@@ -214,7 +253,7 @@ examples/           # 样书 + 词表（手工精选 / 自动挖掘）
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -v   # 35 tests, all green
+python -m unittest discover -s tests -v   # 38 tests, all green
 ```
 
 覆盖：章节解析误判防御 · 倒排表与全库扫描语义等价 · 6 工具的入参出参与防剧透 · LLM 文本解析器 · Web 全接口 · Agent 5 条回归基线。
@@ -226,7 +265,8 @@ python -m unittest discover -s tests -v   # 35 tests, all green
 `agent/` 已是 ReAct 状态机，但仍是**零依赖 MVP**。距离一个"完整的 Agent 工具项目"还有明确差距。详见 **[AGENT_STATUS.md](AGENT_STATUS.md)**：
 
 - [x] 本地索引 / 倒排检索 / LangAgent ReAct / 防剧透 / 多步推理 / Web / CLI
-- [ ] 真向量语义检索（BGE + FAISS）
+- [x] 可选本地 embedding 通道（sentence-transformers + numpy 精确向量检索）
+- [ ] FAISS 加速向量后端与大规模持久化调优
 - [ ] LangGraph 原生编排（已预留接口）
 - [ ] 原生 function-calling（当前用文本协议解析）
 - [ ] 人物关系图 / 自动主题线索 / 章节级笔记

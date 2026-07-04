@@ -3,9 +3,19 @@ from pathlib import Path
 
 from .agent import BookRecallAgent
 from .chunking import build_chunk_hierarchy
-from .config import DEFAULT_CHUNK_SETTINGS
+from .config import DEFAULT_CHUNK_SETTINGS, DEFAULT_EMBEDDING_SETTINGS, DEFAULT_SEARCH_SETTINGS
+from .embeddings import (
+    EmbeddingRetriever,
+    LocalModelError,
+    SentenceTransformerEmbedder,
+    build_embedding_index,
+    default_vector_dir,
+    dependency_report,
+    get_vector_index_info,
+)
 from .entity_index import auto_discover_entities, build_entity_records, load_entity_lexicon
 from .parser import parse_chapters
+from .retrieval import LocalRetriever
 from .storage import BookRecallStore
 from .web import run_server
 
@@ -48,7 +58,8 @@ def ask_question(args: argparse.Namespace) -> None:
     store = BookRecallStore(args.db)
     try:
         store.initialize()
-        agent = BookRecallAgent(store)
+        retriever = _make_retriever(args, store)
+        agent = BookRecallAgent(store, retriever=retriever)
         card = agent.ask_card(
             book_id=args.book_id,
             question=args.question,
@@ -61,6 +72,32 @@ def ask_question(args: argparse.Namespace) -> None:
         print(agent.render_json(card))
     else:
         print(agent.render_text(card))
+
+
+def _make_retriever(args: argparse.Namespace, store: BookRecallStore):
+    mode = getattr(args, "retriever", "lexical")
+    if mode == "lexical":
+        return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+
+    index_dir = getattr(args, "vector_dir", None) or default_vector_dir(getattr(args, "db"))
+    info = get_vector_index_info(index_dir, getattr(args, "book_id"))
+    if info is None:
+        if mode == "auto":
+            return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+        raise LocalModelError("未找到本书的向量索引。请先运行 embed-build，或改用 --retriever lexical。")
+
+    try:
+        embedder = SentenceTransformerEmbedder(info.model_name)
+        return EmbeddingRetriever(
+            store,
+            DEFAULT_SEARCH_SETTINGS,
+            index_dir=index_dir,
+            embedder=embedder,
+        )
+    except LocalModelError:
+        if mode == "auto":
+            return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+        raise
 
 
 def set_progress(args: argparse.Namespace) -> None:
@@ -181,6 +218,78 @@ def clear_book(args: argparse.Namespace) -> None:
     print(f"已删除 book_id={args.book_id} 的全部索引数据（约 {removed} 条 chunk 记录）。")
 
 
+def show_models(args: argparse.Namespace) -> None:
+    report = dependency_report()
+    vector_dir = default_vector_dir(args.db)
+    print("本地小模型能力探测：")
+    print(f"- numpy：{'可用' if report['numpy'] else '缺失'}")
+    print(f"- sentence-transformers：{'可用' if report['sentence_transformers'] else '缺失'}")
+    print(f"- torch：{'可用' if report['torch'] else '缺失'}")
+    print(f"- faiss：{'可用' if report['faiss'] else '缺失'}（当前实现可用 numpy 精确检索，不强制依赖 faiss）")
+    print(f"- 推荐 embedding 模型：{report['recommended_embedding_model']}")
+    print(f"- 默认向量索引目录：{vector_dir}")
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        books = store.list_books()
+    finally:
+        store.close()
+    for book in books:
+        info = get_vector_index_info(vector_dir, book.book_id)
+        status = "已构建" if info else "未构建"
+        suffix = f"，model={info.model_name}，chunks={info.chunk_count}" if info else ""
+        print(f"- {book.book_id}：{status}{suffix}")
+
+
+def build_embeddings(args: argparse.Namespace) -> None:
+    index_dir = args.vector_dir or default_vector_dir(args.db)
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        if store.get_book(args.book_id) is None:
+            print(f"没有找到 book_id={args.book_id}，请先运行 build。")
+            return
+        embedder = SentenceTransformerEmbedder(args.model)
+        info = build_embedding_index(
+            store=store,
+            book_id=args.book_id,
+            index_dir=index_dir,
+            embedder=embedder,
+            batch_size=args.batch_size,
+            limit_chunks=args.limit_chunks,
+        )
+    finally:
+        store.close()
+    print("本地向量索引构建完成：")
+    print(f"- book_id：{info.book_id}")
+    print(f"- model：{info.model_name}")
+    print(f"- chunks：{info.chunk_count}")
+    print(f"- dimension：{info.dimension}")
+    print(f"- path：{info.path}")
+
+
+def search_embeddings(args: argparse.Namespace) -> None:
+    index_dir = args.vector_dir or default_vector_dir(args.db)
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        info = get_vector_index_info(index_dir, args.book_id)
+        if info is None:
+            print("还没有向量索引，请先运行 embed-build。")
+            return
+        embedder = SentenceTransformerEmbedder(info.model_name)
+        retriever = EmbeddingRetriever(store, DEFAULT_SEARCH_SETTINGS, index_dir=index_dir, embedder=embedder)
+        hits = retriever.search(args.book_id, args.query, max_chapter=args.progress)
+    finally:
+        store.close()
+    if not hits:
+        print("没有找到向量检索命中。")
+        return
+    for hit in hits:
+        print(f"- score={hit.score:.4f} 第 {hit.chapter_number} 章《{hit.chapter_title}》")
+        print(f"  {hit.child_text[:160].strip()}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BookRecall 阅读记忆助手 MVP")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -201,6 +310,8 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser_cmd.add_argument("--user", default="default", help="用户 ID")
     ask_parser_cmd.add_argument("--progress", type=int, help="临时覆盖阅读进度章节号")
     ask_parser_cmd.add_argument("--format", choices=("text", "json"), default="text", help="回答输出格式")
+    ask_parser_cmd.add_argument("--retriever", choices=("lexical", "embedding", "auto"), default="lexical", help="检索器：默认倒排检索；embedding 需要先构建本地向量索引")
+    ask_parser_cmd.add_argument("--vector-dir", help="向量索引目录，默认与数据库同目录下的 vectors")
     ask_parser_cmd.set_defaults(func=ask_question)
 
     set_progress_cmd = subparsers.add_parser("set-progress", help="保存阅读进度")
@@ -248,13 +359,37 @@ def build_parser() -> argparse.ArgumentParser:
     clear_cmd.add_argument("--yes", action="store_true", help="确认删除（必需，否则只预览）")
     clear_cmd.set_defaults(func=clear_book)
 
+    models_cmd = subparsers.add_parser("models", help="探测本地小模型依赖与向量索引状态")
+    models_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    models_cmd.set_defaults(func=show_models)
+
+    embed_build_cmd = subparsers.add_parser("embed-build", help="使用本地 embedding 小模型为已有书籍构建向量索引")
+    embed_build_cmd.add_argument("--book-id", required=True, help="书籍唯一 ID")
+    embed_build_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    embed_build_cmd.add_argument("--model", default=DEFAULT_EMBEDDING_SETTINGS.model_name, help="sentence-transformers 模型名")
+    embed_build_cmd.add_argument("--batch-size", type=int, default=DEFAULT_EMBEDDING_SETTINGS.batch_size, help="embedding 批大小")
+    embed_build_cmd.add_argument("--vector-dir", help="向量索引输出目录，默认与数据库同目录下的 vectors")
+    embed_build_cmd.add_argument("--limit-chunks", type=int, help="仅构建前 N 个 child chunk，用于快速试跑")
+    embed_build_cmd.set_defaults(func=build_embeddings)
+
+    embed_search_cmd = subparsers.add_parser("embed-search", help="直接用本地向量索引检索证据片段")
+    embed_search_cmd.add_argument("--book-id", required=True, help="书籍唯一 ID")
+    embed_search_cmd.add_argument("--query", required=True, help="检索问题")
+    embed_search_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    embed_search_cmd.add_argument("--progress", type=int, help="限制最大章节，防止检索越界")
+    embed_search_cmd.add_argument("--vector-dir", help="向量索引目录，默认与数据库同目录下的 vectors")
+    embed_search_cmd.set_defaults(func=search_embeddings)
+
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except LocalModelError as exc:
+        parser.exit(2, f"本地小模型不可用：{exc}\n")
 
 
 if __name__ == "__main__":

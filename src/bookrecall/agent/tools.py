@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ..retrieval import LocalRetriever
+from ..retrieval import Retriever
 from ..storage import BookRecallStore
 from .state import AgentState
 
@@ -310,7 +310,7 @@ def _tool_list_entities(store: BookRecallStore) -> Tool:
     )
 
 
-def build_default_registry(store: BookRecallStore, retriever: LocalRetriever) -> ToolRegistry:
+def build_default_registry(store: BookRecallStore, retriever: Retriever) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(_tool_lookup_first_appearance(store))
     registry.register(_tool_lookup_timeline(store))
