@@ -11,6 +11,8 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
 
 和普通 RAG 不同，BookRecall 不是只靠向量检索。它把结构化实体索引、章节级上下文、细粒度证据片段和一个可控的 ReAct Agent 组合起来，优先解决“第一次出现”“有没有再出现”“不要剧透”这类阅读回忆问题。
 
+![1783146838804](image/README/1783146838804.png)
+
 ## 项目特点
 
 - 本地三层索引：章节解析 -> parent/child chunk -> 结构化实体索引。
@@ -489,4 +491,4 @@ examples/
 
 ## License
 
-Apache-2.0 
+Apache-2.0
