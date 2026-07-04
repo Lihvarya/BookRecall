@@ -110,6 +110,35 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("第 2 章", answer["answer"])
         self.assertIn("rendered_text", answer)
 
+    def test_runtime_endpoint(self) -> None:
+        data = self._get_json("/api/runtime")
+        self.assertIn("dependencies", data)
+        self.assertIn("vector_indexes", data)
+        providers = data["cloud"]["providers"]
+        provider_ids = [item["id"] for item in providers]
+        self.assertIn("deepseek", provider_ids)
+        self.assertEqual(data["retrievers"][0]["id"], "lexical")
+
+    def test_ask_accepts_runtime_options(self) -> None:
+        answer = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "question": "黑袍人第一次出现在哪一章？",
+                "retriever": "auto",
+                "cloud_config": {
+                    "enabled": False,
+                    "endpoint": "https://api.deepseek.com/v1/chat/completions",
+                    "model": "deepseek-chat",
+                    "api_key": "not-used",
+                },
+            },
+        )
+        self.assertEqual(answer["runtime"]["retriever"], "auto")
+        self.assertFalse(answer["runtime"]["cloud_reasoner_enabled"])
+        self.assertIn("rendered_text", answer)
+
     def test_index_page(self) -> None:
         with urllib.request.urlopen(f"{self.base_url}/") as response:
             html = response.read().decode("utf-8")

@@ -1,11 +1,33 @@
+from __future__ import annotations
+
 import json
+import os
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .agent import BookRecallAgent
+from .cloud import OpenAICompatibleReasoner
+from .config import DEFAULT_SEARCH_SETTINGS
+from .embeddings import (
+    EmbeddingRetriever,
+    LocalModelError,
+    SentenceTransformerEmbedder,
+    default_vector_dir,
+    dependency_report,
+    get_vector_index_info,
+)
+from .retrieval import LocalRetriever, Retriever
 from .storage import BookRecallStore
+
+
+class _DisabledReasoner:
+    enabled = False
+    model = None
+
+    def answer(self, prompt: str) -> str | None:
+        return None
 
 
 class BookRecallWebService:
@@ -32,6 +54,72 @@ class BookRecallWebService:
             ]
         finally:
             store.close()
+
+    def runtime_status(self) -> dict[str, object]:
+        report = dependency_report()
+        vector_dir = default_vector_dir(self.db_path)
+        store = self._open_store()
+        try:
+            books = store.list_books()
+        finally:
+            store.close()
+
+        vector_indexes = []
+        for book in books:
+            info = get_vector_index_info(vector_dir, book.book_id)
+            vector_indexes.append(
+                {
+                    "book_id": book.book_id,
+                    "built": info is not None,
+                    "model_name": info.model_name if info else None,
+                    "backend": info.backend if info else None,
+                    "chunk_count": info.chunk_count if info else 0,
+                    "dimension": info.dimension if info else 0,
+                    "path": info.path if info else None,
+                }
+            )
+
+        endpoint = os.getenv("BOOKRECALL_API_ENDPOINT") or "https://api.openai.com/v1/chat/completions"
+        model = os.getenv("BOOKRECALL_MODEL") or "gpt-4o-mini"
+        return {
+            "dependencies": report,
+            "vector_dir": str(vector_dir),
+            "vector_indexes": vector_indexes,
+            "cloud": {
+                "env_key_available": bool(os.getenv("BOOKRECALL_API_KEY") or os.getenv("OPENAI_API_KEY")),
+                "endpoint": endpoint,
+                "model": model,
+                "providers": [
+                    {
+                        "id": "deepseek",
+                        "name": "DeepSeek",
+                        "endpoint": "https://api.deepseek.com/v1/chat/completions",
+                        "model": "deepseek-chat",
+                    },
+                    {
+                        "id": "openai",
+                        "name": "OpenAI",
+                        "endpoint": "https://api.openai.com/v1/chat/completions",
+                        "model": "gpt-4o-mini",
+                    },
+                    {
+                        "id": "custom",
+                        "name": "OpenAI-compatible",
+                        "endpoint": endpoint,
+                        "model": model,
+                    },
+                ],
+            },
+            "retrievers": [
+                {"id": "lexical", "name": "倒排检索", "ready": True},
+                {
+                    "id": "embedding",
+                    "name": "本地 embedding",
+                    "ready": bool(report["numpy"] and report["sentence_transformers"]),
+                },
+                {"id": "auto", "name": "自动选择", "ready": True},
+            ],
+        }
 
     def list_entities(self, book_id: str) -> list[dict[str, object]]:
         store = self._open_store()
@@ -100,10 +188,14 @@ class BookRecallWebService:
         question: str,
         user_id: str = "default",
         progress_chapter: int | None = None,
+        retriever_mode: str = "lexical",
+        cloud_config: dict[str, object] | None = None,
     ) -> dict[str, object]:
         store = self._open_store()
         try:
-            agent = BookRecallAgent(store)
+            retriever = self._make_retriever(store, book_id, retriever_mode)
+            reasoner = self._make_reasoner(cloud_config)
+            agent = BookRecallAgent(store, retriever=retriever, reasoner=reasoner)
             card = agent.ask_card(
                 book_id=book_id,
                 question=question,
@@ -112,14 +204,52 @@ class BookRecallWebService:
             )
             payload = agent.to_payload(card)
             payload["rendered_text"] = agent.render_text(card)
+            payload["runtime"] = {
+                "retriever": retriever_mode,
+                "cloud_reasoner_enabled": reasoner.enabled,
+                "cloud_model": reasoner.model if reasoner.enabled else None,
+            }
             return payload
         finally:
             store.close()
 
+    def _make_retriever(self, store: BookRecallStore, book_id: str, mode: str) -> Retriever:
+        if mode not in {"lexical", "embedding", "auto"}:
+            raise LocalModelError("未知检索器，请选择 lexical、embedding 或 auto。")
+        if mode == "lexical":
+            return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+
+        vector_dir = default_vector_dir(self.db_path)
+        info = get_vector_index_info(vector_dir, book_id)
+        if info is None:
+            if mode == "auto":
+                return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+            raise LocalModelError("这本书还没有向量索引，请先运行 embed-build，或在网页端选择倒排检索。")
+
+        try:
+            embedder = SentenceTransformerEmbedder(info.model_name)
+            return EmbeddingRetriever(store, DEFAULT_SEARCH_SETTINGS, index_dir=vector_dir, embedder=embedder)
+        except LocalModelError:
+            if mode == "auto":
+                return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+            raise
+
+    def _make_reasoner(self, cloud_config: dict[str, object] | None) -> OpenAICompatibleReasoner | _DisabledReasoner:
+        if not cloud_config:
+            return OpenAICompatibleReasoner()
+        enabled = bool(cloud_config.get("enabled"))
+        if not enabled:
+            return _DisabledReasoner()
+        return OpenAICompatibleReasoner(
+            api_key=str(cloud_config.get("api_key") or "").strip(),
+            endpoint=str(cloud_config.get("endpoint") or "").strip() or None,
+            model=str(cloud_config.get("model") or "").strip() or None,
+        )
+
 
 class BookRecallHandler(BaseHTTPRequestHandler):
     service: BookRecallWebService
-    server_version = "BookRecallHTTP/0.1"
+    server_version = "BookRecallHTTP/0.2"
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -131,6 +261,10 @@ class BookRecallHandler(BaseHTTPRequestHandler):
 
         if path == "/api/books":
             self._send_json({"books": self.service.list_books()})
+            return
+
+        if path == "/api/runtime":
+            self._send_json(self.service.runtime_status())
             return
 
         if path.startswith("/api/books/") and path.endswith("/entities"):
@@ -164,39 +298,52 @@ class BookRecallHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/ask":
-            payload = self._read_json_body()
-            if payload is None:
-                return
-            book_id = str(payload.get("book_id", "")).strip()
-            question = str(payload.get("question", "")).strip()
-            user_id = str(payload.get("user_id", "default")).strip() or "default"
-            progress_raw = payload.get("progress_chapter")
-            progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
-            if not book_id or not question:
-                self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和 question 不能为空。")
-                return
-            self._send_json(
-                self.service.ask(
-                    book_id=book_id,
-                    question=question,
-                    user_id=user_id,
-                    progress_chapter=progress_chapter,
+        try:
+            if parsed.path == "/api/ask":
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = str(payload.get("book_id", "")).strip()
+                question = str(payload.get("question", "")).strip()
+                user_id = str(payload.get("user_id", "default")).strip() or "default"
+                retriever_mode = str(payload.get("retriever", "lexical")).strip() or "lexical"
+                progress_raw = payload.get("progress_chapter")
+                progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
+                cloud_config = payload.get("cloud_config")
+                if not isinstance(cloud_config, dict):
+                    cloud_config = None
+                if not book_id or not question:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和 question 不能为空。")
+                    return
+                self._send_json(
+                    self.service.ask(
+                        book_id=book_id,
+                        question=question,
+                        user_id=user_id,
+                        progress_chapter=progress_chapter,
+                        retriever_mode=retriever_mode,
+                        cloud_config=cloud_config,
+                    )
                 )
-            )
-            return
+                return
 
-        if parsed.path == "/api/progress":
-            payload = self._read_json_body()
-            if payload is None:
+            if parsed.path == "/api/progress":
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = str(payload.get("book_id", "")).strip()
+                user_id = str(payload.get("user_id", "default")).strip() or "default"
+                chapter_raw = payload.get("progress_chapter")
+                if not book_id or chapter_raw in (None, ""):
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和 progress_chapter 不能为空。")
+                    return
+                self._send_json(self.service.set_progress(book_id, user_id, int(chapter_raw)))
                 return
-            book_id = str(payload.get("book_id", "")).strip()
-            user_id = str(payload.get("user_id", "default")).strip() or "default"
-            chapter_raw = payload.get("progress_chapter")
-            if not book_id or chapter_raw in (None, ""):
-                self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和 progress_chapter 不能为空。")
-                return
-            self._send_json(self.service.set_progress(book_id, user_id, int(chapter_raw)))
+        except LocalModelError as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except (TypeError, ValueError) as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, f"请求参数不合法：{exc}")
             return
 
         self._send_error_json(HTTPStatus.NOT_FOUND, "接口不存在。")
@@ -261,168 +408,205 @@ def _build_index_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BookRecall</title>
+  <title>BookRecall Agent Console</title>
   <style>
     :root {
-      --paper: #f5efe2;
-      --ink: #1d2731;
-      --accent: #c65d2e;
-      --accent-soft: #f0c9a8;
-      --panel: rgba(255, 251, 244, 0.86);
-      --line: rgba(35, 39, 42, 0.12);
-      --shadow: 0 18px 48px rgba(58, 35, 16, 0.14);
+      --ink: #1b241f;
+      --muted: rgba(27, 36, 31, 0.68);
+      --paper: #f7f0df;
+      --panel: rgba(255, 252, 243, 0.88);
+      --panel-strong: rgba(255, 255, 255, 0.94);
+      --line: rgba(36, 48, 42, 0.13);
+      --green: #295b45;
+      --moss: #789461;
+      --clay: #bf6b3f;
+      --gold: #d7a84f;
+      --shadow: 0 24px 70px rgba(54, 42, 25, 0.16);
+      --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      --serif: "Source Han Serif SC", "Noto Serif SC", "Songti SC", Georgia, serif;
+      --sans: "LXGW WenKai", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: "Source Han Serif SC", "Noto Serif SC", Georgia, Cambria, serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(198, 93, 46, 0.18), transparent 28%),
-        radial-gradient(circle at 90% 20%, rgba(83, 121, 145, 0.14), transparent 24%),
-        linear-gradient(180deg, #efe3ca 0%, #f7f1e5 50%, #f1e5cf 100%);
       min-height: 100vh;
+      color: var(--ink);
+      font-family: var(--sans);
+      background:
+        radial-gradient(circle at 8% 0%, rgba(215, 168, 79, 0.34), transparent 28%),
+        radial-gradient(circle at 88% 12%, rgba(41, 91, 69, 0.2), transparent 24%),
+        linear-gradient(135deg, #efe2c7 0%, #f8f2e6 45%, #e9eddc 100%);
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.35;
+      background-image:
+        linear-gradient(rgba(41, 91, 69, 0.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(41, 91, 69, 0.05) 1px, transparent 1px);
+      background-size: 36px 36px;
+      mask-image: linear-gradient(180deg, #000, transparent 82%);
     }
     .shell {
-      width: min(1180px, calc(100% - 32px));
-      margin: 24px auto 48px;
+      width: min(1440px, calc(100% - 32px));
+      margin: 22px auto 48px;
       display: grid;
-      grid-template-columns: 320px 1fr;
-      gap: 20px;
+      grid-template-columns: 300px minmax(0, 1fr) 360px;
+      gap: 18px;
+      position: relative;
     }
     .panel {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 24px;
+      border-radius: 28px;
       box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
+      backdrop-filter: blur(14px);
     }
-    .sidebar { padding: 22px; }
-    .main { padding: 24px; }
-    h1, h2, h3 { margin: 0; font-weight: 700; }
-    h1 { font-size: 34px; letter-spacing: 0.02em; }
+    .sidebar, .main, .settings { padding: 22px; }
+    h1, h2, h3 { margin: 0; }
+    h1 {
+      font-family: var(--serif);
+      font-size: 34px;
+      letter-spacing: 0.02em;
+    }
+    h2 {
+      font-family: var(--serif);
+      font-size: 22px;
+      margin-bottom: 12px;
+    }
     .subtitle {
-      margin-top: 8px;
-      font-size: 14px;
+      margin: 10px 0 0;
+      color: var(--muted);
       line-height: 1.7;
-      opacity: 0.86;
+      font-size: 14px;
     }
-    .section { margin-top: 24px; }
+    .section { margin-top: 22px; }
     .label {
       display: block;
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
       margin-bottom: 8px;
+      color: rgba(27, 36, 31, 0.72);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
       text-transform: uppercase;
-      color: rgba(29,39,49,0.7);
     }
     select, input, textarea, button {
       width: 100%;
       border-radius: 16px;
       border: 1px solid var(--line);
-      padding: 12px 14px;
+      padding: 12px 13px;
       font: inherit;
-      background: rgba(255,255,255,0.8);
       color: var(--ink);
+      background: rgba(255, 255, 255, 0.78);
+      outline: none;
     }
     textarea {
-      min-height: 128px;
+      min-height: 154px;
       resize: vertical;
-      line-height: 1.6;
+      line-height: 1.65;
     }
     button {
       cursor: pointer;
-      background: linear-gradient(135deg, #d46f3b, #a84422);
-      color: #fff8ef;
-      border: none;
-      font-weight: 700;
-      letter-spacing: 0.03em;
-      box-shadow: 0 10px 22px rgba(154, 66, 33, 0.28);
+      border: 0;
+      color: #fffaf0;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      background: linear-gradient(135deg, var(--green), #16382b);
+      box-shadow: 0 14px 30px rgba(22, 56, 43, 0.25);
+      transition: transform 0.18s ease, box-shadow 0.18s ease;
     }
-    button.secondary {
-      background: linear-gradient(135deg, #54788c, #345062);
-      box-shadow: 0 10px 22px rgba(52, 80, 98, 0.22);
+    button:hover { transform: translateY(-1px); box-shadow: 0 18px 34px rgba(22, 56, 43, 0.28); }
+    button.secondary { background: linear-gradient(135deg, #7b8d58, #52653a); }
+    button.ghost {
+      color: var(--green);
+      background: rgba(41, 91, 69, 0.09);
+      box-shadow: none;
+      border: 1px solid rgba(41, 91, 69, 0.16);
     }
     .inline {
       display: grid;
-      grid-template-columns: 1fr 140px;
+      grid-template-columns: 1fr 118px;
       gap: 10px;
     }
-    .books, .entities, .evidence, .suggestions {
+    .hero {
       display: grid;
-      gap: 10px;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: start;
+      margin-bottom: 18px;
     }
-    .book-item, .entity-item, .evidence-item, .suggestion-item, .status {
-      border: 1px solid rgba(29,39,49,0.1);
-      background: rgba(255,255,255,0.74);
+    .status, .mini-card, .book-item, .entity-item, .evidence-item, .suggestion-item {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.68);
       border-radius: 18px;
-      padding: 14px 16px;
-    }
-    .book-item strong, .entity-item strong {
-      display: block;
-      margin-bottom: 4px;
+      padding: 13px 15px;
     }
     .status {
-      margin-bottom: 16px;
-      background: rgba(240, 201, 168, 0.35);
+      background: linear-gradient(135deg, rgba(215, 168, 79, 0.24), rgba(255, 255, 255, 0.58));
+      line-height: 1.6;
     }
-    .answer-card {
-      margin-top: 18px;
-      padding: 22px;
-      border-radius: 24px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(249,244,235,0.94));
-      border: 1px solid rgba(29,39,49,0.1);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.6);
-    }
-    .answer-head {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-      align-items: center;
-      margin-bottom: 12px;
-    }
+    .stack { display: grid; gap: 10px; }
+    .books, .entities, .chapters, .model-list, .evidence, .suggestions { display: grid; gap: 10px; }
+    .book-item strong, .entity-item strong, .mini-card strong { display: block; margin-bottom: 4px; }
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); font-size: 12px; }
+    .pill-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .pill {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
       padding: 6px 10px;
       border-radius: 999px;
-      background: rgba(198, 93, 46, 0.12);
-      color: #7f3618;
+      background: rgba(41, 91, 69, 0.1);
+      color: var(--green);
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 800;
     }
-    .answer-text {
-      font-size: 19px;
-      line-height: 1.7;
-      margin: 10px 0 0;
+    .pill.warn { background: rgba(191, 107, 63, 0.13); color: #984d2a; }
+    .pill.ready { background: rgba(120, 148, 97, 0.16); color: #405c2d; }
+    .answer-card {
+      margin-top: 18px;
+      padding: 22px;
+      border-radius: 26px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(249,244,235,0.92));
+      border: 1px solid var(--line);
     }
-    .muted { opacity: 0.72; }
+    .answer-head { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+    .answer-text { font-size: 18px; line-height: 1.75; margin: 0; white-space: pre-wrap; }
     .grid-two {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin-top: 18px;
+      gap: 12px;
+      margin-top: 16px;
     }
     .empty {
-      padding: 28px 18px;
+      padding: 24px 16px;
       text-align: center;
-      border: 1px dashed rgba(29,39,49,0.2);
+      border: 1px dashed rgba(27, 36, 31, 0.24);
       border-radius: 18px;
-      color: rgba(29,39,49,0.62);
+      color: var(--muted);
+      line-height: 1.7;
     }
-    .mono {
-      font-family: "Cascadia Code", Consolas, "SFMono-Regular", monospace;
-      font-size: 12px;
+    .tiny { font-size: 12px; line-height: 1.6; }
+    .checkline {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 13px;
     }
-    @media (max-width: 960px) {
-      .shell {
-        grid-template-columns: 1fr;
-      }
-      .grid-two, .inline {
-        grid-template-columns: 1fr;
-      }
+    .checkline input { width: auto; }
+    details summary { cursor: pointer; list-style: none; }
+    details summary::-webkit-details-marker { display: none; }
+    @media (max-width: 1180px) {
+      .shell { grid-template-columns: 280px minmax(0, 1fr); }
+      .settings { grid-column: 1 / -1; }
+    }
+    @media (max-width: 820px) {
+      .shell { grid-template-columns: 1fr; }
+      .hero, .grid-two, .inline { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -430,7 +614,7 @@ def _build_index_html() -> str:
   <div class="shell">
     <aside class="panel sidebar">
       <h1>BookRecall</h1>
-      <p class="subtitle">本地阅读记忆助手。选一本书，设置阅读进度，然后像和自己的记忆做交叉索引一样提问。</p>
+      <p class="subtitle">阅读记忆 Agent 控制台。选择书籍、锁定阅读进度，再决定让本地索引、embedding 小模型或外部大模型怎么协作。</p>
 
       <div class="section">
         <label class="label" for="bookSelect">书籍</label>
@@ -443,10 +627,10 @@ def _build_index_html() -> str:
       </div>
 
       <div class="section">
-        <label class="label" for="progressInput">阅读进度（章）</label>
+        <label class="label" for="progressInput">阅读进度</label>
         <div class="inline">
-          <input id="progressInput" type="number" min="1" step="1">
-          <button class="secondary" id="saveProgressBtn" type="button">保存进度</button>
+          <input id="progressInput" type="number" min="1" step="1" placeholder="已读章节">
+          <button class="secondary" id="saveProgressBtn" type="button">保存</button>
         </div>
       </div>
 
@@ -455,30 +639,45 @@ def _build_index_html() -> str:
       </div>
 
       <div class="section">
-        <span class="label">实体索引</span>
-        <div class="entities" id="entitiesPanel"></div>
+        <details open>
+          <summary class="label">实体索引</summary>
+          <div class="entities" id="entitiesPanel"></div>
+        </details>
       </div>
 
       <div class="section">
         <details>
-          <summary class="label" style="cursor:pointer;list-style:none">章节浏览（点击展开）</summary>
+          <summary class="label">章节浏览</summary>
           <div class="chapters" id="chaptersPanel"></div>
         </details>
       </div>
     </aside>
 
     <main class="panel main">
+      <div class="hero">
+        <div>
+          <h2>唤醒这段记忆</h2>
+          <p class="subtitle">强顺序问题仍走实体索引；开放回忆可以切到 embedding；复杂推理可临时接入 DeepSeek 或其他 OpenAI-compatible API。</p>
+        </div>
+        <div class="pill-row">
+          <span class="pill" id="retrieverPill">retriever: lexical</span>
+          <span class="pill" id="cloudPill">cloud: off</span>
+        </div>
+      </div>
+
       <div class="status" id="statusBar">准备就绪。</div>
 
-      <label class="label" for="questionInput">提问</label>
-      <textarea id="questionInput" placeholder="比如：黑衣人第一次出现在哪一章？或者：这本书里关于自由意志的观点前后有什么变化？"></textarea>
+      <div class="section">
+        <label class="label" for="questionInput">提问</label>
+        <textarea id="questionInput" placeholder="比如：黑衣人第一次出现在哪一章？或者：开窍大典前后发生了什么？"></textarea>
+      </div>
 
       <div class="section">
         <button id="askBtn" type="button">唤醒这段记忆</button>
       </div>
 
       <section class="answer-card" id="answerCard">
-        <div class="empty">先选一本书并提一个问题。这里会显示结构化记忆卡片、证据片段和可继续追问的方向。</div>
+        <div class="empty">先选择一本书并提出问题。这里会显示结构化记忆卡片、证据片段和继续追问方向。</div>
       </section>
 
       <section class="section">
@@ -486,32 +685,96 @@ def _build_index_html() -> str:
         <div class="books" id="booksPanel"></div>
       </section>
     </main>
+
+    <aside class="panel settings">
+      <h2>Agent 设置</h2>
+
+      <div class="section">
+        <label class="label" for="retrieverSelect">证据检索器</label>
+        <select id="retrieverSelect">
+          <option value="lexical">倒排检索：稳定、零依赖</option>
+          <option value="embedding">本地 embedding：语义召回</option>
+          <option value="auto">自动：有向量索引用 embedding，否则倒排</option>
+        </select>
+        <p class="subtitle tiny">“第一次出现”仍由结构化实体索引回答；检索器主要影响语义回忆和对比类问题。</p>
+      </div>
+
+      <div class="section">
+        <span class="label">本地模型与索引</span>
+        <div class="model-list" id="modelPanel"></div>
+      </div>
+
+      <div class="section">
+        <label class="label" for="providerSelect">外部 API 预设</label>
+        <select id="providerSelect">
+          <option value="deepseek">DeepSeek</option>
+          <option value="openai">OpenAI</option>
+          <option value="custom">自定义 OpenAI-compatible</option>
+        </select>
+      </div>
+
+      <div class="section stack">
+        <label class="label" for="apiEndpointInput">API Endpoint</label>
+        <input id="apiEndpointInput" placeholder="https://api.deepseek.com/v1/chat/completions">
+        <label class="label" for="apiModelInput">模型名</label>
+        <input id="apiModelInput" placeholder="deepseek-chat">
+        <label class="label" for="apiKeyInput">API Key</label>
+        <input id="apiKeyInput" type="password" placeholder="仅在本次请求发送，不写入服务端">
+        <label class="checkline">
+          <input id="cloudEnabledInput" type="checkbox">
+          <span>启用外部大模型 ReAct 规划</span>
+        </label>
+        <label class="checkline">
+          <input id="rememberApiInput" type="checkbox">
+          <span>把 endpoint/model/key 保存到本浏览器 localStorage</span>
+        </label>
+        <div class="inline">
+          <button class="ghost" id="saveApiBtn" type="button">保存本地设置</button>
+          <button class="ghost" id="clearApiBtn" type="button">清除</button>
+        </div>
+        <p class="subtitle tiny">安全边界：服务端不落盘保存密钥；如果勾选保存，只会存在当前浏览器的 localStorage。</p>
+      </div>
+    </aside>
   </div>
 
   <script>
     const state = {
       books: [],
+      runtime: null,
+      providers: {},
       currentBookId: "",
       currentUserId: "default"
     };
 
-    const bookSelect = document.getElementById("bookSelect");
-    const userInput = document.getElementById("userInput");
-    const progressInput = document.getElementById("progressInput");
-    const questionInput = document.getElementById("questionInput");
-    const statusBar = document.getElementById("statusBar");
-    const bookMeta = document.getElementById("bookMeta");
-    const booksPanel = document.getElementById("booksPanel");
-    const entitiesPanel = document.getElementById("entitiesPanel");
-    const chaptersPanel = document.getElementById("chaptersPanel");
-    const answerCard = document.getElementById("answerCard");
+    const els = {
+      bookSelect: document.getElementById("bookSelect"),
+      userInput: document.getElementById("userInput"),
+      progressInput: document.getElementById("progressInput"),
+      questionInput: document.getElementById("questionInput"),
+      statusBar: document.getElementById("statusBar"),
+      bookMeta: document.getElementById("bookMeta"),
+      booksPanel: document.getElementById("booksPanel"),
+      entitiesPanel: document.getElementById("entitiesPanel"),
+      chaptersPanel: document.getElementById("chaptersPanel"),
+      answerCard: document.getElementById("answerCard"),
+      retrieverSelect: document.getElementById("retrieverSelect"),
+      retrieverPill: document.getElementById("retrieverPill"),
+      cloudPill: document.getElementById("cloudPill"),
+      modelPanel: document.getElementById("modelPanel"),
+      providerSelect: document.getElementById("providerSelect"),
+      apiEndpointInput: document.getElementById("apiEndpointInput"),
+      apiModelInput: document.getElementById("apiModelInput"),
+      apiKeyInput: document.getElementById("apiKeyInput"),
+      cloudEnabledInput: document.getElementById("cloudEnabledInput"),
+      rememberApiInput: document.getElementById("rememberApiInput")
+    };
 
     function setStatus(text) {
-      statusBar.textContent = text;
+      els.statusBar.textContent = text;
     }
 
     function escapeHtml(value) {
-      return String(value)
+      return String(value ?? "")
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
@@ -533,10 +796,10 @@ def _build_index_html() -> str:
 
     function renderBooks(books) {
       if (!books.length) {
-        booksPanel.innerHTML = '<div class="empty">当前还没有已建索引的书。先用 CLI 执行 build。</div>';
+        els.booksPanel.innerHTML = '<div class="empty">当前还没有已建索引的书。先用 CLI 执行 build。</div>';
         return;
       }
-      booksPanel.innerHTML = books.map((book) => `
+      els.booksPanel.innerHTML = books.map((book) => `
         <div class="book-item">
           <strong>${escapeHtml(book.title)}</strong>
           <div class="muted mono">${escapeHtml(book.book_id)}</div>
@@ -546,12 +809,48 @@ def _build_index_html() -> str:
       `).join("");
     }
 
+    function renderModels(runtime) {
+      const deps = runtime.dependencies || {};
+      const depCards = [
+        ["numpy", deps.numpy],
+        ["sentence-transformers", deps.sentence_transformers],
+        ["torch", deps.torch],
+        ["faiss", deps.faiss]
+      ].map(([name, ok]) => `
+        <div class="mini-card">
+          <strong>${escapeHtml(name)}</strong>
+          <span class="pill ${ok ? "ready" : "warn"}">${ok ? "可用" : "缺失"}</span>
+        </div>
+      `).join("");
+
+      const indexCards = (runtime.vector_indexes || []).map((item) => `
+        <div class="mini-card">
+          <strong>${escapeHtml(item.book_id)}</strong>
+          <div class="pill-row">
+            <span class="pill ${item.built ? "ready" : "warn"}">${item.built ? "向量索引已构建" : "未构建"}</span>
+            ${item.built ? `<span class="pill">${item.chunk_count} chunks</span>` : ""}
+          </div>
+          <div class="muted mono">${escapeHtml(item.model_name || "运行 embed-build 后可用")}</div>
+        </div>
+      `).join("");
+
+      els.modelPanel.innerHTML = `
+        <div class="stack">${depCards}</div>
+        <div class="mini-card">
+          <strong>推荐 embedding</strong>
+          <div class="mono">${escapeHtml(deps.recommended_embedding_model || "BAAI/bge-small-zh-v1.5")}</div>
+          <div class="muted mono">${escapeHtml(runtime.vector_dir)}</div>
+        </div>
+        <div class="stack">${indexCards || '<div class="empty">还没有书籍索引。</div>'}</div>
+      `;
+    }
+
     function renderEntities(entities) {
       if (!entities.length) {
-        entitiesPanel.innerHTML = '<div class="empty">这本书还没有实体索引。</div>';
+        els.entitiesPanel.innerHTML = '<div class="empty">这本书还没有实体索引。</div>';
         return;
       }
-      entitiesPanel.innerHTML = entities.slice(0, 12).map((entity) => `
+      els.entitiesPanel.innerHTML = entities.slice(0, 14).map((entity) => `
         <div class="entity-item">
           <strong>${escapeHtml(entity.name)}</strong>
           <div>首次出现：第 ${entity.first_chapter_number} 章</div>
@@ -563,13 +862,13 @@ def _build_index_html() -> str:
 
     function renderChapters(chapters) {
       if (!chapters.length) {
-        chaptersPanel.innerHTML = '<div class="empty">还没有章节索引。</div>';
+        els.chaptersPanel.innerHTML = '<div class="empty">还没有章节索引。</div>';
         return;
       }
-      chaptersPanel.innerHTML = chapters.map((chapter) => `
+      els.chaptersPanel.innerHTML = chapters.map((chapter) => `
         <div class="entity-item">
           <strong>第 ${chapter.chapter_number} 章 ${escapeHtml(chapter.title)}</strong>
-          <div class="muted">${escapeHtml((chapter.summary || "").slice(0, 60))}${(chapter.summary || "").length > 60 ? "..." : ""}</div>
+          <div class="muted">${escapeHtml((chapter.summary || "").slice(0, 70))}${(chapter.summary || "").length > 70 ? "..." : ""}</div>
         </div>
       `).join("");
     }
@@ -579,153 +878,229 @@ def _build_index_html() -> str:
         ? `<div class="grid-two evidence">${card.evidence.map((item) => `
             <div class="evidence-item">
               <strong>第 ${item.chapter_number} 章《${escapeHtml(item.chapter_title)}》</strong>
-              <div class="muted">${escapeHtml(item.reason)}</div>
               <p>${escapeHtml(item.excerpt)}</p>
+              <div class="muted tiny">${escapeHtml(item.reason || "")}</div>
             </div>
           `).join("")}</div>`
-        : '<div class="empty">这次没有抓到可展示的证据片段。</div>';
+        : '<div class="empty">这次没有足够证据片段。</div>';
 
       const suggestionsHtml = (card.suggestions || []).length
-        ? `<div class="suggestions">${card.suggestions.map((item) => `
-            <button class="suggestion-item" type="button" data-question="${escapeHtml(item)}">${escapeHtml(item)}</button>
-          `).join("")}</div>`
+        ? `<div class="section"><span class="label">继续追问</span><div class="suggestions">${card.suggestions.map((item) => `
+            <button class="suggestion-item ghost" type="button" data-question="${escapeHtml(item)}">${escapeHtml(item)}</button>
+          `).join("")}</div></div>`
         : "";
 
-      answerCard.innerHTML = `
+      const runtime = card.runtime || {};
+      els.answerCard.innerHTML = `
         <div class="answer-head">
-          <span class="pill">${escapeHtml(card.intent)}</span>
-          <span class="pill">已读至第 ${card.progress_chapter} 章</span>
+          <span class="pill">类型：${escapeHtml(card.intent)}</span>
+          <span class="pill">进度：第 ${card.progress_chapter} 章</span>
           ${card.entity_name ? `<span class="pill">实体：${escapeHtml(card.entity_name)}</span>` : ""}
-          ${card.spoiler_blocked ? `<span class="pill">防剧透已触发</span>` : ""}
+          ${card.spoiler_blocked ? '<span class="pill warn">已阻断剧透</span>' : ""}
+          ${runtime.retriever ? `<span class="pill">检索器：${escapeHtml(runtime.retriever)}</span>` : ""}
+          ${runtime.cloud_reasoner_enabled ? `<span class="pill ready">云端：${escapeHtml(runtime.cloud_model)}</span>` : ""}
         </div>
         <p class="answer-text">${escapeHtml(card.answer)}</p>
         ${card.summary ? `<p class="muted">${escapeHtml(card.summary)}</p>` : ""}
-        <div class="section">
-          <span class="label">证据片段</span>
-          ${evidenceHtml}
-        </div>
-        <div class="section">
-          <span class="label">继续追问</span>
-          ${suggestionsHtml || '<div class="empty">当前没有推荐追问。</div>'}
-        </div>
+        <div class="section"><span class="label">证据定位</span>${evidenceHtml}</div>
+        ${suggestionsHtml}
+        <details class="section">
+          <summary class="label">原始 JSON</summary>
+          <pre class="mono">${escapeHtml(JSON.stringify(card, null, 2))}</pre>
+        </details>
       `;
-
-      answerCard.querySelectorAll("[data-question]").forEach((button) => {
-        button.addEventListener("click", () => {
-          questionInput.value = button.getAttribute("data-question") || "";
+      els.answerCard.querySelectorAll("[data-question]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          els.questionInput.value = btn.dataset.question || "";
           askQuestion();
         });
       });
     }
 
-    async function refreshBooks() {
-      const data = await requestJson("/api/books");
-      state.books = data.books || [];
-      renderBooks(state.books);
+    function updatePills() {
+      els.retrieverPill.textContent = `retriever: ${els.retrieverSelect.value}`;
+      els.cloudPill.textContent = els.cloudEnabledInput.checked ? `cloud: ${els.apiModelInput.value || "on"}` : "cloud: off";
+      els.cloudPill.className = `pill ${els.cloudEnabledInput.checked ? "ready" : ""}`;
+    }
 
-      bookSelect.innerHTML = state.books.map((book) =>
-        `<option value="${escapeHtml(book.book_id)}">${escapeHtml(book.title)} (${escapeHtml(book.book_id)})</option>`
-      ).join("");
+    function applyProvider(providerId) {
+      const provider = state.providers[providerId];
+      if (!provider) return;
+      els.apiEndpointInput.value = provider.endpoint || "";
+      els.apiModelInput.value = provider.model || "";
+      updatePills();
+    }
 
-      if (state.books.length && !state.currentBookId) {
-        state.currentBookId = state.books[0].book_id;
-        bookSelect.value = state.currentBookId;
-      }
-      if (state.currentBookId) {
-        await refreshCurrentBook();
-      } else {
-        bookMeta.textContent = "当前没有可用书籍。先用 CLI 建索引。";
+    function loadLocalApiSettings() {
+      try {
+        const raw = localStorage.getItem("bookrecall.apiSettings");
+        if (!raw) return;
+        const saved = JSON.parse(raw);
+        els.providerSelect.value = saved.provider || "deepseek";
+        els.apiEndpointInput.value = saved.endpoint || "";
+        els.apiModelInput.value = saved.model || "";
+        els.apiKeyInput.value = saved.apiKey || "";
+        els.cloudEnabledInput.checked = Boolean(saved.enabled);
+        els.rememberApiInput.checked = Boolean(saved.remember);
+      } catch (_) {
+        localStorage.removeItem("bookrecall.apiSettings");
       }
     }
 
-    async function refreshCurrentBook() {
-      state.currentBookId = bookSelect.value;
-      state.currentUserId = userInput.value.trim() || "default";
-      if (!state.currentBookId) {
-        return;
+    function saveLocalApiSettings() {
+      const payload = {
+        provider: els.providerSelect.value,
+        endpoint: els.apiEndpointInput.value.trim(),
+        model: els.apiModelInput.value.trim(),
+        apiKey: els.apiKeyInput.value.trim(),
+        enabled: els.cloudEnabledInput.checked,
+        remember: els.rememberApiInput.checked
+      };
+      if (els.rememberApiInput.checked) {
+        localStorage.setItem("bookrecall.apiSettings", JSON.stringify(payload));
+        setStatus("已保存到当前浏览器 localStorage。");
+      } else {
+        localStorage.removeItem("bookrecall.apiSettings");
+        setStatus("未勾选保存，已清除浏览器里的 API 设置。");
+      }
+      updatePills();
+    }
+
+    function buildCloudConfig() {
+      return {
+        enabled: els.cloudEnabledInput.checked,
+        endpoint: els.apiEndpointInput.value.trim(),
+        model: els.apiModelInput.value.trim(),
+        api_key: els.apiKeyInput.value.trim()
+      };
+    }
+
+    async function loadBooks() {
+      const [booksData, runtime] = await Promise.all([
+        requestJson("/api/books"),
+        requestJson("/api/runtime")
+      ]);
+      state.books = booksData.books || [];
+      state.runtime = runtime;
+      state.providers = Object.fromEntries((runtime.cloud.providers || []).map((item) => [item.id, item]));
+      renderBooks(state.books);
+      renderModels(runtime);
+
+      els.bookSelect.innerHTML = state.books.map((book) => `<option value="${escapeHtml(book.book_id)}">${escapeHtml(book.title)}</option>`).join("");
+      if (state.books.length) {
+        state.currentBookId = state.books[0].book_id;
+        els.bookSelect.value = state.currentBookId;
+        await loadBookDetails();
+      } else {
+        els.bookMeta.textContent = "暂无书籍。";
       }
 
-      const [progress, entityData, chapterData] = await Promise.all([
-        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/progress?user=${encodeURIComponent(state.currentUserId)}`),
-        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/entities`),
-        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/chapters?limit=30`)
-      ]);
+      applyProvider("deepseek");
+      if (runtime.cloud.env_key_available) {
+        els.cloudPill.textContent = `cloud env: ${runtime.cloud.model}`;
+      }
+      loadLocalApiSettings();
+      updatePills();
+    }
 
-      progressInput.value = progress.progress_chapter || "";
+    async function loadBookDetails() {
       const book = state.books.find((item) => item.book_id === state.currentBookId);
-      bookMeta.innerHTML = book
-        ? `当前书籍：<strong>${escapeHtml(book.title)}</strong><br>来源：<span class="mono">${escapeHtml(book.source_path)}</span><br>总章节：${book.chapter_count}，当前进度：${progress.progress_chapter || "未设置"}`
-        : "未找到当前书籍信息。";
-      renderEntities(entityData.entities || []);
-      renderChapters(chapterData.chapters || []);
+      if (!book) return;
+      els.bookMeta.innerHTML = `
+        <strong>${escapeHtml(book.title)}</strong>
+        <div>章节 ${book.chapter_count} · 实体 ${book.entity_count}</div>
+        <div class="muted mono">${escapeHtml(book.book_id)}</div>
+      `;
+      const [entitiesData, chaptersData, progressData] = await Promise.all([
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/entities`),
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/chapters?limit=60`),
+        requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/progress?user=${encodeURIComponent(state.currentUserId)}`)
+      ]);
+      renderEntities(entitiesData.entities || []);
+      renderChapters(chaptersData.chapters || []);
+      els.progressInput.value = progressData.progress_chapter || progressData.max_chapter || "";
+      setStatus(`已加载《${book.title}》。`);
     }
 
     async function saveProgress() {
-      if (!state.currentBookId) {
-        setStatus("请先选一本书。");
+      if (!state.currentBookId) return;
+      const chapter = Number(els.progressInput.value);
+      if (!chapter) {
+        setStatus("请输入有效章节号。");
         return;
       }
-      const progressValue = Number(progressInput.value);
-      if (!progressValue) {
-        setStatus("请输入有效的章节号。");
-        return;
-      }
-      const payload = {
-        book_id: state.currentBookId,
-        user_id: userInput.value.trim() || "default",
-        progress_chapter: progressValue
-      };
-      await requestJson("/api/progress", {
+      const saved = await requestJson("/api/progress", {
         method: "POST",
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+          book_id: state.currentBookId,
+          user_id: state.currentUserId,
+          progress_chapter: chapter
+        })
       });
-      setStatus(`已保存 ${payload.user_id} 在 ${payload.book_id} 的阅读进度：第 ${progressValue} 章。`);
-      await refreshCurrentBook();
+      els.progressInput.value = saved.progress_chapter;
+      setStatus(`阅读进度已保存到第 ${saved.progress_chapter} 章。`);
     }
 
     async function askQuestion() {
       if (!state.currentBookId) {
-        setStatus("请先选一本书。");
+        setStatus("请先选择一本书。");
         return;
       }
-      const question = questionInput.value.trim();
+      const question = els.questionInput.value.trim();
       if (!question) {
-        setStatus("请输入一个问题。");
+        setStatus("先写一个问题吧。");
         return;
       }
-      setStatus("正在检索章节、实体索引和已读范围内的证据...");
-      const progressValue = progressInput.value ? Number(progressInput.value) : null;
+      setStatus("Agent 正在规划工具调用与检索证据...");
+      els.answerCard.innerHTML = '<div class="empty">正在唤醒记忆，请稍等。</div>';
       const payload = {
         book_id: state.currentBookId,
-        user_id: userInput.value.trim() || "default",
-        progress_chapter: Number.isFinite(progressValue) ? progressValue : null,
-        question
+        user_id: state.currentUserId,
+        question,
+        progress_chapter: els.progressInput.value ? Number(els.progressInput.value) : null,
+        retriever: els.retrieverSelect.value,
+        cloud_config: buildCloudConfig()
       };
       const card = await requestJson("/api/ask", {
         method: "POST",
         body: JSON.stringify(payload)
       });
       renderAnswer(card);
-      setStatus("记忆卡片已更新。");
+      setStatus("完成。");
     }
 
-    document.getElementById("askBtn").addEventListener("click", () => {
-      askQuestion().catch((error) => setStatus(error.message));
+    els.bookSelect.addEventListener("change", async () => {
+      state.currentBookId = els.bookSelect.value;
+      await loadBookDetails();
     });
-    document.getElementById("saveProgressBtn").addEventListener("click", () => {
-      saveProgress().catch((error) => setStatus(error.message));
+    els.userInput.addEventListener("change", async () => {
+      state.currentUserId = els.userInput.value.trim() || "default";
+      await loadBookDetails();
     });
-    bookSelect.addEventListener("change", () => {
-      refreshCurrentBook().catch((error) => setStatus(error.message));
-    });
-    userInput.addEventListener("change", () => {
-      refreshCurrentBook().catch((error) => setStatus(error.message));
+    els.retrieverSelect.addEventListener("change", updatePills);
+    els.cloudEnabledInput.addEventListener("change", updatePills);
+    els.apiModelInput.addEventListener("input", updatePills);
+    els.providerSelect.addEventListener("change", () => applyProvider(els.providerSelect.value));
+    document.getElementById("saveProgressBtn").addEventListener("click", () => saveProgress().catch((err) => setStatus(err.message)));
+    document.getElementById("askBtn").addEventListener("click", () => askQuestion().catch((err) => {
+      setStatus(err.message);
+      els.answerCard.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+    }));
+    document.getElementById("saveApiBtn").addEventListener("click", saveLocalApiSettings);
+    document.getElementById("clearApiBtn").addEventListener("click", () => {
+      localStorage.removeItem("bookrecall.apiSettings");
+      els.apiKeyInput.value = "";
+      els.cloudEnabledInput.checked = false;
+      els.rememberApiInput.checked = false;
+      applyProvider(els.providerSelect.value);
+      setStatus("已清除浏览器保存的 API 设置。");
     });
 
-    refreshBooks().catch((error) => {
-      setStatus(error.message);
+    loadBooks().catch((err) => {
+      console.error(err);
+      setStatus(err.message);
+      els.bookMeta.textContent = "加载失败。";
     });
   </script>
 </body>
-</html>
-"""
+</html>"""
