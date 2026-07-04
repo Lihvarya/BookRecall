@@ -1,4 +1,4 @@
-# BookRecall
+<img width="1280" height="1594" alt="PixPin_2026-07-04_14-30-28" src="https://github.com/user-attachments/assets/265275f9-5dbf-48aa-bf0a-a239dee69099" /># BookRecall
 
 BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
 
@@ -10,7 +10,9 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
 - 某个主题在前后章节里发生了什么变化
 
 和普通 RAG 不同，BookRecall 不是只靠向量检索。它把结构化实体索引、章节级上下文、细粒度证据片段和一个可控的 ReAct Agent 组合起来，优先解决“第一次出现”“有没有再出现”“不要剧透”这类阅读回忆问题。
-![Uploading PixPin_2026-07-04_14-30-28.png…]()
+<img width="1280" height="1594" alt="PixPin_2026-07-04_14-30-28" src="https://github.com/user-attachments/assets/d6112eec-2355-45ec-a4ab-eebde77f0075" />
+
+
 
 ## 项目特点
 
