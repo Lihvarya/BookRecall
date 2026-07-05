@@ -7,12 +7,28 @@
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
-  <div class="shell">
-    <aside class="panel sidebar">
-      <header>
-        <h1>BookRecall</h1>
-        <p class="subtitle">阅读记忆 Agent 控制台。选择书籍、锁定进度，再让本地索引、embedding 小模型和云端大模型协作。</p>
+  <div class="workspace">
+    <nav class="app-rail" aria-label="主导航">
+      <div class="rail-brand" title="BookRecall">B</div>
+      <button class="rail-item active" type="button" data-scroll-target="#chatTop" title="对话">问</button>
+      <button class="rail-item" type="button" data-scroll-target="#librarySection" title="书库">书</button>
+      <button class="rail-item" type="button" data-scroll-target="#indexSection" title="索引">索</button>
+      <button class="rail-item" type="button" data-scroll-target="#importSection" title="导入">入</button>
+      <button class="rail-item" type="button" data-scroll-target="#modelSection" title="模型">模</button>
+      <button class="rail-item" type="button" data-scroll-target="#cloudSection" title="设置">设</button>
+      <div class="rail-spacer"></div>
+      <span class="rail-dot" title="本地优先"></span>
+    </nav>
+
+    <aside class="topic-sidebar">
+      <header class="brand-block">
+        <div>
+          <p class="eyebrow">阅读记忆助手</p>
+          <h1>BookRecall</h1>
+        </div>
+        <span class="agent-badge">Agent</span>
       </header>
+      <p class="subtitle">选择书籍、锁定阅读进度，再让本地索引、embedding 小模型和云端大模型协作。</p>
 
       <div class="section">
         <label class="label" for="bookSelect">当前书籍</label>
@@ -47,7 +63,7 @@
 
       <div class="status" id="bookMeta">正在加载书库...</div>
 
-      <div class="section">
+      <div class="section" id="sessionsSection">
         <details open>
           <summary>会话与分支</summary>
           <div class="stack">
@@ -66,6 +82,99 @@
           </div>
         </details>
       </div>
+
+      <section class="section" id="librarySection">
+        <label class="label">书库总览</label>
+        <div class="books" id="booksPanel"></div>
+      </section>
+    </aside>
+
+    <main class="chat-stage" id="chatTop">
+      <header class="topbar">
+        <div class="context-title">
+          <span class="star-chip">★</span>
+          <div>
+            <p class="eyebrow">默认助手 / BookRecall Agent</p>
+            <h2>唤醒这段记忆</h2>
+          </div>
+        </div>
+        <div class="pill-row">
+          <span class="pill" id="policyPill">policy: auto</span>
+          <span class="pill" id="retrieverPill">retriever: lexical</span>
+          <span class="pill" id="cloudPill">cloud: off</span>
+        </div>
+      </header>
+
+      <div class="status status-floating" id="statusBar">系统准备就绪。</div>
+
+      <section class="welcome-card">
+        <div>
+          <p class="eyebrow">Hybrid Recall</p>
+          <h2>像聊天一样回到书里的某一刻</h2>
+          <p class="subtitle">强顺序问题走结构化索引；开放回忆可切换 embedding；复杂分析可启用 OpenAI-compatible 云端规划。</p>
+        </div>
+        <div>
+          <label class="label quick-title">快捷提问模板</label>
+          <div class="quick-actions">
+            <button class="quick-item" type="button" data-template="{entity}第一次出现在哪一章？">首次出现定位</button>
+            <button class="quick-item" type="button" data-template="{entity}后来还有出现过吗？">实体轨迹追踪</button>
+            <button class="quick-item" type="button" data-template="{entity}还和谁有关？">多维关系回忆</button>
+            <button class="quick-item" type="button" data-template="{theme}前后有什么变化？">主题演化分析</button>
+            <button class="quick-item" type="button" data-template="{entity}涉及哪些关键事件？">事件关联切片</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="answer-card" id="answerCard">
+        <div class="empty">暂无查询结果。请选择书籍并提交问题，系统会展示结构化记忆卡片与溯源证据。</div>
+      </section>
+
+      <section class="section reader-panel" id="readerPanel">
+        <div class="reader-head">
+          <div>
+            <label class="label">原文阅读器</label>
+            <h3 id="readerTitle">还没有打开章节</h3>
+          </div>
+          <span class="pill" id="readerMeta">点击章节或证据定位</span>
+        </div>
+        <article class="chapter-reader" id="chapterReader">
+          <div class="empty">从左侧章节浏览或回答证据卡片打开原文。匹配到的证据片段会被高亮。</div>
+        </article>
+      </section>
+
+      <div class="stage-grid">
+        <section class="section glass-section">
+          <label class="label">多轮会话历史</label>
+          <div class="turns" id="sessionPanel">
+            <div class="empty">当前会话暂无历史记录。</div>
+          </div>
+        </section>
+
+        <section class="section glass-section">
+          <label class="label">本轮工具轨迹</label>
+          <div class="trace-list" id="tracePanel">
+            <div class="empty">提问后会显示 Agent 的工具调用链路。</div>
+          </div>
+        </section>
+      </div>
+
+      <section class="composer-card" aria-label="提问输入区">
+        <label class="label" for="questionInput">向 Agent 提问</label>
+        <textarea id="questionInput" placeholder="例如：黑衣人第一次出现在哪一章？或者：星辰之匙涉及哪些关键事件？"></textarea>
+        <div class="composer-tools">
+          <span class="tool-token">本地索引</span>
+          <span class="tool-token">防剧透</span>
+          <span class="tool-token">证据溯源</span>
+          <button id="askBtn" type="button">唤醒并检索记忆</button>
+        </div>
+      </section>
+    </main>
+
+    <aside class="inspector">
+      <header class="inspector-head">
+        <p class="eyebrow">Control Center</p>
+        <h2>Agent 设置</h2>
+      </header>
 
       <div class="section">
         <details>
@@ -96,7 +205,7 @@
         </details>
       </div>
 
-      <div class="section">
+      <div class="section" id="indexSection">
         <details open>
           <summary>索引雷达</summary>
           <div class="stats-grid" id="statsPanel"></div>
@@ -127,86 +236,8 @@
           <div class="chapters" id="chaptersPanel"></div>
         </details>
       </div>
-    </aside>
 
-    <main class="panel main">
-      <div class="hero">
-        <div>
-          <h2>唤醒这段记忆</h2>
-          <p class="subtitle">强顺序问题走结构化索引；开放回忆可切换 embedding；复杂分析可启用 OpenAI-compatible 云端规划。</p>
-        </div>
-        <div class="pill-row">
-          <span class="pill" id="policyPill">policy: auto</span>
-          <span class="pill" id="retrieverPill">retriever: lexical</span>
-          <span class="pill" id="cloudPill">cloud: off</span>
-        </div>
-      </div>
-
-      <div class="status" id="statusBar">系统准备就绪。</div>
-
-      <div class="section">
-        <label class="label" for="questionInput">向 Agent 提问</label>
-        <textarea id="questionInput" placeholder="例如：黑衣人第一次出现在哪一章？或者：星辰之匙涉及哪些关键事件？"></textarea>
-      </div>
-
-      <div class="section">
-        <label class="label">快捷提问模板</label>
-        <div class="quick-actions">
-          <button class="quick-item" type="button" data-template="{entity}第一次出现在哪一章？">首次出现定位</button>
-          <button class="quick-item" type="button" data-template="{entity}后来还有出现过吗？">实体轨迹追踪</button>
-          <button class="quick-item" type="button" data-template="{entity}还和谁有关？">多维关系回忆</button>
-          <button class="quick-item" type="button" data-template="{theme}前后有什么变化？">主题演化分析</button>
-          <button class="quick-item" type="button" data-template="{entity}涉及哪些关键事件？">事件关联切片</button>
-        </div>
-      </div>
-
-      <div class="section">
-        <button id="askBtn" type="button">唤醒并检索记忆</button>
-      </div>
-
-      <section class="answer-card" id="answerCard">
-        <div class="empty">暂无查询结果。请选择书籍并提交问题，系统会展示结构化记忆卡片与溯源证据。</div>
-      </section>
-
-      <section class="section reader-panel" id="readerPanel">
-        <div class="reader-head">
-          <div>
-            <label class="label">原文阅读器</label>
-            <h3 id="readerTitle">还没有打开章节</h3>
-          </div>
-          <span class="pill" id="readerMeta">点击章节或证据定位</span>
-        </div>
-        <article class="chapter-reader" id="chapterReader">
-          <div class="empty">从左侧章节浏览或回答证据卡片打开原文。匹配到的证据片段会被高亮。</div>
-        </article>
-      </section>
-
-      <div class="grid-two">
-        <section class="section">
-          <label class="label">多轮会话历史</label>
-          <div class="turns" id="sessionPanel">
-            <div class="empty">当前会话暂无历史记录。</div>
-          </div>
-        </section>
-
-        <section class="section">
-          <label class="label">本轮工具轨迹</label>
-          <div class="trace-list" id="tracePanel">
-            <div class="empty">提问后会显示 Agent 的工具调用链路。</div>
-          </div>
-        </section>
-      </div>
-
-      <section class="section">
-        <label class="label">书库总览</label>
-        <div class="books" id="booksPanel"></div>
-      </section>
-    </main>
-
-    <aside class="panel settings">
-      <h2>Agent 设置</h2>
-
-      <div class="section">
+      <div class="section" id="importSection">
         <details>
           <summary>导入书籍并建索引</summary>
           <div class="stack">
@@ -230,7 +261,7 @@
         </details>
       </div>
 
-      <div class="section">
+      <div class="section" id="modelSection">
         <details open>
           <summary>召回层与本地模型</summary>
           <div class="stack">
@@ -280,7 +311,7 @@
         <p class="subtitle tiny">“首次出现”等强顺序问题仍优先使用结构化实体索引。</p>
       </div>
 
-      <div class="section stack">
+      <div class="section stack" id="cloudSection">
         <label class="label">云端推理配置</label>
         <select id="providerSelect">
           <option value="deepseek">DeepSeek</option>

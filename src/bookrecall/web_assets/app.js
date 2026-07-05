@@ -1360,6 +1360,23 @@ document.getElementById("searchEvidenceBtn").addEventListener("click", () => sea
 document.querySelectorAll("[data-template]").forEach((btn) => {
   btn.addEventListener("click", () => applyQuestionTemplate(btn.dataset.template || ""));
 });
+document.querySelectorAll("[data-scroll-target]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("[data-scroll-target]").forEach((item) => item.classList.remove("active"));
+    btn.classList.add("active");
+    const target = document.querySelector(btn.dataset.scrollTarget || "");
+    target?.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+});
+els.questionInput.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    askQuestion().catch((err) => {
+      setStatus(err.message);
+      els.answerCard.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+    });
+  }
+});
 
 loadBooks().catch((err) => {
   console.error(err);
