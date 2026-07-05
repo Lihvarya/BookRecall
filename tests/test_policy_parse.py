@@ -9,7 +9,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from bookrecall.agent.policies.base import ToolCall
+from bookrecall.agent.policies.base import Decision, DecisionPolicy, ToolCall
+from bookrecall.agent.policies.langgraph import LangGraphPolicy, is_langgraph_available
 from bookrecall.agent.policies.llm_react import LLMReActPolicy, _parse_react
 from bookrecall.agent.state import AgentState
 from bookrecall.agent.tools import Tool, ToolRegistry, ToolSchema
@@ -104,6 +105,35 @@ class ReactParseTest(unittest.TestCase):
         self.assertFalse(decision.is_terminal)
         self.assertEqual(decision.tool_call.name, "lookup_timeline")
         self.assertEqual(decision.tool_call.arguments, {"entity": "方源"})
+
+    @unittest.skipUnless(is_langgraph_available(), "langgraph optional dependency is not installed")
+    def test_langgraph_policy_can_invoke_delegate(self) -> None:
+        class FixedPolicy(DecisionPolicy):
+            def next_action(self, state, registry):
+                return Decision(
+                    is_terminal=False,
+                    tool_call=ToolCall(name="lookup_timeline", arguments={"entity": "方源"}, thought="graph"),
+                )
+
+            def name(self) -> str:
+                return "fixed"
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                schema=ToolSchema(
+                    name="lookup_timeline",
+                    description="test tool",
+                    parameters={"entity": {"type": "str", "required": True}},
+                ),
+                run=lambda state, args: {},
+            )
+        )
+        state = AgentState(book_id="sample", question="方源后来还出现过吗？", progress_chapter=10)
+        decision = LangGraphPolicy(delegate=FixedPolicy()).next_action(state, registry)
+        self.assertFalse(decision.is_terminal)
+        self.assertEqual(decision.tool_call.name, "lookup_timeline")
+        self.assertEqual(decision.tool_call.thought, "graph")
 
 
 if __name__ == "__main__":

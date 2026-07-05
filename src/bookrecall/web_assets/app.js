@@ -5,18 +5,30 @@ const state = {
   currentBookId: "",
   currentUserId: "default",
   currentSessionId: "default-session",
+  currentGroupFilter: "",
+  currentAgentPolicy: "auto",
+  importedBookText: "",
+  importedBookSourceName: "",
+  currentTurns: [],
   entities: [],
   themes: []
 };
 
+const PREFERENCES_KEY = "bookrecall.preferences";
+const LEGACY_API_SETTINGS_KEY = "bookrecall.apiSettings";
+
 const els = {
   bookSelect: document.getElementById("bookSelect"),
+  groupFilterSelect: document.getElementById("groupFilterSelect"),
   userInput: document.getElementById("userInput"),
   sessionInput: document.getElementById("sessionInput"),
   progressInput: document.getElementById("progressInput"),
   questionInput: document.getElementById("questionInput"),
   statusBar: document.getElementById("statusBar"),
   bookMeta: document.getElementById("bookMeta"),
+  bookGroupInput: document.getElementById("bookGroupInput"),
+  bookTagsInput: document.getElementById("bookTagsInput"),
+  bookMetaResultPanel: document.getElementById("bookMetaResultPanel"),
   booksPanel: document.getElementById("booksPanel"),
   statsPanel: document.getElementById("statsPanel"),
   entitiesPanel: document.getElementById("entitiesPanel"),
@@ -27,6 +39,11 @@ const els = {
   sessionPanel: document.getElementById("sessionPanel"),
   tracePanel: document.getElementById("tracePanel"),
   answerCard: document.getElementById("answerCard"),
+  readerTitle: document.getElementById("readerTitle"),
+  readerMeta: document.getElementById("readerMeta"),
+  chapterReader: document.getElementById("chapterReader"),
+  policySelect: document.getElementById("policySelect"),
+  policyPill: document.getElementById("policyPill"),
   retrieverSelect: document.getElementById("retrieverSelect"),
   retrieverPill: document.getElementById("retrieverPill"),
   cloudPill: document.getElementById("cloudPill"),
@@ -39,6 +56,7 @@ const els = {
   rememberApiInput: document.getElementById("rememberApiInput"),
   buildBookIdInput: document.getElementById("buildBookIdInput"),
   buildTitleInput: document.getElementById("buildTitleInput"),
+  buildFileInput: document.getElementById("buildFileInput"),
   buildTextInput: document.getElementById("buildTextInput"),
   buildEntitiesInput: document.getElementById("buildEntitiesInput"),
   buildThemesInput: document.getElementById("buildThemesInput"),
@@ -47,7 +65,10 @@ const els = {
   vectorModelInput: document.getElementById("vectorModelInput"),
   vectorBackendSelect: document.getElementById("vectorBackendSelect"),
   vectorLimitInput: document.getElementById("vectorLimitInput"),
-  vectorResultPanel: document.getElementById("vectorResultPanel")
+  vectorResultPanel: document.getElementById("vectorResultPanel"),
+  searchQueryInput: document.getElementById("searchQueryInput"),
+  searchLimitInput: document.getElementById("searchLimitInput"),
+  searchResultPanel: document.getElementById("searchResultPanel")
 };
 
 function setStatus(text) {
@@ -75,19 +96,94 @@ async function requestJson(url, options = {}) {
   return data;
 }
 
+function excerptNeedle(excerpt) {
+  return String(excerpt || "").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
+function renderHighlightedContent(content, excerpt = "") {
+  const raw = String(content || "");
+  const needle = excerptNeedle(excerpt);
+  if (!needle) {
+    return escapeHtml(raw);
+  }
+  let index = raw.indexOf(needle);
+  let matched = needle;
+  if (index < 0 && needle.length > 24) {
+    matched = needle.slice(0, Math.max(24, Math.floor(needle.length / 2)));
+    index = raw.indexOf(matched);
+  }
+  if (index < 0) {
+    return escapeHtml(raw);
+  }
+  const before = raw.slice(0, index);
+  const match = raw.slice(index, index + matched.length);
+  const after = raw.slice(index + matched.length);
+  return `${escapeHtml(before)}<mark>${escapeHtml(match)}</mark>${escapeHtml(after)}`;
+}
+
+async function openChapter(chapterNumber, excerpt = "") {
+  if (!state.currentBookId || !chapterNumber) {
+    return;
+  }
+  els.readerTitle.textContent = `正在打开第 ${chapterNumber} 章...`;
+  els.readerMeta.textContent = "loading";
+  els.chapterReader.innerHTML = '<div class="empty">正在载入章节原文。</div>';
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/chapters/${encodeURIComponent(chapterNumber)}`);
+  const chapter = data.chapter || {};
+  els.readerTitle.textContent = `第 ${chapter.chapter_number} 章 ${chapter.title || ""}`;
+  els.readerMeta.textContent = excerpt ? "已尝试高亮证据片段" : "章节原文";
+  els.chapterReader.innerHTML = `<pre>${renderHighlightedContent(chapter.content || "", excerpt)}</pre>`;
+  document.getElementById("readerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
 function renderBooks(books) {
-  if (!books.length) {
+  const visibleBooks = state.currentGroupFilter
+    ? books.filter((book) => (
+        state.currentGroupFilter === "__ungrouped__"
+          ? !(book.book_group || "").trim()
+          : (book.book_group || "") === state.currentGroupFilter
+      ))
+    : books;
+  if (!visibleBooks.length) {
     els.booksPanel.innerHTML = '<div class="empty">当前还没有已建索引的书。先用 CLI 执行 build。</div>';
     return;
   }
-  els.booksPanel.innerHTML = books.map((book) => `
+  els.booksPanel.innerHTML = visibleBooks.map((book) => `
     <div class="book-item">
       <strong>${escapeHtml(book.title)}</strong>
       <div class="muted mono">${escapeHtml(book.book_id)}</div>
       <div>章节 ${book.chapter_count} · 实体 ${book.entity_count}</div>
+      <div class="pill-row">
+        <span class="pill">${escapeHtml(book.book_group || "未分组")}</span>
+        ${(book.tags || []).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("")}
+      </div>
       <div class="muted mono">${escapeHtml(book.source_path)}</div>
     </div>
   `).join("");
+}
+
+function renderGroupFilter(books) {
+  const groups = [];
+  for (const book of books) {
+    const group = (book.book_group || "").trim();
+    if (group && !groups.includes(group)) {
+      groups.push(group);
+    }
+  }
+  groups.sort((a, b) => a.localeCompare(b, "zh-CN"));
+  els.groupFilterSelect.innerHTML = [
+    '<option value="">全部分组</option>',
+    '<option value="__ungrouped__">未分组</option>',
+    ...groups.map((group) => `<option value="${escapeHtml(group)}">${escapeHtml(group)}</option>`)
+  ].join("");
+  if (state.currentGroupFilter === "__ungrouped__") {
+    els.groupFilterSelect.value = "__ungrouped__";
+  } else if (groups.includes(state.currentGroupFilter)) {
+    els.groupFilterSelect.value = state.currentGroupFilter;
+  } else {
+    state.currentGroupFilter = "";
+    els.groupFilterSelect.value = "";
+  }
 }
 
 function renderModels(runtime) {
@@ -115,6 +211,13 @@ function renderModels(runtime) {
     </div>
   `).join("");
 
+  const policyCards = (runtime.agent_policies || []).map((item) => `
+    <div class="mini-card">
+      <strong>${escapeHtml(item.name)}</strong>
+      <span class="pill ${item.ready ? "ready" : "warn"}">${item.ready ? "可用" : "缺依赖"}</span>
+    </div>
+  `).join("");
+
   els.modelPanel.innerHTML = `
     <div class="stack">${depCards}</div>
     <div class="mini-card">
@@ -122,6 +225,7 @@ function renderModels(runtime) {
       <div class="mono">${escapeHtml(deps.recommended_embedding_model || "BAAI/bge-small-zh-v1.5")}</div>
       <div class="muted mono">${escapeHtml(runtime.vector_dir)}</div>
     </div>
+    <div class="stack">${policyCards || '<div class="empty">暂无 Agent 策略状态。</div>'}</div>
     <div class="stack">${indexCards || '<div class="empty">还没有书籍索引。</div>'}</div>
   `;
 }
@@ -213,11 +317,15 @@ function renderChapters(chapters) {
     return;
   }
   els.chaptersPanel.innerHTML = chapters.map((chapter) => `
-    <div class="entity-item">
+    <button class="entity-item chapter-link" type="button" data-chapter="${chapter.chapter_number}">
       <strong>第 ${chapter.chapter_number} 章 ${escapeHtml(chapter.title)}</strong>
       <div class="muted">${escapeHtml((chapter.summary || "").slice(0, 70))}${(chapter.summary || "").length > 70 ? "..." : ""}</div>
-    </div>
+      <span class="pill">打开原文</span>
+    </button>
   `).join("");
+  els.chaptersPanel.querySelectorAll("[data-chapter]").forEach((item) => {
+    item.addEventListener("click", () => openChapter(Number(item.dataset.chapter)).catch((err) => setStatus(err.message)));
+  });
 }
 
 function renderSession(turns) {
@@ -225,8 +333,9 @@ function renderSession(turns) {
     els.sessionPanel.innerHTML = '<div class="empty">当前会话还没有历史记录。</div>';
     return;
   }
+  state.currentTurns = turns;
   els.sessionPanel.innerHTML = turns.slice().reverse().map((turn) => `
-    <div class="turn-item">
+    <div class="turn-item" data-turn-id="${escapeHtml(turn.turn_id || "")}">
       <div class="pill-row">
         <span class="pill">第 ${escapeHtml(turn.turn_index)} 轮</span>
         ${turn.entity_name ? `<span class="pill">实体：${escapeHtml(turn.entity_name)}</span>` : ""}
@@ -235,8 +344,17 @@ function renderSession(turns) {
       <p><strong>问：</strong>${escapeHtml(turn.question || "")}</p>
       <p><strong>答：</strong>${escapeHtml(turn.answer || "")}</p>
       ${turn.summary ? `<div class="muted tiny">${escapeHtml(turn.summary)}</div>` : ""}
+      <div class="inline-actions">
+        <button class="ghost tiny" type="button" data-session-action="reask" data-turn-id="${escapeHtml(turn.turn_id || "")}" data-question="${escapeHtml(turn.question || "")}">重新提问</button>
+        <button class="ghost tiny" type="button" data-session-action="trace" data-turn-id="${escapeHtml(turn.turn_id || "")}">查看轨迹</button>
+        <button class="ghost tiny" type="button" data-session-action="edit" data-turn-id="${escapeHtml(turn.turn_id || "")}" data-question="${escapeHtml(turn.question || "")}" data-answer="${escapeHtml(turn.answer || "")}" data-summary="${escapeHtml(turn.summary || "")}">编辑保存</button>
+        <button class="ghost tiny danger-action" type="button" data-session-action="delete" data-turn-id="${escapeHtml(turn.turn_id || "")}">删除此轮</button>
+      </div>
     </div>
   `).join("");
+  els.sessionPanel.querySelectorAll("[data-session-action]").forEach((btn) => {
+    btn.addEventListener("click", () => handleSessionAction(btn).catch((err) => setStatus(err.message)));
+  });
 }
 
 function renderTrace(trace) {
@@ -269,6 +387,7 @@ function renderAnswer(card) {
           <strong>第 ${item.chapter_number} 章《${escapeHtml(item.chapter_title)}》</strong>
           <p>${escapeHtml(item.excerpt)}</p>
           <div class="muted tiny">${escapeHtml(item.reason || "")}</div>
+          <button class="ghost tiny" type="button" data-open-chapter="${item.chapter_number}" data-excerpt="${escapeHtml(item.excerpt)}">查看原文并高亮</button>
         </div>
       `).join("")}</div>`
     : '<div class="empty">这次没有足够证据片段。</div>';
@@ -286,6 +405,7 @@ function renderAnswer(card) {
       <span class="pill">进度：第 ${card.progress_chapter} 章</span>
       ${card.entity_name ? `<span class="pill">实体：${escapeHtml(card.entity_name)}</span>` : ""}
       ${card.spoiler_blocked ? '<span class="pill warn">已阻断剧透</span>' : ""}
+      ${runtime.effective_policy ? `<span class="pill">策略：${escapeHtml(runtime.effective_policy)}</span>` : ""}
       ${runtime.retriever ? `<span class="pill">检索器：${escapeHtml(runtime.retriever)}</span>` : ""}
       ${runtime.cloud_reasoner_enabled ? `<span class="pill ready">云端：${escapeHtml(runtime.cloud_model)}</span>` : ""}
     </div>
@@ -304,14 +424,29 @@ function renderAnswer(card) {
       askQuestion();
     });
   });
+  els.answerCard.querySelectorAll("[data-open-chapter]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      openChapter(Number(btn.dataset.openChapter), btn.dataset.excerpt || "").catch((err) => setStatus(err.message));
+    });
+  });
   renderSession(card.session ? (card.session.turns || []) : []);
   renderTrace(card.trace || []);
 }
 
 function updatePills() {
+  els.policyPill.textContent = `policy: ${els.policySelect.value}`;
   els.retrieverPill.textContent = `retriever: ${els.retrieverSelect.value}`;
   els.cloudPill.textContent = els.cloudEnabledInput.checked ? `cloud: ${els.apiModelInput.value || "on"}` : "cloud: off";
   els.cloudPill.className = `pill ${els.cloudEnabledInput.checked ? "ready" : ""}`;
+}
+
+function selectOptionIfExists(selectEl, value) {
+  if (!value) {
+    return;
+  }
+  if (Array.from(selectEl.options).some((option) => option.value === value)) {
+    selectEl.value = value;
+  }
 }
 
 function applyProvider(providerId) {
@@ -322,39 +457,82 @@ function applyProvider(providerId) {
   updatePills();
 }
 
-function loadLocalApiSettings() {
+function readLocalPreferences() {
   try {
-    const raw = localStorage.getItem("bookrecall.apiSettings");
-    if (!raw) return;
-    const saved = JSON.parse(raw);
-    els.providerSelect.value = saved.provider || "deepseek";
-    els.apiEndpointInput.value = saved.endpoint || "";
-    els.apiModelInput.value = saved.model || "";
-    els.apiKeyInput.value = saved.apiKey || "";
-    els.cloudEnabledInput.checked = Boolean(saved.enabled);
-    els.rememberApiInput.checked = Boolean(saved.remember);
+    const raw = localStorage.getItem(PREFERENCES_KEY);
+    if (raw) {
+      return JSON.parse(raw);
+    }
+    const legacyRaw = localStorage.getItem(LEGACY_API_SETTINGS_KEY);
+    if (!legacyRaw) {
+      return {};
+    }
+    const legacy = JSON.parse(legacyRaw);
+    return {
+      provider: legacy.provider || "deepseek",
+      endpoint: legacy.endpoint || "",
+      model: legacy.model || "",
+      apiKey: legacy.apiKey || "",
+      cloud_enabled: Boolean(legacy.enabled),
+      remember_api: Boolean(legacy.remember)
+    };
   } catch (_) {
-    localStorage.removeItem("bookrecall.apiSettings");
+    localStorage.removeItem(PREFERENCES_KEY);
+    return {};
   }
 }
 
-function saveLocalApiSettings() {
+function applyLocalPreferences(saved) {
+  if (!saved || typeof saved !== "object") {
+    return;
+  }
+  state.currentUserId = saved.user_id || state.currentUserId;
+  state.currentSessionId = saved.session_id || state.currentSessionId;
+  state.currentGroupFilter = saved.group_filter || state.currentGroupFilter;
+  state.currentBookId = saved.last_book_id || state.currentBookId;
+  state.currentAgentPolicy = saved.agent_policy || state.currentAgentPolicy;
+  els.userInput.value = state.currentUserId;
+  els.sessionInput.value = state.currentSessionId;
+  selectOptionIfExists(els.policySelect, state.currentAgentPolicy);
+  selectOptionIfExists(els.retrieverSelect, saved.retriever);
+
+  const providerId = saved.provider || "deepseek";
+  selectOptionIfExists(els.providerSelect, providerId);
+  if (saved.endpoint || saved.model || saved.provider === "custom") {
+    els.apiEndpointInput.value = saved.endpoint || "";
+    els.apiModelInput.value = saved.model || "";
+  } else {
+    applyProvider(providerId);
+  }
+  els.apiKeyInput.value = saved.apiKey || "";
+  els.cloudEnabledInput.checked = Boolean(saved.cloud_enabled);
+  els.rememberApiInput.checked = Boolean(saved.remember_api);
+  updatePills();
+}
+
+function saveLocalPreferences() {
   const payload = {
+    user_id: els.userInput.value.trim() || "default",
+    session_id: els.sessionInput.value.trim() || "default-session",
+    last_book_id: state.currentBookId || "",
+    group_filter: els.groupFilterSelect.value || "",
+    agent_policy: els.policySelect.value,
+    retriever: els.retrieverSelect.value,
     provider: els.providerSelect.value,
     endpoint: els.apiEndpointInput.value.trim(),
     model: els.apiModelInput.value.trim(),
-    apiKey: els.apiKeyInput.value.trim(),
-    enabled: els.cloudEnabledInput.checked,
-    remember: els.rememberApiInput.checked
+    apiKey: els.rememberApiInput.checked ? els.apiKeyInput.value.trim() : "",
+    cloud_enabled: els.cloudEnabledInput.checked,
+    remember_api: els.rememberApiInput.checked
   };
-  if (els.rememberApiInput.checked) {
-    localStorage.setItem("bookrecall.apiSettings", JSON.stringify(payload));
-    setStatus("已保存到当前浏览器 localStorage。");
-  } else {
-    localStorage.removeItem("bookrecall.apiSettings");
-    setStatus("未勾选保存，已清除浏览器里的 API 设置。");
-  }
+  localStorage.setItem(PREFERENCES_KEY, JSON.stringify(payload));
+  localStorage.removeItem(LEGACY_API_SETTINGS_KEY);
+  setStatus("已保存控制台偏好到当前浏览器 localStorage。");
   updatePills();
+}
+
+function saveLocalApiSettings() {
+  saveLocalPreferences();
 }
 
 function buildCloudConfig() {
@@ -378,9 +556,9 @@ function applyQuestionTemplate(template) {
 
 async function buildBookFromPanel() {
   const bookId = els.buildBookIdInput.value.trim();
-  const text = els.buildTextInput.value;
+  const text = state.importedBookText || els.buildTextInput.value;
   if (!bookId || !text.trim()) {
-    els.buildResultPanel.textContent = "请至少填写 book_id 和书籍正文。";
+    els.buildResultPanel.textContent = "请至少填写 book_id，并选择 TXT 文件或粘贴少量正文。";
     return;
   }
   els.buildResultPanel.textContent = "正在解析章节并构建本地结构化索引...";
@@ -393,7 +571,8 @@ async function buildBookFromPanel() {
       text,
       entities: els.buildEntitiesInput.value,
       themes: els.buildThemesInput.value,
-      overwrite: els.buildOverwriteInput.checked
+      overwrite: els.buildOverwriteInput.checked,
+      source_name: state.importedBookSourceName
     })
   });
   const built = data.book || {};
@@ -405,6 +584,81 @@ async function buildBookFromPanel() {
   `;
   await loadBooks(bookId);
   setStatus(`已完成《${built.title || bookId}》索引构建。`);
+}
+
+async function readSelectedBookFile() {
+  const file = els.buildFileInput.files?.[0];
+  if (!file) {
+    return;
+  }
+  if (!file.name.toLowerCase().endsWith(".txt") && file.type && file.type !== "text/plain") {
+    setStatus("建议选择 TXT 纯文本文件。");
+  }
+  const text = await file.text();
+  state.importedBookText = text;
+  state.importedBookSourceName = file.name;
+  els.buildTextInput.value = "";
+  if (!els.buildBookIdInput.value.trim()) {
+    els.buildBookIdInput.value = file.name.replace(/\.[^.]+$/, "").replace(/[^\w.-]+/g, "_");
+  }
+  if (!els.buildTitleInput.value.trim()) {
+    els.buildTitleInput.value = file.name.replace(/\.[^.]+$/, "");
+  }
+  const preview = text.slice(0, 500).replace(/\s+/g, " ").trim();
+  els.buildResultPanel.innerHTML = `
+    已读取本地文件：<strong>${escapeHtml(file.name)}</strong><br>
+    大小：${escapeHtml(Math.round(file.size / 1024))} KB · 字符数：${escapeHtml(text.length)}<br>
+    <span class="muted">仅显示开头预览，不把全文写入页面输入框：</span>
+    <div class="file-preview">${escapeHtml(preview || "无可预览文本")}</div>
+  `;
+  setStatus("TXT 文件已读取，可以开始建索引。");
+}
+
+async function rebuildCurrentBookIndex() {
+  if (!state.currentBookId) {
+    setStatus("请先选择一本书。");
+    return;
+  }
+  if (!window.confirm("重建会清空并重新生成当前书的结构化索引、事件、主题、关系和本书会话记忆。继续吗？")) {
+    return;
+  }
+  els.buildResultPanel.textContent = "正在基于已保存章节重建结构化索引...";
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/rebuild`, {
+    method: "POST",
+    body: JSON.stringify({
+      entities: els.buildEntitiesInput.value,
+      themes: els.buildThemesInput.value
+    })
+  });
+  const built = data.book || {};
+  els.buildResultPanel.innerHTML = `
+    已重建：<strong>${escapeHtml(built.book_id)}</strong><br>
+    章节 ${escapeHtml(built.chapter_count)} · 实体 ${escapeHtml(built.entities)}
+    · 关系 ${escapeHtml(built.relations)} · 主题 ${escapeHtml(built.themes)}
+    · 事件 ${escapeHtml(built.events)}
+  `;
+  await loadBooks(state.currentBookId);
+  setStatus("当前书结构化索引已重建。");
+}
+
+async function deleteCurrentBook() {
+  if (!state.currentBookId) {
+    setStatus("请先选择一本书。");
+    return;
+  }
+  const book = state.books.find((item) => item.book_id === state.currentBookId);
+  const label = book ? `${book.title} (${book.book_id})` : state.currentBookId;
+  if (!window.confirm(`将删除《${label}》的本地书籍数据、结构化索引、阅读进度、会话记忆和向量索引。此操作不可撤销。继续吗？`)) {
+    return;
+  }
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/delete`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+  els.buildResultPanel.textContent = `已删除 ${data.deleted?.book_id || label}。`;
+  state.currentBookId = "";
+  await loadBooks();
+  setStatus("当前书本地数据已删除。");
 }
 
 async function buildVectorIndexFromPanel() {
@@ -433,14 +687,91 @@ async function buildVectorIndexFromPanel() {
   setStatus("向量索引构建完成，可以切换到 embedding 或 auto 检索。");
 }
 
+async function deleteCurrentVectorIndex() {
+  if (!state.currentBookId) {
+    els.vectorResultPanel.textContent = "请先选择一本书。";
+    return;
+  }
+  if (!window.confirm("只删除当前书的本地向量索引文件，不会删除书籍正文和结构化索引。继续吗？")) {
+    return;
+  }
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/vectors/delete`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+  const info = data.vector_index || {};
+  els.vectorResultPanel.textContent = `已删除 ${info.deleted_count || 0} 个向量索引文件。`;
+  await loadBooks(state.currentBookId);
+  setStatus("当前书向量索引已删除。");
+}
+
+function renderSearchResults(search) {
+  const hits = search.hits || [];
+  if (!hits.length) {
+    els.searchResultPanel.innerHTML = '<div class="empty tiny">没有命中证据片段。可以换个问法，或确认阅读进度没有限制过严。</div>';
+    return;
+  }
+  els.searchResultPanel.innerHTML = `
+    <div class="pill-row">
+      <span class="pill">retriever: ${escapeHtml(search.retriever)}</span>
+      <span class="pill">effective: ${escapeHtml(search.effective_retriever)}</span>
+      <span class="pill">hits: ${escapeHtml(hits.length)}</span>
+    </div>
+    ${hits.map((hit) => `
+      <div class="search-hit">
+        <div class="pill-row">
+          <span class="pill">第 ${escapeHtml(hit.chapter_number)} 章</span>
+          <span class="pill">score ${escapeHtml(Number(hit.score || 0).toFixed(4))}</span>
+        </div>
+        <strong>${escapeHtml(hit.chapter_title || "")}</strong>
+        <p>${escapeHtml(hit.child_text || "")}</p>
+        <button class="ghost tiny" type="button" data-open-search-hit="${escapeHtml(hit.chapter_number)}" data-excerpt="${escapeHtml(hit.child_text || "")}">打开原文并高亮</button>
+      </div>
+    `).join("")}
+  `;
+  els.searchResultPanel.querySelectorAll("[data-open-search-hit]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      openChapter(Number(btn.dataset.openSearchHit), btn.dataset.excerpt || "").catch((err) => setStatus(err.message));
+    });
+  });
+}
+
+async function searchEvidenceFromPanel() {
+  if (!state.currentBookId) {
+    els.searchResultPanel.innerHTML = '<div class="empty tiny">请先选择一本书。</div>';
+    return;
+  }
+  const query = els.searchQueryInput.value.trim();
+  if (!query) {
+    els.searchResultPanel.innerHTML = '<div class="empty tiny">请输入要检索的问题或关键词。</div>';
+    return;
+  }
+  els.searchResultPanel.innerHTML = '<div class="empty tiny">正在检索证据片段...</div>';
+  setStatus("正在测试召回层...");
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/search`, {
+    method: "POST",
+    body: JSON.stringify({
+      query,
+      retriever: els.retrieverSelect.value,
+      progress_chapter: els.progressInput.value ? Number(els.progressInput.value) : null,
+      limit: els.searchLimitInput.value ? Number(els.searchLimitInput.value) : 6
+    })
+  });
+  renderSearchResults(data.search || {});
+  setStatus("召回层检索完成。");
+}
+
 async function loadBooks(preferredBookId = "") {
   const [booksData, runtime] = await Promise.all([
     requestJson("/api/books"),
     requestJson("/api/runtime")
   ]);
+  const preferences = readLocalPreferences();
   state.books = booksData.books || [];
   state.runtime = runtime;
   state.providers = Object.fromEntries((runtime.cloud.providers || []).map((item) => [item.id, item]));
+  applyLocalPreferences(preferences);
+  renderGroupFilter(state.books);
   renderBooks(state.books);
   renderModels(runtime);
   if (!els.vectorModelInput.value) {
@@ -449,20 +780,24 @@ async function loadBooks(preferredBookId = "") {
 
   els.bookSelect.innerHTML = state.books.map((book) => `<option value="${escapeHtml(book.book_id)}">${escapeHtml(book.title)}</option>`).join("");
   if (state.books.length) {
+    const savedBookId = preferences.last_book_id || state.currentBookId;
     state.currentBookId = state.books.some((book) => book.book_id === preferredBookId)
       ? preferredBookId
-      : state.books[0].book_id;
+      : state.books.some((book) => book.book_id === savedBookId)
+        ? savedBookId
+        : state.books[0].book_id;
     els.bookSelect.value = state.currentBookId;
     await loadBookDetails();
   } else {
     els.bookMeta.textContent = "暂无书籍。";
   }
 
-  applyProvider("deepseek");
+  if (!preferences.provider && !els.apiEndpointInput.value && !els.apiModelInput.value) {
+    applyProvider("deepseek");
+  }
   if (runtime.cloud.env_key_available) {
     els.cloudPill.textContent = `cloud env: ${runtime.cloud.model}`;
   }
-  loadLocalApiSettings();
   updatePills();
 }
 
@@ -470,15 +805,19 @@ async function loadBookDetails() {
   const book = state.books.find((item) => item.book_id === state.currentBookId);
   if (!book) return;
   els.bookMeta.innerHTML = `
-    <strong>${escapeHtml(book.title)}</strong>
-    <div>章节 ${book.chapter_count} · 实体 ${book.entity_count}</div>
-    <div class="muted mono">${escapeHtml(book.book_id)}</div>
-  `;
+      <strong>${escapeHtml(book.title)}</strong>
+      <div>章节 ${book.chapter_count} · 实体 ${book.entity_count}</div>
+      <div>分组：${escapeHtml(book.book_group || "未分组")}</div>
+      <div>标签：${escapeHtml((book.tags || []).join("、") || "无")}</div>
+      <div class="muted mono">${escapeHtml(book.book_id)}</div>
+    `;
+  els.bookGroupInput.value = book.book_group || "";
+  els.bookTagsInput.value = (book.tags || []).join(", ");
   const [entitiesData, chaptersData, progressData, sessionData, statsData, themesData, eventsData, relationsData] = await Promise.all([
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/entities`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/chapters?limit=60`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/progress?user=${encodeURIComponent(state.currentUserId)}`),
-    requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session?user=${encodeURIComponent(state.currentUserId)}&session=${encodeURIComponent(state.currentSessionId)}&limit=10`),
+    requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session?user=${encodeURIComponent(state.currentUserId)}&session=${encodeURIComponent(state.currentSessionId)}&limit=50`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/stats`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/themes`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/events?limit=20`),
@@ -517,6 +856,29 @@ async function saveProgress() {
   setStatus(`阅读进度已保存到第 ${saved.progress_chapter} 章。`);
 }
 
+async function saveBookMetadata() {
+  if (!state.currentBookId) {
+    setStatus("请先选择一本书。");
+    return;
+  }
+  const payload = {
+    book_group: els.bookGroupInput.value.trim(),
+    tags: els.bookTagsInput.value
+  };
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/metadata`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  const book = data.book || {};
+  els.bookMetaResultPanel.innerHTML = `
+    已保存：<strong>${escapeHtml(book.book_group || "未分组")}</strong>
+    ${book.tags?.length ? ` · ${escapeHtml(book.tags.join("、"))}` : ""}
+  `;
+  state.currentGroupFilter = book.book_group || "";
+  await loadBooks(state.currentBookId);
+  setStatus("书籍分组和标签已保存。");
+}
+
 async function askQuestion() {
   if (!state.currentBookId) {
     setStatus("请先选择一本书。");
@@ -535,6 +897,7 @@ async function askQuestion() {
     session_id: state.currentSessionId,
     question,
     progress_chapter: els.progressInput.value ? Number(els.progressInput.value) : null,
+    agent_policy: els.policySelect.value,
     retriever: els.retrieverSelect.value,
     cloud_config: buildCloudConfig()
   };
@@ -546,9 +909,74 @@ async function askQuestion() {
   setStatus("完成。");
 }
 
+async function handleSessionAction(btn) {
+  const action = btn.dataset.sessionAction;
+  const turnId = Number(btn.dataset.turnId);
+  if (!turnId) {
+    setStatus("这条历史记录缺少 turn_id，无法操作。");
+    return;
+  }
+  if (action === "reask") {
+    els.questionInput.value = btn.dataset.question || "";
+    els.questionInput.focus();
+    setStatus("已把历史问题放回输入框，可编辑后继续提问。");
+    return;
+  }
+  if (action === "trace") {
+    const turn = (state.currentTurns || []).find((item) => Number(item.turn_id) === turnId);
+    if (!turn) {
+      setStatus("没有找到这轮对话的 trace。");
+      return;
+    }
+    renderTrace(turn.trace || []);
+    setStatus(`已回放第 ${turn.turn_index} 轮工具轨迹。`);
+    return;
+  }
+  if (action === "delete") {
+    if (!window.confirm("删除这轮对话历史？这不会影响书籍索引。")) {
+      return;
+    }
+    await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session/turns/${encodeURIComponent(turnId)}`, {
+      method: "POST",
+      body: JSON.stringify({
+        operation: "delete",
+        user_id: state.currentUserId,
+        session_id: state.currentSessionId
+      })
+    });
+    await loadBookDetails();
+    setStatus("已删除该轮对话。");
+    return;
+  }
+  if (action === "edit") {
+    const question = window.prompt("编辑这一轮的问题：", btn.dataset.question || "");
+    if (question === null) return;
+    const answer = window.prompt("编辑这一轮的回答：", btn.dataset.answer || "");
+    if (answer === null) return;
+    const summary = window.prompt("编辑摘要（可留空）：", btn.dataset.summary || "");
+    await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session/turns/${encodeURIComponent(turnId)}`, {
+      method: "POST",
+      body: JSON.stringify({
+        operation: "update",
+        user_id: state.currentUserId,
+        session_id: state.currentSessionId,
+        question,
+        answer,
+        summary
+      })
+    });
+    await loadBookDetails();
+    setStatus("已保存该轮对话修改。");
+  }
+}
+
 els.bookSelect.addEventListener("change", async () => {
   state.currentBookId = els.bookSelect.value;
   await loadBookDetails();
+});
+els.groupFilterSelect.addEventListener("change", () => {
+  state.currentGroupFilter = els.groupFilterSelect.value;
+  renderBooks(state.books);
 });
 els.userInput.addEventListener("change", async () => {
   state.currentUserId = els.userInput.value.trim() || "default";
@@ -558,30 +986,59 @@ els.sessionInput.addEventListener("change", () => {
   state.currentSessionId = els.sessionInput.value.trim() || "default-session";
   loadBookDetails().catch((err) => setStatus(err.message));
 });
+els.policySelect.addEventListener("change", updatePills);
 els.retrieverSelect.addEventListener("change", updatePills);
 els.cloudEnabledInput.addEventListener("change", updatePills);
 els.apiModelInput.addEventListener("input", updatePills);
 els.providerSelect.addEventListener("change", () => applyProvider(els.providerSelect.value));
+els.buildFileInput.addEventListener("change", () => readSelectedBookFile().catch((err) => setStatus(err.message)));
+els.buildTextInput.addEventListener("input", () => {
+  if (els.buildTextInput.value.trim()) {
+    state.importedBookText = "";
+    state.importedBookSourceName = "";
+  }
+});
 document.getElementById("saveProgressBtn").addEventListener("click", () => saveProgress().catch((err) => setStatus(err.message)));
+document.getElementById("saveBookMetaBtn").addEventListener("click", () => saveBookMetadata().catch((err) => {
+  els.bookMetaResultPanel.textContent = err.message;
+  setStatus(err.message);
+}));
 document.getElementById("askBtn").addEventListener("click", () => askQuestion().catch((err) => {
   setStatus(err.message);
   els.answerCard.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
 }));
 document.getElementById("saveApiBtn").addEventListener("click", saveLocalApiSettings);
 document.getElementById("clearApiBtn").addEventListener("click", () => {
-  localStorage.removeItem("bookrecall.apiSettings");
+  localStorage.removeItem(PREFERENCES_KEY);
+  localStorage.removeItem(LEGACY_API_SETTINGS_KEY);
   els.apiKeyInput.value = "";
   els.cloudEnabledInput.checked = false;
   els.rememberApiInput.checked = false;
   applyProvider(els.providerSelect.value);
-  setStatus("已清除浏览器保存的 API 设置。");
+  setStatus("已清除浏览器保存的控制台偏好。");
 });
 document.getElementById("buildBookBtn").addEventListener("click", () => buildBookFromPanel().catch((err) => {
   els.buildResultPanel.textContent = err.message;
   setStatus(err.message);
 }));
+document.getElementById("rebuildBookBtn").addEventListener("click", () => rebuildCurrentBookIndex().catch((err) => {
+  els.buildResultPanel.textContent = err.message;
+  setStatus(err.message);
+}));
+document.getElementById("deleteBookBtn").addEventListener("click", () => deleteCurrentBook().catch((err) => {
+  els.buildResultPanel.textContent = err.message;
+  setStatus(err.message);
+}));
 document.getElementById("buildVectorBtn").addEventListener("click", () => buildVectorIndexFromPanel().catch((err) => {
   els.vectorResultPanel.textContent = err.message;
+  setStatus(err.message);
+}));
+document.getElementById("deleteVectorBtn").addEventListener("click", () => deleteCurrentVectorIndex().catch((err) => {
+  els.vectorResultPanel.textContent = err.message;
+  setStatus(err.message);
+}));
+document.getElementById("searchEvidenceBtn").addEventListener("click", () => searchEvidenceFromPanel().catch((err) => {
+  els.searchResultPanel.innerHTML = `<div class="empty tiny">${escapeHtml(err.message)}</div>`;
   setStatus(err.message);
 }));
 document.querySelectorAll("[data-template]").forEach((btn) => {

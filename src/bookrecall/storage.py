@@ -28,6 +28,8 @@ class BookRecallStore:
                 source_path TEXT,
                 chapter_count INTEGER NOT NULL DEFAULT 0,
                 entity_count INTEGER NOT NULL DEFAULT 0,
+                book_group TEXT NOT NULL DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -186,6 +188,8 @@ class BookRecallStore:
         )
         self._ensure_column("books", "chapter_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("books", "entity_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("books", "book_group", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("books", "tags_json", "TEXT NOT NULL DEFAULT '[]'")
         self.connection.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, ddl: str) -> None:
@@ -212,12 +216,18 @@ class BookRecallStore:
         theme_records = theme_records or []
         event_records = event_records or []
         cursor = self.connection.cursor()
+        metadata = cursor.execute(
+            "SELECT book_group, tags_json FROM books WHERE book_id = ?",
+            (book_id,),
+        ).fetchone()
+        book_group = str(metadata["book_group"]) if metadata is not None and metadata["book_group"] else ""
+        tags_json = str(metadata["tags_json"]) if metadata is not None and metadata["tags_json"] else "[]"
         cursor.execute(
             """
-            INSERT OR REPLACE INTO books(book_id, title, source_path, chapter_count, entity_count)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO books(book_id, title, source_path, chapter_count, entity_count, book_group, tags_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (book_id, title, source_path, len(chapters), len(entity_records)),
+            (book_id, title, source_path, len(chapters), len(entity_records), book_group, tags_json),
         )
         cursor.execute("DELETE FROM chapters WHERE book_id = ?", (book_id,))
         cursor.execute("DELETE FROM parent_chunks WHERE book_id = ?", (book_id,))
@@ -494,7 +504,7 @@ class BookRecallStore:
     def list_books(self) -> list[BookInfo]:
         rows = self.connection.execute(
             """
-            SELECT book_id, title, source_path, chapter_count, entity_count
+            SELECT book_id, title, source_path, chapter_count, entity_count, book_group, tags_json
             FROM books
             ORDER BY created_at DESC, book_id ASC
             """
@@ -506,6 +516,8 @@ class BookRecallStore:
                 source_path=row["source_path"] or "",
                 chapter_count=int(row["chapter_count"]),
                 entity_count=int(row["entity_count"]),
+                book_group=str(row["book_group"] or ""),
+                tags=_loads_string_list(row["tags_json"]),
             )
             for row in rows
         ]
@@ -513,7 +525,7 @@ class BookRecallStore:
     def get_book(self, book_id: str) -> BookInfo | None:
         row = self.connection.execute(
             """
-            SELECT book_id, title, source_path, chapter_count, entity_count
+            SELECT book_id, title, source_path, chapter_count, entity_count, book_group, tags_json
             FROM books
             WHERE book_id = ?
             """,
@@ -527,7 +539,26 @@ class BookRecallStore:
             source_path=row["source_path"] or "",
             chapter_count=int(row["chapter_count"]),
             entity_count=int(row["entity_count"]),
+            book_group=str(row["book_group"] or ""),
+            tags=_loads_string_list(row["tags_json"]),
         )
+
+    def update_book_metadata(self, book_id: str, book_group: str = "", tags: list[str] | None = None) -> BookInfo | None:
+        cleaned_tags = []
+        for tag in tags or []:
+            cleaned = str(tag).strip()
+            if cleaned and cleaned not in cleaned_tags:
+                cleaned_tags.append(cleaned)
+        self.connection.execute(
+            """
+            UPDATE books
+            SET book_group = ?, tags_json = ?
+            WHERE book_id = ?
+            """,
+            (book_group.strip(), json.dumps(cleaned_tags, ensure_ascii=False), book_id),
+        )
+        self.connection.commit()
+        return self.get_book(book_id)
 
     def list_entities(self, book_id: str) -> list[str]:
         rows = self.connection.execute(
@@ -899,6 +930,7 @@ class BookRecallStore:
         rows = self.connection.execute(
             """
             SELECT
+                turn_id,
                 turn_index,
                 question,
                 intent,
@@ -920,6 +952,7 @@ class BookRecallStore:
         for row in reversed(rows):
             turns.append(
                 {
+                    "turn_id": int(row["turn_id"]),
                     "turn_index": int(row["turn_index"]),
                     "question": str(row["question"]),
                     "intent": str(row["intent"]),
@@ -994,6 +1027,62 @@ class BookRecallStore:
         self.connection.commit()
         return int(cursor.lastrowid)
 
+    def update_agent_turn(
+        self,
+        *,
+        turn_id: int,
+        book_id: str,
+        user_id: str,
+        session_id: str,
+        question: str,
+        answer: str,
+        summary: str | None = None,
+    ) -> dict[str, object] | None:
+        self.connection.execute(
+            """
+            UPDATE agent_memory
+            SET question = ?, answer = ?, summary = ?
+            WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
+            """,
+            (question, answer, summary, turn_id, book_id, user_id, session_id),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            """
+            SELECT turn_id, turn_index, question, intent, entity_name, answer, summary, progress_chapter,
+                   matched_entities_json, trace_json, created_at
+            FROM agent_memory
+            WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
+            """,
+            (turn_id, book_id, user_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "turn_id": int(row["turn_id"]),
+            "turn_index": int(row["turn_index"]),
+            "question": str(row["question"]),
+            "intent": str(row["intent"]),
+            "entity_name": str(row["entity_name"]) if row["entity_name"] else None,
+            "answer": str(row["answer"]),
+            "summary": str(row["summary"]) if row["summary"] else None,
+            "progress_chapter": int(row["progress_chapter"]),
+            "matched_entities": _loads_json_list(row["matched_entities_json"]),
+            "trace": _loads_json_list(row["trace_json"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    def delete_agent_turn(self, *, turn_id: int, book_id: str, user_id: str, session_id: str) -> int:
+        cursor = self.connection.execute(
+            """
+            DELETE FROM agent_memory
+            WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
+            """,
+            (turn_id, book_id, user_id, session_id),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
+
     def get_max_chapter(self, book_id: str) -> int:
         row = self.connection.execute(
             "SELECT COALESCE(MAX(chapter_number), 0) AS max_chapter FROM chapters WHERE book_id = ?",
@@ -1021,6 +1110,37 @@ class BookRecallStore:
             query += " LIMIT ?"
             params.append(limit)
         return self.connection.execute(query, params).fetchall()
+
+    def list_chapter_records(self, book_id: str) -> list[Chapter]:
+        rows = self.connection.execute(
+            """
+            SELECT chapter_number, title, content, start_offset, end_offset
+            FROM chapters
+            WHERE book_id = ?
+            ORDER BY chapter_number ASC
+            """,
+            (book_id,),
+        ).fetchall()
+        return [
+            Chapter(
+                number=int(row["chapter_number"]),
+                title=str(row["title"]),
+                content=str(row["content"]),
+                start_offset=int(row["start_offset"]),
+                end_offset=int(row["end_offset"]),
+            )
+            for row in rows
+        ]
+
+    def get_chapter(self, book_id: str, chapter_number: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """
+            SELECT chapter_number, title, content, start_offset, end_offset
+            FROM chapters
+            WHERE book_id = ? AND chapter_number = ?
+            """,
+            (book_id, chapter_number),
+        ).fetchone()
 
     def get_stats(self, book_id: str) -> dict[str, int]:
         rows = self.connection.execute(
@@ -1093,6 +1213,16 @@ def _loads_json_list(raw: object) -> list[object]:
     except (json.JSONDecodeError, TypeError, ValueError):
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _loads_string_list(raw: object) -> list[str]:
+    values = _loads_json_list(raw)
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _event_query_tokens(query_text: str) -> list[str]:

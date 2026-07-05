@@ -16,6 +16,7 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
 ## 项目特点
 
 - 本地三层索引：章节解析 -> parent/child chunk -> 结构化实体索引。
+- 章节解析支持常见网文目录，包括“第一卷 卷名 / 第一节：小节名”这类分卷结构。
 - 强顺序问题可精确回答：例如“第一次出现在哪一章”。
 - 三重防剧透：用户阅读进度会限制检索、工具调用和最终证据输出。
 - 默认零运行时依赖：核心链路只用 Python 标准库。
@@ -54,16 +55,17 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
   - 关系查询意图 `relation_lookup`
   - 主题线索意图 `theme_explore`
   - 事件链回忆意图 `event_chain`
-  - LangGraph 预留接口
+  - 可选 `LangGraphPolicy` 图策略（安装 `langgraph` 后可用）
 - Web 可用：
   - 书库总览
-  - 粘贴正文创建本地索引
+  - 本地 TXT 文件导入并创建索引
   - 索引规模统计
   - 实体索引浏览
   - 主题线索浏览
   - 事件链浏览
   - 关系索引浏览
   - 章节概览
+  - 原文阅读器与证据片段高亮
   - 阅读进度管理
   - 会话级连续追问
   - 本轮工具 trace
@@ -73,6 +75,11 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
   - DeepSeek / OpenAI-compatible API 设置
   - 本地 embedding 与向量索引状态查看
   - 当前书向量索引构建
+  - 召回层证据检索测试
+  - 多本书分组与标签管理
+  - 控制台偏好本地持久化
+  - 删除书籍数据、删除向量索引、重建结构化索引
+  - 长会话历史查看、编辑、删除与重新提问
 - 本地 embedding 可用：
   - `sentence-transformers`
   - 推荐模型：`BAAI/bge-small-zh-v1.5`
@@ -91,7 +98,7 @@ BookRecall Agent
    |- Policy
    |  |- RuleBasedPolicy
    |  |- LLMReActPolicy (optional)
-   |  `- LangGraphPolicy (placeholder)
+   |  `- LangGraphPolicy (optional)
    |
    |- Tools
    |  |- lookup_first_appearance
@@ -309,9 +316,14 @@ http://127.0.0.1:8000
 
 网页端当前支持：
 
-- 粘贴书籍正文并创建本地索引
+- 选择本地 TXT 文件并创建本地索引
+- 临时粘贴正文试跑
+- TXT 文件导入只显示文件摘要和开头短预览，不会把整本书全文写入页面输入框，避免大文件卡顿。
 - 填写实体词表和主题词表
 - 可选覆盖同名 `book_id` 的已有索引
+- 对当前书重建结构化索引
+- 删除当前书本地数据
+- 为书籍设置分组和标签，并按分组筛选书库
 - 选择书籍
 - 查看书库统计
 - 查看实体索引
@@ -319,22 +331,31 @@ http://127.0.0.1:8000
 - 查看事件链
 - 查看关系索引
 - 查看章节概览
+- 点击章节或证据卡片打开原文，并高亮证据片段
 - 设置用户阅读进度
 - 输入会话 ID
 - 提交问答
 - 查看会话历史和本轮工具 trace
+- 编辑、删除历史对话轮次，回放历史工具轨迹，或把历史问题放回输入框重新提问
 - 使用“首次出现 / 轨迹追踪 / 关系回忆 / 主题变化 / 关键事件”快捷提问模板
+- 选择 Agent 执行策略：`auto / rule_based / llm_react / langgraph`
 - 选择检索器：`lexical / embedding / auto`
 - 查看本地模型依赖状态
 - 查看每本书是否已有向量索引
 - 为当前书构建本地向量索引
+- 删除当前书向量索引
+- 直接测试当前召回层，查看 lexical / embedding / auto 命中的证据片段，并打开原文高亮
 - 直接配置外部 OpenAI-compatible API
 - 快速套用 DeepSeek / OpenAI 预设
+- 保存控制台偏好：用户、会话、当前书籍、分组筛选、召回策略、云端开关和模型配置
 
 说明：
 
 - API Key 不会保存在服务端文件中。
-- 如果勾选“保存”，只会保存在当前浏览器的 `localStorage`。
+- 如果勾选“保存”，API Key 只会保存在当前浏览器的 `localStorage`。
+- 控制台偏好使用 `bookrecall.preferences`，旧版 `bookrecall.apiSettings` 会自动兼容读取。
+- `langgraph` 是可选依赖；未安装时 Web 会显示该策略缺依赖，选择它提问会返回明确提示。
+- `faiss` 是可选向量后端；网页显示缺失不是错误，选择 Auto/Numpy 仍可构建和检索向量索引。
 - 网页端“导入书籍并建索引”不会自动下载 embedding 模型；它只构建 SQLite 本地结构化索引。
 - 如果要使用本地 embedding 检索，可以在网页端点击“构建当前书向量索引”，也可以继续用 CLI 的 `embed-build`。
 - 构建向量索引会加载本地 embedding 模型；如果本地缓存不存在，`sentence-transformers` 可能联网下载模型。
@@ -361,12 +382,19 @@ http://127.0.0.1:8000
 
 - `GET /api/books`
 - `POST /api/books/build`
+- `POST /api/books/{book_id}/rebuild`
+- `POST /api/books/{book_id}/delete`
+- `POST /api/books/{book_id}/metadata`
 - `GET /api/books/{book_id}/stats`
 - `GET /api/books/{book_id}/entities`
 - `GET /api/books/{book_id}/themes`
 - `GET /api/books/{book_id}/events`
 - `GET /api/books/{book_id}/relations`
+- `GET /api/books/{book_id}/chapters/{chapter_number}`
 - `POST /api/books/{book_id}/vectors`
+- `POST /api/books/{book_id}/vectors/delete`
+- `POST /api/books/{book_id}/search`
+- `POST /api/books/{book_id}/session/turns/{turn_id}`
 - `POST /api/ask`
 - `POST /api/progress`
 
@@ -390,6 +418,15 @@ http://127.0.0.1:8000
   "model": "BAAI/bge-small-zh-v1.5",
   "backend": "auto",
   "limit_chunks": null
+}
+```
+
+`POST /api/books/{book_id}/metadata` 请求体示例：
+
+```json
+{
+  "book_group": "小说",
+  "tags": ["二刷", "重点", "长篇"]
 }
 ```
 
@@ -601,7 +638,7 @@ python -m unittest discover -s tests -v
 当前代码状态下测试数量为：
 
 ```text
-60 tests
+78 tests
 ```
 
 ## 项目结构
@@ -649,7 +686,7 @@ examples/
 
 当前仍然存在这些限制：
 
-- LangGraph 还没有正式接入执行流
+- LangGraph 已作为可选策略接入，但还不是完整 checkpoint / 中断恢复 / human-in-the-loop 图工作流
 - 虽然已经接入原生 tool calling 优先链路，但还没有做更完整的多供应商兼容验证
 - 人物关系第一版已接入，能做阶段摘要，但还不是事件级高质量关系图谱
 - 主题线索第一版已接入，能做阶段摘要，但还不是完整深层主题演化分析

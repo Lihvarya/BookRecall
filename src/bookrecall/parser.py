@@ -7,19 +7,25 @@ from .models import Chapter
 HEADING_MAX_LENGTH = 48
 
 # 章节序数标识符（"第" 之后、"标题前缀" 之后的内容）。
-_HEADING_SUFFIX = r"[章节回卷篇部集节]"
+# "卷" 是结构层，不作为真正内容章节；小节/章节才生成 Chapter。
+_CONTENT_HEADING_SUFFIX = r"[章节回篇部集节]"
+_VOLUME_HEADING_SUFFIX = r"[卷]"
 
 # 标题与序数之间的分隔符：半角/全角空格、全角冒号、顿号等——网文里常见 "第一节：魔潮降临"。
 _HEADING_SEP = r"[\s：、:]*"
 
 CHAPTER_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"^\s*第[0-9零一二三四五六七八九十百千万两〇]+{_HEADING_SUFFIX}{_HEADING_SEP}.*$"),
+    re.compile(rf"^\s*第[0-9零一二三四五六七八九十百千万两〇]+{_CONTENT_HEADING_SUFFIX}{_HEADING_SEP}.*$"),
     re.compile(r"^\s*(chapter|chap\.)\s+\d+.*$", re.IGNORECASE),
+)
+
+VOLUME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"^\s*第[0-9零一二三四五六七八九十百千万两〇]+{_VOLUME_HEADING_SUFFIX}{_HEADING_SEP}.*$"),
 )
 
 # 匹配行首「第X节/章/...」并捕获序数前缀与其后的标题文本。
 _HEADING_STRIP = re.compile(
-    rf"^\s*(第[0-9零一二三四五六七八九十百千万两〇]+{_HEADING_SUFFIX}){_HEADING_SEP}(.*)$"
+    rf"^\s*(第[0-9零一二三四五六七八九十百千万两〇]+(?:{_CONTENT_HEADING_SUFFIX}|{_VOLUME_HEADING_SUFFIX})){_HEADING_SEP}(.*)$"
 )
 
 
@@ -47,6 +53,15 @@ def _looks_like_heading_body(line: str) -> bool:
     return any(pattern.match(stripped) for pattern in CHAPTER_PATTERNS)
 
 
+def _looks_like_volume_heading(line: str) -> bool:
+    stripped = _strip_heading(line)
+    if not stripped:
+        return False
+    if len(stripped) > HEADING_MAX_LENGTH:
+        return False
+    return any(pattern.match(stripped) for pattern in VOLUME_PATTERNS)
+
+
 def is_chapter_heading(line: str) -> bool:
     return _looks_like_heading_body(line)
 
@@ -58,6 +73,24 @@ def _clean_title(raw_heading: str) -> str:
     prefix = match.group(1)
     rest = match.group(2).strip()
     return rest if rest else prefix
+
+
+def _clean_volume_title(raw_heading: str) -> str:
+    stripped = _strip_heading(raw_heading)
+    match = _HEADING_STRIP.match(stripped)
+    if match is None:
+        return stripped
+    prefix = match.group(1)
+    rest = match.group(2).strip()
+    return f"{prefix} {rest}".strip()
+
+
+def _scoped_title(volume_title: str, chapter_title: str) -> str:
+    if not volume_title:
+        return chapter_title
+    if not chapter_title:
+        return volume_title
+    return f"{volume_title} / {chapter_title}"
 
 
 def _finalize_chapter(
@@ -91,6 +124,7 @@ def parse_chapters(text: str) -> list[Chapter]:
     chapters: list[Chapter] = []
     current_title = ""
     current_lines: list[str] = []
+    current_volume = ""
     cursor = 0
     saw_heading = False
 
@@ -106,10 +140,14 @@ def parse_chapters(text: str) -> list[Chapter]:
         current_lines = []
 
     for line in lines:
+        if _looks_like_volume_heading(line):
+            _flush()
+            current_volume = _clean_volume_title(line)
+            continue
         if _looks_like_heading_body(line):
             _flush()
             saw_heading = True
-            current_title = _clean_title(line)
+            current_title = _scoped_title(current_volume, _clean_title(line))
             continue
         current_lines.append(line)
 

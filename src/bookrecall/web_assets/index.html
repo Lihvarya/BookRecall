@@ -9,74 +9,84 @@
 <body>
   <div class="shell">
     <aside class="panel sidebar">
-      <h1>BookRecall</h1>
-      <p class="subtitle">阅读记忆 Agent 控制台。选择书籍、锁定阅读进度，再决定让本地索引、embedding 小模型或外部大模型怎么协作。</p>
+      <header>
+        <h1>BookRecall</h1>
+        <p class="subtitle">阅读记忆 Agent 控制台。选择书籍、锁定进度，再让本地索引、embedding 小模型和云端大模型协作。</p>
+      </header>
 
       <div class="section">
-        <label class="label" for="bookSelect">书籍</label>
+        <label class="label" for="bookSelect">当前书籍</label>
         <select id="bookSelect"></select>
       </div>
 
       <div class="section">
-        <label class="label" for="userInput">用户 ID</label>
-        <input id="userInput" value="default">
+        <label class="label" for="groupFilterSelect">分组筛选</label>
+        <select id="groupFilterSelect">
+          <option value="">全部分组</option>
+        </select>
       </div>
 
-      <div class="section">
-        <label class="label" for="sessionInput">会话 ID</label>
-        <input id="sessionInput" value="default-session" placeholder="同一会话内支持连续追问">
+      <div class="grid-two">
+        <div class="section">
+          <label class="label" for="userInput">用户 ID</label>
+          <input id="userInput" value="default">
+        </div>
+        <div class="section">
+          <label class="label" for="sessionInput">会话 ID</label>
+          <input id="sessionInput" value="default-session">
+        </div>
       </div>
 
       <div class="section">
         <label class="label" for="progressInput">阅读进度</label>
         <div class="inline">
-          <input id="progressInput" type="number" min="1" step="1" placeholder="已读章节">
+          <input id="progressInput" type="number" min="1" step="1" placeholder="已读到第几章">
           <button class="secondary" id="saveProgressBtn" type="button">保存</button>
         </div>
       </div>
 
+      <div class="status" id="bookMeta">正在加载书库...</div>
+
       <div class="section">
-        <div class="status" id="bookMeta">正在加载书库...</div>
+        <details>
+          <summary>书籍分组与标签</summary>
+          <div class="stack">
+            <input id="bookGroupInput" placeholder="分组，例如 小说 / 学术 / 待读">
+            <input id="bookTagsInput" placeholder="标签，用逗号分隔，例如 玄幻,二刷,重点">
+            <button class="secondary" id="saveBookMetaBtn" type="button">保存书籍元数据</button>
+            <div class="empty tiny" id="bookMetaResultPanel">分组和标签只用于本地书库管理，不影响索引内容。</div>
+          </div>
+        </details>
       </div>
 
       <div class="section">
         <details open>
-          <summary class="label">索引雷达</summary>
+          <summary>索引雷达</summary>
           <div class="stats-grid" id="statsPanel"></div>
         </details>
-      </div>
 
-      <div class="section">
-        <details open>
-          <summary class="label">实体索引</summary>
+        <details>
+          <summary>实体索引</summary>
           <div class="entities" id="entitiesPanel"></div>
         </details>
-      </div>
 
-      <div class="section">
         <details>
-          <summary class="label">主题线索</summary>
+          <summary>主题线索</summary>
           <div class="themes" id="themesPanel"></div>
         </details>
-      </div>
 
-      <div class="section">
         <details>
-          <summary class="label">事件链</summary>
+          <summary>事件链</summary>
           <div class="events" id="eventsPanel"></div>
         </details>
-      </div>
 
-      <div class="section">
         <details>
-          <summary class="label">关系索引</summary>
+          <summary>关系索引</summary>
           <div class="relations" id="relationsPanel"></div>
         </details>
-      </div>
 
-      <div class="section">
         <details>
-          <summary class="label">章节浏览</summary>
+          <summary>章节浏览</summary>
           <div class="chapters" id="chaptersPanel"></div>
         </details>
       </div>
@@ -86,56 +96,72 @@
       <div class="hero">
         <div>
           <h2>唤醒这段记忆</h2>
-          <p class="subtitle">强顺序问题仍走实体索引；开放回忆可以切到 embedding；复杂推理可临时接入 DeepSeek 或其他 OpenAI-compatible API。</p>
+          <p class="subtitle">强顺序问题走结构化索引；开放回忆可切换 embedding；复杂分析可启用 OpenAI-compatible 云端规划。</p>
         </div>
         <div class="pill-row">
+          <span class="pill" id="policyPill">policy: auto</span>
           <span class="pill" id="retrieverPill">retriever: lexical</span>
           <span class="pill" id="cloudPill">cloud: off</span>
         </div>
       </div>
 
-      <div class="status" id="statusBar">准备就绪。</div>
+      <div class="status" id="statusBar">系统准备就绪。</div>
 
       <div class="section">
-        <label class="label" for="questionInput">提问</label>
-        <textarea id="questionInput" placeholder="比如：黑衣人第一次出现在哪一章？或者：开窍大典前后发生了什么？"></textarea>
+        <label class="label" for="questionInput">向 Agent 提问</label>
+        <textarea id="questionInput" placeholder="例如：黑衣人第一次出现在哪一章？或者：星辰之匙涉及哪些关键事件？"></textarea>
       </div>
 
       <div class="section">
-        <span class="label">快捷提问模板</span>
+        <label class="label">快捷提问模板</label>
         <div class="quick-actions">
-          <button class="quick-item" type="button" data-template="{entity}第一次出现在哪一章？">首次出现</button>
-          <button class="quick-item" type="button" data-template="{entity}后来还有出现过吗？">轨迹追踪</button>
-          <button class="quick-item" type="button" data-template="{entity}还和谁有关？">关系回忆</button>
-          <button class="quick-item" type="button" data-template="{theme}前后有什么变化？">主题变化</button>
-          <button class="quick-item" type="button" data-template="{entity}涉及哪些关键事件？">关键事件</button>
+          <button class="quick-item" type="button" data-template="{entity}第一次出现在哪一章？">首次出现定位</button>
+          <button class="quick-item" type="button" data-template="{entity}后来还有出现过吗？">实体轨迹追踪</button>
+          <button class="quick-item" type="button" data-template="{entity}还和谁有关？">多维关系回忆</button>
+          <button class="quick-item" type="button" data-template="{theme}前后有什么变化？">主题演化分析</button>
+          <button class="quick-item" type="button" data-template="{entity}涉及哪些关键事件？">事件关联切片</button>
         </div>
       </div>
 
       <div class="section">
-        <button id="askBtn" type="button">唤醒这段记忆</button>
+        <button id="askBtn" type="button">唤醒并检索记忆</button>
       </div>
 
       <section class="answer-card" id="answerCard">
-        <div class="empty">先选择一本书并提出问题。这里会显示结构化记忆卡片、证据片段和继续追问方向。</div>
+        <div class="empty">暂无查询结果。请选择书籍并提交问题，系统会展示结构化记忆卡片与溯源证据。</div>
       </section>
 
-      <section class="section">
-        <span class="label">会话历史</span>
-        <div class="turns" id="sessionPanel">
-          <div class="empty">当前会话还没有历史记录。</div>
+      <section class="section reader-panel" id="readerPanel">
+        <div class="reader-head">
+          <div>
+            <label class="label">原文阅读器</label>
+            <h3 id="readerTitle">还没有打开章节</h3>
+          </div>
+          <span class="pill" id="readerMeta">点击章节或证据定位</span>
         </div>
+        <article class="chapter-reader" id="chapterReader">
+          <div class="empty">从左侧章节浏览或回答证据卡片打开原文。匹配到的证据片段会被高亮。</div>
+        </article>
       </section>
 
-      <section class="section">
-        <span class="label">本轮工具轨迹</span>
-        <div class="trace-list" id="tracePanel">
-          <div class="empty">提问后会显示本轮工具调用轨迹。</div>
-        </div>
-      </section>
+      <div class="grid-two">
+        <section class="section">
+          <label class="label">多轮会话历史</label>
+          <div class="turns" id="sessionPanel">
+            <div class="empty">当前会话暂无历史记录。</div>
+          </div>
+        </section>
+
+        <section class="section">
+          <label class="label">本轮工具轨迹</label>
+          <div class="trace-list" id="tracePanel">
+            <div class="empty">提问后会显示 Agent 的工具调用链路。</div>
+          </div>
+        </section>
+      </div>
 
       <section class="section">
-        <span class="label">书库总览</span>
+        <label class="label">书库总览</label>
         <div class="books" id="booksPanel"></div>
       </section>
     </main>
@@ -145,84 +171,104 @@
 
       <div class="section">
         <details>
-          <summary class="label">导入书籍并建索引</summary>
+          <summary>导入书籍并建索引</summary>
           <div class="stack">
-            <input id="buildBookIdInput" placeholder="book_id，例如 sample">
-            <input id="buildTitleInput" placeholder="书名，可留空">
-            <textarea class="large" id="buildTextInput" placeholder="粘贴书籍正文。支持“第1章 标题”这类章节格式。"></textarea>
-            <textarea class="compact" id="buildEntitiesInput" placeholder="实体词表，可选。每行：标准名|别名1,别名2"></textarea>
-            <textarea class="compact" id="buildThemesInput" placeholder="主题词表，可选。每行：主题名|别名1,别名2"></textarea>
+            <input id="buildBookIdInput" placeholder="全局唯一 Book ID，例如 sample_book">
+            <input id="buildTitleInput" placeholder="书名展示，可选">
+            <input id="buildFileInput" type="file" accept=".txt,text/plain">
+            <textarea class="large" id="buildTextInput" placeholder="选择本地 TXT 后不会在这里预览全文，避免大文件卡顿；这里仅用于临时粘贴少量文本试跑。支持“第1章 标题 / 第一卷 + 第一节”这类章节格式。"></textarea>
+            <textarea class="compact" id="buildEntitiesInput" placeholder="实体词表，可选。格式：标准名|别名1,别名2"></textarea>
+            <textarea class="compact" id="buildThemesInput" placeholder="主题词表，可选。格式：主题名|别名1,别名2"></textarea>
             <label class="checkline">
               <input id="buildOverwriteInput" type="checkbox">
-              <span>允许覆盖同名 book_id 的已有索引</span>
+              <span>允许覆盖同名 Book ID 的已有索引</span>
             </label>
-            <button class="secondary" id="buildBookBtn" type="button">创建本地索引</button>
-            <div class="empty tiny" id="buildResultPanel">不会写入 API Key，也不会自动下载 embedding 模型。</div>
+            <button class="secondary" id="buildBookBtn" type="button">开始本地解析与建库</button>
+            <div class="inline">
+              <button class="ghost" id="rebuildBookBtn" type="button">重建当前书结构化索引</button>
+              <button class="ghost danger-action" id="deleteBookBtn" type="button">删除当前书数据</button>
+            </div>
+            <div class="empty tiny" id="buildResultPanel">推荐选择本地 TXT 文件导入；页面只显示文件摘要，不预览全文。</div>
           </div>
         </details>
       </div>
 
       <div class="section">
-        <label class="label" for="retrieverSelect">证据检索器</label>
-        <select id="retrieverSelect">
-          <option value="lexical">倒排检索：稳定、零依赖</option>
-          <option value="embedding">本地 embedding：语义召回</option>
-          <option value="auto">自动：有向量索引用 embedding，否则倒排</option>
-        </select>
-        <p class="subtitle tiny">“第一次出现”仍由结构化实体索引回答；检索器主要影响语义回忆和对比类问题。</p>
-      </div>
-
-      <div class="section">
-        <span class="label">本地模型与索引</span>
-        <div class="model-list" id="modelPanel"></div>
-      </div>
-
-      <div class="section">
-        <details>
-          <summary class="label">构建当前书向量索引</summary>
+        <details open>
+          <summary>召回层与本地模型</summary>
           <div class="stack">
-            <input id="vectorModelInput" placeholder="BAAI/bge-small-zh-v1.5">
+            <div class="model-list" id="modelPanel"></div>
+            <label class="label">为当前书构建向量索引</label>
+            <input id="vectorModelInput" placeholder="默认：BAAI/bge-small-zh-v1.5">
             <select id="vectorBackendSelect">
-              <option value="auto">backend: auto</option>
-              <option value="numpy">backend: numpy</option>
-              <option value="faiss">backend: faiss</option>
+              <option value="auto">后端：Auto</option>
+              <option value="numpy">后端：Numpy</option>
+              <option value="faiss">后端：FAISS</option>
             </select>
-            <input id="vectorLimitInput" type="number" min="1" step="1" placeholder="可选：仅构建前 N 个 chunks">
-            <button class="secondary" id="buildVectorBtn" type="button">构建向量索引</button>
-            <div class="empty tiny" id="vectorResultPanel">会加载本地 embedding 模型；如缓存不存在，sentence-transformers 可能联网下载模型。</div>
+            <input id="vectorLimitInput" type="number" min="1" step="1" placeholder="Max Chunks，留空为全部">
+            <button class="secondary" id="buildVectorBtn" type="button">构建 Embedding 索引</button>
+            <button class="ghost danger-action" id="deleteVectorBtn" type="button">删除当前书向量索引</button>
+            <div class="empty tiny" id="vectorResultPanel">FAISS 是可选后端；缺失时可使用 Auto/Numpy，首次构建且无本地缓存时可能下载模型权重。</div>
+            <label class="label" for="searchQueryInput">测试当前召回层</label>
+            <input id="searchQueryInput" placeholder="输入关键词或自然语言问题，直接查看命中的证据片段">
+            <div class="inline">
+              <input id="searchLimitInput" type="number" min="1" max="20" step="1" value="6" placeholder="Top K">
+              <button class="secondary" id="searchEvidenceBtn" type="button">检索证据</button>
+            </div>
+            <div class="search-results" id="searchResultPanel">
+              <div class="empty tiny">会使用当前选择的召回策略和阅读进度过滤结果。</div>
+            </div>
           </div>
         </details>
       </div>
 
       <div class="section">
-        <label class="label" for="providerSelect">外部 API 预设</label>
+        <label class="label" for="policySelect">Agent 执行策略</label>
+        <select id="policySelect">
+          <option value="auto">Auto：本地规则优先，启用云端时自动使用 LLM ReAct</option>
+          <option value="rule_based">RuleBased：本地确定性 ReAct</option>
+          <option value="llm_react">LLM ReAct：云端模型规划工具调用</option>
+          <option value="langgraph">LangGraph：可选图编排策略</option>
+        </select>
+        <p class="subtitle tiny">LangGraph 需要安装可选依赖；未安装时会在运行时提示。</p>
+      </div>
+
+      <div class="section">
+        <label class="label" for="retrieverSelect">Agent 召回策略</label>
+        <select id="retrieverSelect">
+          <option value="lexical">Lexical：倒排检索，稳定零依赖</option>
+          <option value="embedding">Embedding：语义召回</option>
+          <option value="auto">Auto：有向量索引用 embedding，否则倒排</option>
+        </select>
+        <p class="subtitle tiny">“首次出现”等强顺序问题仍优先使用结构化实体索引。</p>
+      </div>
+
+      <div class="section stack">
+        <label class="label">云端推理配置</label>
         <select id="providerSelect">
           <option value="deepseek">DeepSeek</option>
           <option value="openai">OpenAI</option>
           <option value="custom">自定义 OpenAI-compatible</option>
         </select>
-      </div>
 
-      <div class="section stack">
-        <label class="label" for="apiEndpointInput">API Endpoint</label>
-        <input id="apiEndpointInput" placeholder="https://api.deepseek.com/v1/chat/completions">
-        <label class="label" for="apiModelInput">模型名</label>
-        <input id="apiModelInput" placeholder="deepseek-chat">
-        <label class="label" for="apiKeyInput">API Key</label>
-        <input id="apiKeyInput" type="password" placeholder="仅在本次请求发送，不写入服务端">
+        <input id="apiEndpointInput" placeholder="Endpoint API URL">
+        <input id="apiModelInput" placeholder="Model Name，例如 deepseek-chat">
+        <input id="apiKeyInput" type="password" placeholder="API Key，仅本次请求发送">
+
         <label class="checkline">
           <input id="cloudEnabledInput" type="checkbox">
-          <span>启用外部大模型 ReAct 规划</span>
+          <span>启用云端大模型 ReAct 规划链路</span>
         </label>
         <label class="checkline">
           <input id="rememberApiInput" type="checkbox">
-          <span>把 endpoint/model/key 保存到本浏览器 localStorage</span>
+          <span>把 API 配置保存到当前浏览器 LocalStorage</span>
         </label>
+
         <div class="inline">
-          <button class="ghost" id="saveApiBtn" type="button">保存本地设置</button>
-          <button class="ghost" id="clearApiBtn" type="button">清除</button>
+          <button class="ghost" id="saveApiBtn" type="button">保存控制台偏好</button>
+          <button class="ghost" id="clearApiBtn" type="button">清除本地偏好</button>
         </div>
-        <p class="subtitle tiny">安全边界：服务端不落盘保存密钥；如果勾选保存，只会存在当前浏览器的 localStorage。</p>
+        <p class="subtitle tiny">会保存用户、会话、书籍、分组筛选、召回策略与云端配置；服务端不会落盘保存任何密钥，勾选保存时 API Key 也只写入当前浏览器。</p>
       </div>
     </aside>
   </div>

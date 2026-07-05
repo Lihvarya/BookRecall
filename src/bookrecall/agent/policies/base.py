@@ -3,7 +3,7 @@
 三种实现都实现 `next_action(state, registry) -> Decision`：
 - RuleBasedPolicy：确定性多步路由（默认）
 - LLMReActPolicy：调云端模型决定下一步（需 API key）
-- LangGraphPolicy：预留接口，需 pip install langgraph（不实现）
+- LangGraphPolicy：可选图策略，需 pip install langgraph
 """
 
 from __future__ import annotations

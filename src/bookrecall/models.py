@@ -107,6 +107,8 @@ class BookInfo:
     source_path: str
     chapter_count: int
     entity_count: int
+    book_group: str = ""
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

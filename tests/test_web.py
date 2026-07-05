@@ -112,6 +112,8 @@ class BookRecallWebTest(unittest.TestCase):
     def test_books_endpoint(self) -> None:
         data = self._get_json("/api/books")
         self.assertEqual(data["books"][0]["book_id"], "sample")
+        self.assertIn("book_group", data["books"][0])
+        self.assertIn("tags", data["books"][0])
 
     def test_entities_endpoint(self) -> None:
         data = self._get_json("/api/books/sample/entities")
@@ -146,6 +148,9 @@ class BookRecallWebTest(unittest.TestCase):
         provider_ids = [item["id"] for item in providers]
         self.assertIn("deepseek", provider_ids)
         self.assertEqual(data["retrievers"][0]["id"], "lexical")
+        policy_ids = [item["id"] for item in data["agent_policies"]]
+        self.assertIn("rule_based", policy_ids)
+        self.assertIn("langgraph", policy_ids)
 
     def test_stats_themes_events_and_relations_endpoints(self) -> None:
         stats = self._get_json("/api/books/sample/stats")
@@ -167,6 +172,22 @@ class BookRecallWebTest(unittest.TestCase):
             any("黑衣人" in {item["source_entity"], item["target_entity"]} for item in relations["relations"])
         )
 
+    def test_book_metadata_endpoint(self) -> None:
+        saved = self._post_json(
+            "/api/books/sample/metadata",
+            {
+                "book_group": "测试分组",
+                "tags": "玄幻, 二刷, 重点",
+            },
+        )
+        self.assertEqual(saved["book"]["book_group"], "测试分组")
+        self.assertEqual(saved["book"]["tags"], ["玄幻", "二刷", "重点"])
+
+        books = self._get_json("/api/books")
+        sample = next(item for item in books["books"] if item["book_id"] == "sample")
+        self.assertEqual(sample["book_group"], "测试分组")
+        self.assertIn("重点", sample["tags"])
+
     def test_build_book_endpoint_from_pasted_text(self) -> None:
         created = self._post_json(
             "/api/books/build",
@@ -176,6 +197,7 @@ class BookRecallWebTest(unittest.TestCase):
                 "text": SAMPLE_TEXT,
                 "entities": "黑衣人|黑袍人\n星辰之匙|钥匙\n林澈",
                 "themes": "自由意志|真相",
+                "source_name": "web_book.txt",
             },
         )
         self.assertEqual(created["book"]["book_id"], "web-built")
@@ -183,7 +205,8 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertGreaterEqual(created["book"]["events"], 1)
 
         books = self._get_json("/api/books")
-        self.assertIn("web-built", [item["book_id"] for item in books["books"]])
+        built_book = next(item for item in books["books"] if item["book_id"] == "web-built")
+        self.assertEqual(built_book["source_path"], "web://file/web_book.txt")
 
         answer = self._post_json(
             "/api/ask",
@@ -206,6 +229,18 @@ class BookRecallWebTest(unittest.TestCase):
                 },
             )
         self.assertEqual(context.exception.code, 400)
+
+    def test_rebuild_book_endpoint(self) -> None:
+        rebuilt = self._post_json(
+            "/api/books/sample/rebuild",
+            {
+                "entities": "黑衣人|黑袍人\n星辰之匙|钥匙\n林澈",
+                "themes": "自由意志|真相",
+            },
+        )
+        self.assertEqual(rebuilt["book"]["book_id"], "sample")
+        self.assertGreaterEqual(rebuilt["book"]["entities"], 3)
+        self.assertGreaterEqual(rebuilt["book"]["child_chunks"], 1)
 
     def test_build_vector_index_endpoint(self) -> None:
         with patch("bookrecall.web.SentenceTransformerEmbedder", TinyWebEmbedder):
@@ -230,6 +265,56 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertTrue(sample_index["built"])
         self.assertEqual(sample_index["model_name"], "test-web-embedder")
 
+        deleted = self._post_json("/api/books/sample/vectors/delete", {})
+        self.assertGreaterEqual(deleted["vector_index"]["deleted_count"], 1)
+        self.assertFalse(Path(info["path"]).exists())
+
+    def test_search_endpoint_lexical(self) -> None:
+        data = self._post_json(
+            "/api/books/sample/search",
+            {
+                "query": "黑衣人 雨里",
+                "retriever": "lexical",
+                "progress_chapter": 2,
+                "limit": 5,
+            },
+        )
+        search = data["search"]
+        self.assertEqual(search["book_id"], "sample")
+        self.assertEqual(search["retriever"], "lexical")
+        self.assertTrue(search["hits"])
+        self.assertLessEqual(max(item["chapter_number"] for item in search["hits"]), 2)
+        self.assertTrue(any("黑衣人" in item["child_text"] for item in search["hits"]))
+
+    def test_search_endpoint_embedding(self) -> None:
+        with patch("bookrecall.web.SentenceTransformerEmbedder", TinyWebEmbedder):
+            self._post_json(
+                "/api/books/sample/vectors",
+                {
+                    "model": "test-web-embedder",
+                    "backend": "numpy",
+                },
+            )
+            data = self._post_json(
+                "/api/books/sample/search",
+                {
+                    "query": "钥匙",
+                    "retriever": "embedding",
+                    "limit": 3,
+                },
+            )
+        search = data["search"]
+        self.assertEqual(search["retriever"], "embedding")
+        self.assertEqual(search["effective_retriever"], "EmbeddingRetriever")
+        self.assertTrue(search["hits"])
+
+    def test_delete_book_endpoint(self) -> None:
+        deleted = self._post_json("/api/books/sample/delete", {})
+        self.assertEqual(deleted["deleted"]["book_id"], "sample")
+        self.assertGreaterEqual(deleted["deleted"]["deleted_chunks"], 1)
+        books = self._get_json("/api/books")
+        self.assertNotIn("sample", [item["book_id"] for item in books["books"]])
+
     def test_event_chain_question_via_api(self) -> None:
         answer = self._post_json(
             "/api/ask",
@@ -250,6 +335,7 @@ class BookRecallWebTest(unittest.TestCase):
                 "book_id": "sample",
                 "user_id": "alice",
                 "question": "黑袍人第一次出现在哪一章？",
+                "agent_policy": "rule_based",
                 "retriever": "auto",
                 "cloud_config": {
                     "enabled": False,
@@ -259,6 +345,8 @@ class BookRecallWebTest(unittest.TestCase):
                 },
             },
         )
+        self.assertEqual(answer["runtime"]["agent_policy"], "rule_based")
+        self.assertEqual(answer["runtime"]["effective_policy"], "rule_based")
         self.assertEqual(answer["runtime"]["retriever"], "auto")
         self.assertFalse(answer["runtime"]["cloud_reasoner_enabled"])
         self.assertIn("rendered_text", answer)
@@ -288,6 +376,7 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("第 3 章", second["answer"])
         self.assertEqual(second["session"]["session_id"], "thread-1")
         self.assertEqual(len(second["session"]["turns"]), 2)
+        self.assertIn("turn_id", second["session"]["turns"][0])
         self.assertTrue(second["trace"])
 
     def test_session_endpoint(self) -> None:
@@ -305,6 +394,33 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertEqual(len(data["turns"]), 1)
         self.assertEqual(data["turns"][0]["entity_name"], "黑衣人")
         self.assertTrue(data["turns"][0]["trace"])
+        turn_id = data["turns"][0]["turn_id"]
+
+        updated = self._post_json(
+            f"/api/books/sample/session/turns/{turn_id}",
+            {
+                "operation": "update",
+                "user_id": "alice",
+                "session_id": "thread-2",
+                "question": "编辑后的问题",
+                "answer": "编辑后的回答",
+                "summary": "人工修订",
+            },
+        )
+        self.assertEqual(updated["session"]["turn"]["question"], "编辑后的问题")
+        self.assertEqual(updated["session"]["turn"]["answer"], "编辑后的回答")
+
+        removed = self._post_json(
+            f"/api/books/sample/session/turns/{turn_id}",
+            {
+                "operation": "delete",
+                "user_id": "alice",
+                "session_id": "thread-2",
+            },
+        )
+        self.assertEqual(removed["session"]["deleted"], 1)
+        empty = self._get_json("/api/books/sample/session?user=alice&session=thread-2&limit=10")
+        self.assertEqual(empty["turns"], [])
 
     def test_index_page(self) -> None:
         with urllib.request.urlopen(f"{self.base_url}/") as response:
@@ -318,20 +434,48 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("事件链", html)
         self.assertIn("快捷提问模板", html)
         self.assertIn("导入书籍并建索引", html)
-        self.assertIn("构建当前书向量索引", html)
+        self.assertIn("为当前书构建向量索引", html)
+        self.assertIn("测试当前召回层", html)
+        self.assertIn('type="file"', html)
+        self.assertIn("不预览全文", html)
+        self.assertIn("重建当前书结构化索引", html)
+        self.assertIn("删除当前书数据", html)
+        self.assertIn("删除当前书向量索引", html)
+        self.assertIn("原文阅读器", html)
+        self.assertIn("分组筛选", html)
+        self.assertIn("书籍分组与标签", html)
+        self.assertIn("Agent 执行策略", html)
+        self.assertIn("保存控制台偏好", html)
 
     def test_static_assets(self) -> None:
         with urllib.request.urlopen(f"{self.base_url}/assets/app.css") as response:
             css = response.read().decode("utf-8")
             self.assertIn("text/css", response.headers["Content-Type"])
-        self.assertIn("--green", css)
+        self.assertIn("--primary", css)
         self.assertIn(".answer-card", css)
+        self.assertIn(".chapter-reader", css)
 
         with urllib.request.urlopen(f"{self.base_url}/assets/app.js") as response:
             js = response.read().decode("utf-8")
             self.assertIn("javascript", response.headers["Content-Type"])
         self.assertIn("loadBooks", js)
         self.assertIn("askQuestion", js)
+        self.assertIn("openChapter", js)
+        self.assertIn("saveBookMetadata", js)
+        self.assertIn("bookrecall.preferences", js)
+        self.assertIn("bookrecall.apiSettings", js)
+        self.assertIn("saveLocalPreferences", js)
+        self.assertIn("policySelect", js)
+        self.assertIn("readSelectedBookFile", js)
+        self.assertIn("importedBookText", js)
+        self.assertNotIn("els.buildTextInput.value = text", js)
+        self.assertIn("deleteCurrentBook", js)
+        self.assertIn("deleteCurrentVectorIndex", js)
+        self.assertIn("handleSessionAction", js)
+        self.assertIn("查看轨迹", js)
+        self.assertIn("renderTrace(turn.trace || [])", js)
+        self.assertIn("searchEvidenceFromPanel", js)
+        self.assertIn("renderSearchResults", js)
 
     def test_chapters_endpoint(self) -> None:
         data = self._get_json("/api/books/sample/chapters")
@@ -339,6 +483,14 @@ class BookRecallWebTest(unittest.TestCase):
         numbers = [item["chapter_number"] for item in data["chapters"]]
         self.assertEqual(numbers, [1, 2, 3])
         self.assertEqual(data["chapters"][0]["title"], "起点")
+
+    def test_chapter_detail_endpoint(self) -> None:
+        data = self._get_json("/api/books/sample/chapters/2")
+        chapter = data["chapter"]
+        self.assertEqual(chapter["book_id"], "sample")
+        self.assertEqual(chapter["chapter_number"], 2)
+        self.assertEqual(chapter["title"], "阴影")
+        self.assertIn("黑衣人", chapter["content"])
 
 
 if __name__ == "__main__":

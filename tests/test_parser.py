@@ -51,6 +51,37 @@ class ParserTest(unittest.TestCase):
         self.assertIn("武器", chapters[1].content)
         self.assertIn("远方", chapters[2].content)
 
+    def test_volume_heading_scopes_section_titles(self) -> None:
+        text = (
+            "第一卷  魔性不改\n"
+            "第一节：纵身亡魔心仍不悔\n"
+            "古月方源纵身一跃。\n"
+            "第二节 白日梦醒\n"
+            "山寨晨光渐亮。\n"
+            "第二卷 风起青茅\n"
+            "第一节 再入山林\n"
+            "山风吹来。\n"
+        )
+        chapters = parse_chapters(text)
+        self.assertEqual(len(chapters), 3)
+        self.assertEqual(chapters[0].title, "第一卷 魔性不改 / 纵身亡魔心仍不悔")
+        self.assertEqual(chapters[1].title, "第一卷 魔性不改 / 白日梦醒")
+        self.assertEqual(chapters[2].title, "第二卷 风起青茅 / 再入山林")
+        self.assertIn("纵身一跃", chapters[0].content)
+        self.assertNotIn("魔性不改", chapters[0].content)
+
+    def test_volume_only_does_not_create_empty_chapter(self) -> None:
+        text = "第一卷 魔性不改\n第一节 开端\n正文。\n"
+        chapters = parse_chapters(text)
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(chapters[0].title, "第一卷 魔性不改 / 开端")
+
+    def test_volume_without_name_still_scopes_sections(self) -> None:
+        text = "第一卷\n第一节 开端\n正文。\n"
+        chapters = parse_chapters(text)
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(chapters[0].title, "第一卷 / 开端")
+
     def test_chapter_numbers_are_sequential(self) -> None:
         # 真实序号在正文里不可靠恢复；本实现统一按出现顺序递增
         text = (

@@ -9,6 +9,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .agent import BookRecallAgent
+from .agent.policies.base import DecisionPolicy
+from .agent.policies.langgraph import LangGraphPolicy, LangGraphUnavailableError, is_langgraph_available
+from .agent.policies.llm_react import LLMReActPolicy
+from .agent.policies.rule_based import RuleBasedPolicy
 from .chunking import build_chunk_hierarchy
 from .cloud import OpenAICompatibleReasoner
 from .config import DEFAULT_CHUNK_SETTINGS, DEFAULT_EMBEDDING_SETTINGS, DEFAULT_SEARCH_SETTINGS
@@ -18,6 +22,7 @@ from .embeddings import (
     SentenceTransformerEmbedder,
     build_embedding_index,
     configure_local_model_cache,
+    delete_vector_index,
     default_cache_root,
     default_sentence_transformers_cache_dir,
     default_vector_dir,
@@ -80,6 +85,8 @@ class BookRecallWebService:
                     "source_path": item.source_path,
                     "chapter_count": item.chapter_count,
                     "entity_count": item.entity_count,
+                    "book_group": item.book_group,
+                    "tags": item.tags,
                 }
                 for item in store.list_books()
             ]
@@ -95,6 +102,7 @@ class BookRecallWebService:
         entity_lexicon: str = "",
         theme_lexicon: str = "",
         overwrite: bool = False,
+        source_path: str = "web://imported-text",
     ) -> dict[str, object]:
         if not book_id:
             raise ValueError("book_id 不能为空。")
@@ -107,42 +115,133 @@ class BookRecallWebService:
                 raise ValueError("book_id 已存在。若要重建，请勾选覆盖已有索引。")
 
             chapters = parse_chapters(text)
-            parent_chunks, child_chunks = build_chunk_hierarchy(book_id, chapters, DEFAULT_CHUNK_SETTINGS)
-            entity_names = _parse_inline_lexicon(entity_lexicon)
-            if not entity_names:
-                entity_names = auto_discover_entities(text)
-            entity_records = build_entity_records(chapters, entity_names, DEFAULT_CHUNK_SETTINGS)
-            relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
-            theme_names = auto_discover_themes(text, extra_terms=_parse_inline_lexicon(theme_lexicon))
-            theme_records = build_theme_records(chapters, theme_names, DEFAULT_CHUNK_SETTINGS)
-            event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
-
+            index_payload = self._build_index_payload(
+                book_id=book_id,
+                chapters=chapters,
+                text=text,
+                entity_lexicon=entity_lexicon,
+                theme_lexicon=theme_lexicon,
+            )
             store.replace_book(
                 book_id=book_id,
                 title=title or book_id,
-                source_path="web://pasted-text",
+                source_path=source_path,
                 chapters=chapters,
-                parent_chunks=parent_chunks,
-                child_chunks=child_chunks,
-                entity_records=entity_records,
-                relation_records=relation_records,
-                theme_records=theme_records,
-                event_records=event_records,
+                parent_chunks=index_payload["parent_chunks"],
+                child_chunks=index_payload["child_chunks"],
+                entity_records=index_payload["entity_records"],
+                relation_records=index_payload["relation_records"],
+                theme_records=index_payload["theme_records"],
+                event_records=index_payload["event_records"],
             )
             return {
                 "book_id": book_id,
                 "title": title or book_id,
                 "chapter_count": len(chapters),
-                "parent_chunks": len(parent_chunks),
-                "child_chunks": len(child_chunks),
-                "entities": len(entity_records),
-                "relations": len(relation_records),
-                "themes": len(theme_records),
-                "events": len(event_records),
+                "parent_chunks": len(index_payload["parent_chunks"]),
+                "child_chunks": len(index_payload["child_chunks"]),
+                "entities": len(index_payload["entity_records"]),
+                "relations": len(index_payload["relation_records"]),
+                "themes": len(index_payload["theme_records"]),
+                "events": len(index_payload["event_records"]),
                 "overwritten": overwrite,
             }
         finally:
             store.close()
+
+    def rebuild_book_index(
+        self,
+        *,
+        book_id: str,
+        entity_lexicon: str = "",
+        theme_lexicon: str = "",
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            info = store.get_book(book_id)
+            if info is None:
+                raise ValueError(f"没有找到 book_id={book_id}。")
+            chapters = store.list_chapter_records(book_id)
+            if not chapters:
+                raise ValueError("这本书没有可重建的章节正文。")
+            text = "\n\n".join(chapter.content for chapter in chapters)
+            index_payload = self._build_index_payload(
+                book_id=book_id,
+                chapters=chapters,
+                text=text,
+                entity_lexicon=entity_lexicon,
+                theme_lexicon=theme_lexicon,
+            )
+            store.replace_book(
+                book_id=book_id,
+                title=info.title,
+                source_path=info.source_path,
+                chapters=chapters,
+                parent_chunks=index_payload["parent_chunks"],
+                child_chunks=index_payload["child_chunks"],
+                entity_records=index_payload["entity_records"],
+                relation_records=index_payload["relation_records"],
+                theme_records=index_payload["theme_records"],
+                event_records=index_payload["event_records"],
+            )
+            return {
+                "book_id": book_id,
+                "title": info.title,
+                "chapter_count": len(chapters),
+                "parent_chunks": len(index_payload["parent_chunks"]),
+                "child_chunks": len(index_payload["child_chunks"]),
+                "entities": len(index_payload["entity_records"]),
+                "relations": len(index_payload["relation_records"]),
+                "themes": len(index_payload["theme_records"]),
+                "events": len(index_payload["event_records"]),
+            }
+        finally:
+            store.close()
+
+    def delete_book(self, book_id: str) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            if store.get_book(book_id) is None:
+                raise ValueError(f"没有找到 book_id={book_id}。")
+            chunk_count = store.delete_book(book_id)
+        finally:
+            store.close()
+        vector_delete = delete_vector_index(default_vector_dir(self.db_path), book_id)
+        return {
+            "book_id": book_id,
+            "deleted_chunks": chunk_count,
+            "vector_index": vector_delete,
+        }
+
+    def delete_vector_index(self, book_id: str) -> dict[str, object]:
+        return delete_vector_index(default_vector_dir(self.db_path), book_id)
+
+    def _build_index_payload(
+        self,
+        *,
+        book_id: str,
+        chapters,
+        text: str,
+        entity_lexicon: str = "",
+        theme_lexicon: str = "",
+    ) -> dict[str, object]:
+        parent_chunks, child_chunks = build_chunk_hierarchy(book_id, chapters, DEFAULT_CHUNK_SETTINGS)
+        entity_names = _parse_inline_lexicon(entity_lexicon)
+        if not entity_names:
+            entity_names = auto_discover_entities(text)
+        entity_records = build_entity_records(chapters, entity_names, DEFAULT_CHUNK_SETTINGS)
+        relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+        theme_names = auto_discover_themes(text, extra_terms=_parse_inline_lexicon(theme_lexicon))
+        theme_records = build_theme_records(chapters, theme_names, DEFAULT_CHUNK_SETTINGS)
+        event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+        return {
+            "parent_chunks": parent_chunks,
+            "child_chunks": child_chunks,
+            "entity_records": entity_records,
+            "relation_records": relation_records,
+            "theme_records": theme_records,
+            "event_records": event_records,
+        }
 
     def runtime_status(self) -> dict[str, object]:
         report = dependency_report()
@@ -210,6 +309,12 @@ class BookRecallWebService:
                 },
                 {"id": "auto", "name": "自动选择", "ready": True},
             ],
+            "agent_policies": [
+                {"id": "auto", "name": "自动选择", "ready": True},
+                {"id": "rule_based", "name": "本地规则 ReAct", "ready": True},
+                {"id": "llm_react", "name": "云端 LLM ReAct", "ready": True},
+                {"id": "langgraph", "name": "LangGraph ReAct", "ready": is_langgraph_available()},
+            ],
         }
 
     def list_entities(self, book_id: str) -> list[dict[str, object]]:
@@ -241,6 +346,41 @@ class BookRecallWebService:
                 }
                 for row in titles
             ]
+        finally:
+            store.close()
+
+    def update_book_metadata(self, book_id: str, book_group: str = "", tags: list[str] | None = None) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            info = store.update_book_metadata(book_id, book_group=book_group, tags=tags)
+            if info is None:
+                raise ValueError(f"没有找到 book_id={book_id}。")
+            return {
+                "book_id": info.book_id,
+                "title": info.title,
+                "source_path": info.source_path,
+                "chapter_count": info.chapter_count,
+                "entity_count": info.entity_count,
+                "book_group": info.book_group,
+                "tags": info.tags,
+            }
+        finally:
+            store.close()
+
+    def get_chapter(self, book_id: str, chapter_number: int) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            row = store.get_chapter(book_id, chapter_number)
+            if row is None:
+                raise ValueError(f"没有找到第 {chapter_number} 章。")
+            return {
+                "book_id": book_id,
+                "chapter_number": int(row["chapter_number"]),
+                "title": row["title"],
+                "content": row["content"],
+                "start_offset": int(row["start_offset"]),
+                "end_offset": int(row["end_offset"]),
+            }
         finally:
             store.close()
 
@@ -410,6 +550,97 @@ class BookRecallWebService:
             "turns": turns,
         }
 
+    def update_session_turn(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        session_id: str,
+        turn_id: int,
+        question: str,
+        answer: str,
+        summary: str | None = None,
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            turn = store.update_agent_turn(
+                turn_id=turn_id,
+                book_id=book_id,
+                user_id=user_id,
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                summary=summary,
+            )
+            if turn is None:
+                raise ValueError("没有找到要修改的对话轮次。")
+            return {
+                "book_id": book_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "turn": turn,
+            }
+        finally:
+            store.close()
+
+    def search_evidence(
+        self,
+        *,
+        book_id: str,
+        query: str,
+        retriever_mode: str = "auto",
+        progress_chapter: int | None = None,
+        limit: int = 8,
+    ) -> dict[str, object]:
+        if not query.strip():
+            raise ValueError("query 不能为空。")
+        store = self._open_store()
+        try:
+            if store.get_book(book_id) is None:
+                raise ValueError(f"没有找到 book_id={book_id}。")
+            retriever = self._make_retriever(store, book_id, retriever_mode)
+            hits = retriever.search(book_id, query, max_chapter=progress_chapter)[:limit]
+            return {
+                "book_id": book_id,
+                "query": query,
+                "retriever": retriever_mode,
+                "effective_retriever": type(retriever).__name__,
+                "progress_chapter": progress_chapter,
+                "hits": [
+                    {
+                        "score": hit.score,
+                        "chapter_number": hit.chapter_number,
+                        "chapter_title": hit.chapter_title,
+                        "parent_id": hit.parent_id,
+                        "child_text": hit.child_text,
+                        "parent_text": hit.parent_text,
+                    }
+                    for hit in hits
+                ],
+            }
+        finally:
+            store.close()
+
+    def delete_session_turn(self, *, book_id: str, user_id: str, session_id: str, turn_id: int) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            deleted = store.delete_agent_turn(
+                turn_id=turn_id,
+                book_id=book_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if deleted <= 0:
+                raise ValueError("没有找到要删除的对话轮次。")
+            return {
+                "book_id": book_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "deleted": deleted,
+            }
+        finally:
+            store.close()
+
     def ask(
         self,
         *,
@@ -419,13 +650,15 @@ class BookRecallWebService:
         session_id: str | None = None,
         progress_chapter: int | None = None,
         retriever_mode: str = "lexical",
+        agent_policy: str = "auto",
         cloud_config: dict[str, object] | None = None,
     ) -> dict[str, object]:
         store = self._open_store()
         try:
             retriever = self._make_retriever(store, book_id, retriever_mode)
             reasoner = self._make_reasoner(cloud_config)
-            agent = BookRecallAgent(store, retriever=retriever, reasoner=reasoner)
+            policy = self._make_policy(agent_policy, reasoner)
+            agent = BookRecallAgent(store, policy=policy, retriever=retriever, reasoner=reasoner)
             card = agent.ask_card(
                 book_id=book_id,
                 question=question,
@@ -437,6 +670,8 @@ class BookRecallWebService:
             payload["rendered_text"] = agent.render_text(card)
             payload["runtime"] = {
                 "retriever": retriever_mode,
+                "agent_policy": agent_policy,
+                "effective_policy": self._effective_policy_name(agent_policy, reasoner),
                 "cloud_reasoner_enabled": reasoner.enabled,
                 "cloud_model": reasoner.model if reasoner.enabled else None,
             }
@@ -445,7 +680,7 @@ class BookRecallWebService:
                     "book_id": book_id,
                     "user_id": user_id,
                     "session_id": session_id,
-                    "turns": store.list_agent_turns(book_id, user_id, session_id, limit=10),
+                    "turns": store.list_agent_turns(book_id, user_id, session_id, limit=50),
                 }
                 payload["session"] = session_data
                 payload["trace"] = session_data["turns"][-1]["trace"] if session_data["turns"] else []
@@ -480,6 +715,44 @@ class BookRecallWebService:
             if mode == "auto":
                 return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
             raise
+
+    def _make_policy(
+        self,
+        mode: str,
+        reasoner: OpenAICompatibleReasoner | _DisabledReasoner,
+    ) -> DecisionPolicy | None:
+        normalized = (mode or "auto").strip().lower()
+        if normalized == "auto":
+            return None
+        if normalized == "rule_based":
+            return RuleBasedPolicy(reasoner=None)
+        if normalized == "llm_react":
+            if not reasoner.enabled:
+                raise LocalModelError("LLM ReAct 策略需要先启用云端大模型配置。")
+            return LLMReActPolicy(reasoner)
+        if normalized == "langgraph":
+            delegate: DecisionPolicy
+            if reasoner.enabled:
+                delegate = LLMReActPolicy(reasoner)
+            else:
+                delegate = RuleBasedPolicy(reasoner=None)
+            try:
+                return LangGraphPolicy(delegate=delegate)
+            except LangGraphUnavailableError as exc:
+                raise LocalModelError(str(exc)) from exc
+        raise LocalModelError("未知 Agent 执行策略，请选择 auto、rule_based、llm_react 或 langgraph。")
+
+    @staticmethod
+    def _effective_policy_name(
+        mode: str,
+        reasoner: OpenAICompatibleReasoner | _DisabledReasoner,
+    ) -> str:
+        normalized = (mode or "auto").strip().lower()
+        if normalized == "auto":
+            return "llm_react" if reasoner.enabled else "rule_based"
+        if normalized == "langgraph":
+            return "langgraph(llm_react)" if reasoner.enabled else "langgraph(rule_based)"
+        return normalized
 
     def _make_reasoner(self, cloud_config: dict[str, object] | None) -> OpenAICompatibleReasoner | _DisabledReasoner:
         if not cloud_config:
@@ -521,6 +794,16 @@ class BookRecallHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/books/") and path.endswith("/entities"):
             book_id = path[len("/api/books/") : -len("/entities")].strip("/")
             self._send_json({"book_id": book_id, "entities": self.service.list_entities(book_id)})
+            return
+
+        if path.startswith("/api/books/") and "/chapters/" in path:
+            book_part, chapter_part = path[len("/api/books/") :].split("/chapters/", 1)
+            book_id = book_part.strip("/")
+            try:
+                chapter_number = int(chapter_part.strip("/"))
+                self._send_json({"chapter": self.service.get_chapter(book_id, chapter_number)})
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
 
         if path.startswith("/api/books/") and path.endswith("/chapters"):
@@ -633,6 +916,7 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 entity_lexicon = str(payload.get("entities", ""))
                 theme_lexicon = str(payload.get("themes", ""))
                 overwrite = bool(payload.get("overwrite"))
+                source_name = str(payload.get("source_name", "")).strip()
                 if not book_id or not text.strip():
                     self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和书籍正文不能为空。")
                     return
@@ -645,9 +929,36 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                             entity_lexicon=entity_lexicon,
                             theme_lexicon=theme_lexicon,
                             overwrite=overwrite,
+                            source_path=f"web://file/{source_name}" if source_name else "web://imported-text",
                         )
                     }
                 )
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/rebuild"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/rebuild")].strip("/")
+                self._send_json(
+                    {
+                        "book": self.service.rebuild_book_index(
+                            book_id=book_id,
+                            entity_lexicon=str(payload.get("entities", "")),
+                            theme_lexicon=str(payload.get("themes", "")),
+                        )
+                    }
+                )
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/vectors/delete"):
+                book_id = parsed.path[len("/api/books/") : -len("/vectors/delete")].strip("/")
+                self._send_json({"vector_index": self.service.delete_vector_index(book_id)})
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/delete"):
+                book_id = parsed.path[len("/api/books/") : -len("/delete")].strip("/")
+                self._send_json({"deleted": self.service.delete_book(book_id)})
                 return
 
             if parsed.path.startswith("/api/books/") and parsed.path.endswith("/vectors"):
@@ -674,6 +985,88 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/search"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/search")].strip("/")
+                progress_raw = payload.get("progress_chapter")
+                limit_raw = payload.get("limit")
+                progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
+                limit = max(1, min(20, int(limit_raw))) if limit_raw not in (None, "") else 8
+                self._send_json(
+                    {
+                        "search": self.service.search_evidence(
+                            book_id=book_id,
+                            query=str(payload.get("query", "")).strip(),
+                            retriever_mode=str(payload.get("retriever", "auto")).strip() or "auto",
+                            progress_chapter=progress_chapter,
+                            limit=limit,
+                        )
+                    }
+                )
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/metadata"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/metadata")].strip("/")
+                book_group = str(payload.get("book_group", "")).strip()
+                raw_tags = payload.get("tags", [])
+                if isinstance(raw_tags, str):
+                    tags = [item.strip() for item in raw_tags.replace("，", ",").split(",") if item.strip()]
+                elif isinstance(raw_tags, list):
+                    tags = [str(item).strip() for item in raw_tags if str(item).strip()]
+                else:
+                    tags = []
+                self._send_json({"book": self.service.update_book_metadata(book_id, book_group=book_group, tags=tags)})
+                return
+
+            if parsed.path.startswith("/api/books/") and "/session/turns/" in parsed.path:
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_part, turn_part = parsed.path[len("/api/books/") :].split("/session/turns/", 1)
+                book_id = book_part.strip("/")
+                turn_id = int(turn_part.strip("/"))
+                user_id = str(payload.get("user_id", "default")).strip() or "default"
+                session_id = str(payload.get("session_id", "default-session")).strip() or "default-session"
+                operation = str(payload.get("operation", "update")).strip().lower()
+                if operation == "delete":
+                    self._send_json(
+                        {
+                            "session": self.service.delete_session_turn(
+                                book_id=book_id,
+                                user_id=user_id,
+                                session_id=session_id,
+                                turn_id=turn_id,
+                            )
+                        }
+                    )
+                    return
+                question = str(payload.get("question", "")).strip()
+                answer = str(payload.get("answer", "")).strip()
+                summary_raw = payload.get("summary")
+                summary = str(summary_raw).strip() if summary_raw not in (None, "") else None
+                if not question or not answer:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "question 和 answer 不能为空。")
+                    return
+                self._send_json(
+                    {
+                        "session": self.service.update_session_turn(
+                            book_id=book_id,
+                            user_id=user_id,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            question=question,
+                            answer=answer,
+                            summary=summary,
+                        )
+                    }
+                )
+                return
+
             if parsed.path == "/api/ask":
                 payload = self._read_json_body()
                 if payload is None:
@@ -683,6 +1076,7 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 user_id = str(payload.get("user_id", "default")).strip() or "default"
                 session_id = str(payload.get("session_id", "")).strip() or None
                 retriever_mode = str(payload.get("retriever", "lexical")).strip() or "lexical"
+                agent_policy = str(payload.get("agent_policy", "auto")).strip() or "auto"
                 progress_raw = payload.get("progress_chapter")
                 progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
                 cloud_config = payload.get("cloud_config")
@@ -699,6 +1093,7 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                         session_id=session_id,
                         progress_chapter=progress_chapter,
                         retriever_mode=retriever_mode,
+                        agent_policy=agent_policy,
                         cloud_config=cloud_config,
                     )
                 )
