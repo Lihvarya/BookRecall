@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import threading
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import perf_counter
 from urllib.parse import parse_qs, urlparse
 
 from .agent import BookRecallAgent
@@ -14,6 +16,8 @@ from .agent.policies.base import DecisionPolicy
 from .agent.policies.langgraph import LangGraphPolicy, LangGraphUnavailableError, is_langgraph_available
 from .agent.policies.llm_react import LLMReActPolicy
 from .agent.policies.rule_based import RuleBasedPolicy
+from .agent.state import AgentState
+from .agent.tools import build_default_registry
 from .chunking import build_chunk_hierarchy
 from .cloud import OpenAICompatibleReasoner
 from .config import DEFAULT_CHUNK_SETTINGS, DEFAULT_EMBEDDING_SETTINGS, DEFAULT_SEARCH_SETTINGS
@@ -318,6 +322,119 @@ class BookRecallWebService:
             ],
         }
 
+    def diagnostics(self) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            books = store.list_books()
+            total_stats = {
+                "books": len(books),
+                "chapters": sum(item.chapter_count for item in books),
+                "entities": sum(item.entity_count for item in books),
+            }
+        finally:
+            store.close()
+
+        dist_index = _frontend_dist_root() / "index.html"
+        legacy_index = _asset_root() / "index.html"
+        return {
+            "ok": True,
+            "database": {
+                "path": self.db_path,
+                "exists": Path(self.db_path).exists(),
+            },
+            "frontend": {
+                "mode": "vue_dist" if dist_index.exists() else "legacy_static",
+                "dist_index": str(dist_index),
+                "dist_built": dist_index.exists(),
+                "legacy_index": str(legacy_index),
+                "legacy_available": legacy_index.exists(),
+            },
+            "storage": {
+                "vector_dir": str(default_vector_dir(self.db_path)),
+                "model_cache_dir": str(default_sentence_transformers_cache_dir(self.db_path)),
+            },
+            "dependencies": dependency_report(),
+            "stats": total_stats,
+            "thread": threading.current_thread().name,
+        }
+
+    def list_agent_tools(self) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            registry = build_default_registry(store, LocalRetriever(store, DEFAULT_SEARCH_SETTINGS))
+            tools = registry.describe_for_llm()
+        finally:
+            store.close()
+        return {
+            "tools": tools,
+            "count": len(tools),
+        }
+
+    def run_agent_tool(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        session_id: str | None,
+        tool_name: str,
+        arguments: dict[str, object],
+        question: str = "",
+        progress_chapter: int | None = None,
+        retriever_mode: str = "lexical",
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            if store.get_book(book_id) is None:
+                raise ValueError(f"没有找到 book_id={book_id}。")
+            effective_progress = progress_chapter
+            if effective_progress is None:
+                effective_progress = store.get_progress(book_id, user_id)
+            if effective_progress is None:
+                effective_progress = store.get_max_chapter(book_id)
+            retriever = self._make_retriever(store, book_id, retriever_mode)
+            registry = build_default_registry(store, retriever)
+            tool = registry.get(tool_name)
+            if tool is None:
+                raise ValueError(f"未知工具：{tool_name}")
+            safe_args = dict(arguments)
+            if tool.schema.parameters.get("max_chapter"):
+                given = safe_args.get("max_chapter")
+                if given not in (None, ""):
+                    safe_args["max_chapter"] = min(int(given), int(effective_progress or 0))
+                else:
+                    safe_args["max_chapter"] = int(effective_progress or 0)
+            matched_entities = store.match_entity_candidates(book_id, question) if question else []
+            matched_themes = store.match_theme_candidates(book_id, question) if question else []
+            state = AgentState(
+                book_id=book_id,
+                question=question or f"调试工具 {tool_name}",
+                user_id=user_id,
+                session_id=session_id,
+                progress_chapter=int(effective_progress or 0),
+                matched_entities=matched_entities,
+                matched_themes=matched_themes,
+                primary_entity=matched_entities[0] if matched_entities else None,
+                recent_turns=store.list_agent_turns(book_id, user_id, session_id, limit=4) if session_id else [],
+                user_preferences=store.get_user_preferences(book_id, user_id),
+            )
+            started = perf_counter()
+            result = tool.run(state, safe_args)
+            elapsed_ms = round((perf_counter() - started) * 1000, 2)
+            return {
+                "book_id": book_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "tool_name": tool_name,
+                "arguments": safe_args,
+                "progress_chapter": int(effective_progress or 0),
+                "retriever": retriever_mode,
+                "elapsed_ms": elapsed_ms,
+                "status": "blocked" if result.get("spoiler_blocked") else "ok",
+                "result": result,
+            }
+        finally:
+            store.close()
+
     def list_entities(self, book_id: str) -> list[dict[str, object]]:
         store = self._open_store()
         try:
@@ -591,6 +708,68 @@ class BookRecallWebService:
             "sessions": sessions,
         }
 
+    def get_session_digest(
+        self,
+        book_id: str,
+        user_id: str,
+        session_id: str,
+        *,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            turns = store.list_agent_turns(book_id, user_id, session_id, limit=limit)
+        finally:
+            store.close()
+        entities = _collect_turn_entities(turns)
+        tools = _collect_trace_tools(turns)
+        intents = sorted({str(turn.get("intent") or "") for turn in turns if turn.get("intent")})
+        progress_values = [int(turn["progress_chapter"]) for turn in turns if turn.get("progress_chapter")]
+        first_turn = turns[0] if turns else None
+        last_turn = turns[-1] if turns else None
+        question_samples = [str(turn.get("question") or "") for turn in turns[-5:] if turn.get("question")]
+        latest_summary = str(last_turn.get("summary") or "") if last_turn else ""
+        synopsis_parts = []
+        if turns:
+            synopsis_parts.append(f"该会话共有 {len(turns)} 轮。")
+        if entities:
+            synopsis_parts.append(f"主要实体：{'、'.join(entities[:8])}。")
+        if intents:
+            synopsis_parts.append(f"覆盖意图：{'、'.join(intents[:6])}。")
+        if latest_summary:
+            synopsis_parts.append(f"最近摘要：{latest_summary}")
+        return {
+            "book_id": book_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "turn_count": len(turns),
+            "first_question": str(first_turn.get("question") or "") if first_turn else "",
+            "last_question": str(last_turn.get("question") or "") if last_turn else "",
+            "latest_summary": latest_summary,
+            "progress_min": min(progress_values) if progress_values else None,
+            "progress_max": max(progress_values) if progress_values else None,
+            "entities": entities,
+            "tools": tools,
+            "intents": intents,
+            "recent_questions": question_samples,
+            "synopsis": "".join(synopsis_parts) if synopsis_parts else "当前会话还没有可摘要的记忆。",
+        }
+
+    def delete_session(self, *, book_id: str, user_id: str, session_id: str) -> dict[str, object]:
+        if not session_id:
+            raise ValueError("session_id 不能为空。")
+        store = self._open_store()
+        try:
+            deleted = store.delete_agent_session(book_id=book_id, user_id=user_id, session_id=session_id)
+        finally:
+            store.close()
+        return {
+            "book_id": book_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "deleted_turns": deleted,
+        }
+
     def compare_sessions(
         self,
         *,
@@ -622,6 +801,18 @@ class BookRecallWebService:
         right_entities = _collect_turn_entities(right_turns)
         left_tools = _collect_trace_tools(left_turns)
         right_tools = _collect_trace_tools(right_turns)
+        entity_delta = _build_delta(left_entities, right_entities)
+        tool_delta = _build_delta(left_tools, right_tools)
+        turn_diffs = _build_turn_diffs(left_unique, right_unique)
+        diff_insights = _build_session_diff_insights(
+            common_prefix=common_prefix,
+            left_session_id=left_session_id,
+            right_session_id=right_session_id,
+            left_unique=left_unique,
+            right_unique=right_unique,
+            entity_delta=entity_delta,
+            tool_delta=tool_delta,
+        )
         return {
             "book_id": book_id,
             "user_id": user_id,
@@ -635,14 +826,79 @@ class BookRecallWebService:
             "right_unique_turns": right_unique,
             "left_entities": left_entities,
             "right_entities": right_entities,
-            "shared_entities": sorted(set(left_entities) & set(right_entities)),
+            "shared_entities": entity_delta["shared"],
+            "entity_delta": entity_delta,
             "left_tools": left_tools,
             "right_tools": right_tools,
-            "shared_tools": sorted(set(left_tools) & set(right_tools)),
+            "shared_tools": tool_delta["shared"],
+            "tool_delta": tool_delta,
+            "turn_diffs": turn_diffs,
+            "diff_insights": diff_insights,
             "summary": (
                 f"两个会话共有 {common_prefix} 轮相同前缀；"
                 f"{left_session_id} 独有 {len(left_unique)} 轮，"
                 f"{right_session_id} 独有 {len(right_unique)} 轮。"
+            ),
+        }
+
+    def merge_sessions(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        left_session_id: str,
+        right_session_id: str,
+        target_session_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        if not left_session_id or not right_session_id:
+            raise ValueError("请选择两个要合并的会话。")
+        if left_session_id == right_session_id:
+            raise ValueError("请选择两个不同的会话进行合并。")
+        target_session = target_session_id or _merge_session_id(left_session_id, right_session_id)
+        if target_session in {left_session_id, right_session_id}:
+            raise ValueError("合并目标会话不能覆盖原分支。")
+
+        store = self._open_store()
+        try:
+            left_turns = store.list_agent_turns(book_id, user_id, left_session_id, limit=limit)
+            right_turns = store.list_agent_turns(book_id, user_id, right_session_id, limit=limit)
+            if not left_turns:
+                raise ValueError(f"会话 {left_session_id} 没有可合并的历史。")
+            if not right_turns:
+                raise ValueError(f"会话 {right_session_id} 没有可合并的历史。")
+            existing_target_turns = store.list_agent_turns(book_id, user_id, target_session, limit=1)
+            if existing_target_turns:
+                raise ValueError(f"目标会话 {target_session} 已存在，请换一个新的会话 ID。")
+
+            common_prefix = _common_turn_prefix(left_turns, right_turns)
+            common_turns = left_turns[:common_prefix]
+            left_unique = left_turns[common_prefix:]
+            right_unique = right_turns[common_prefix:]
+            copied = store.copy_agent_turns_to_session(
+                book_id=book_id,
+                user_id=user_id,
+                source_turns=[*common_turns, *left_unique, *right_unique],
+                target_session_id=target_session,
+            )
+        finally:
+            store.close()
+
+        session = self.get_session_history(book_id, user_id, target_session, limit=limit)
+        return {
+            "book_id": book_id,
+            "user_id": user_id,
+            "left_session_id": left_session_id,
+            "right_session_id": right_session_id,
+            "target_session_id": target_session,
+            "common_prefix_turns": common_prefix,
+            "left_unique_turns": len(left_unique),
+            "right_unique_turns": len(right_unique),
+            "copied_turns": copied,
+            "session": session,
+            "summary": (
+                f"已创建合并会话 {target_session}：保留共同前缀 {common_prefix} 轮，"
+                f"追加左分支 {len(left_unique)} 轮、右分支 {len(right_unique)} 轮。"
             ),
         }
 
@@ -995,6 +1251,14 @@ class BookRecallHandler(BaseHTTPRequestHandler):
             self._send_json(self.service.runtime_status())
             return
 
+        if path == "/api/diagnostics":
+            self._send_json(self.service.diagnostics())
+            return
+
+        if path == "/api/agent/tools":
+            self._send_json(self.service.list_agent_tools())
+            return
+
         if path.startswith("/api/books/") and path.endswith("/entities"):
             book_id = path[len("/api/books/") : -len("/entities")].strip("/")
             self._send_json({"book_id": book_id, "entities": self.service.list_entities(book_id)})
@@ -1108,6 +1372,19 @@ class BookRecallHandler(BaseHTTPRequestHandler):
             self._send_json(self.service.get_session_history(book_id, user_id, session_id, limit=limit))
             return
 
+        if path.startswith("/api/books/") and path.endswith("/session/digest"):
+            book_id = path[len("/api/books/") : -len("/session/digest")].strip("/")
+            query = parse_qs(parsed.query)
+            user_id = query.get("user", ["default"])[0]
+            session_id = query.get("session", ["default-session"])[0]
+            limit_raw = query.get("limit", ["100"])[0]
+            try:
+                limit = max(1, min(300, int(limit_raw)))
+            except ValueError:
+                limit = 100
+            self._send_json({"digest": self.service.get_session_digest(book_id, user_id, session_id, limit=limit)})
+            return
+
         if path.startswith("/api/books/") and path.endswith("/sessions/compare"):
             book_id = path[len("/api/books/") : -len("/sessions/compare")].strip("/")
             query = parse_qs(parsed.query)
@@ -1203,7 +1480,11 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 self._send_json({"vector_index": self.service.delete_vector_index(book_id)})
                 return
 
-            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/delete"):
+            if (
+                parsed.path.startswith("/api/books/")
+                and parsed.path.endswith("/delete")
+                and not parsed.path.endswith("/session/delete")
+            ):
                 book_id = parsed.path[len("/api/books/") : -len("/delete")].strip("/")
                 self._send_json({"deleted": self.service.delete_book(book_id)})
                 return
@@ -1284,6 +1565,77 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                             answer_style=str(payload.get("answer_style", "")),
                             focus=str(payload.get("focus", "")),
                             custom_prompt=str(payload.get("custom_prompt", "")),
+                        )
+                    }
+                )
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/agent/tools/run"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/agent/tools/run")].strip("/")
+                tool_name = str(payload.get("tool_name", "")).strip()
+                arguments = payload.get("arguments", {})
+                if not isinstance(arguments, dict):
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "arguments 必须是对象。")
+                    return
+                progress_raw = payload.get("progress_chapter")
+                progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
+                self._send_json(
+                    {
+                        "tool_run": self.service.run_agent_tool(
+                            book_id=book_id,
+                            user_id=str(payload.get("user_id", "default")).strip() or "default",
+                            session_id=str(payload.get("session_id", "")).strip() or None,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            question=str(payload.get("question", "")).strip(),
+                            progress_chapter=progress_chapter,
+                            retriever_mode=str(payload.get("retriever", "lexical")).strip() or "lexical",
+                        )
+                    }
+                )
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/session/delete"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/session/delete")].strip("/")
+                user_id = str(payload.get("user_id", "default")).strip() or "default"
+                session_id = str(payload.get("session_id", "default-session")).strip() or "default-session"
+                self._send_json(
+                    {
+                        "session": self.service.delete_session(
+                            book_id=book_id,
+                            user_id=user_id,
+                            session_id=session_id,
+                        )
+                    }
+                )
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/sessions/merge"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/sessions/merge")].strip("/")
+                user_id = str(payload.get("user_id", "default")).strip() or "default"
+                left_session_id = str(payload.get("left_session_id", "")).strip()
+                right_session_id = str(payload.get("right_session_id", "")).strip()
+                target_session_id = str(payload.get("target_session_id", "")).strip() or None
+                limit_raw = payload.get("limit", 100)
+                limit = max(1, min(200, int(limit_raw))) if limit_raw not in (None, "") else 100
+                self._send_json(
+                    {
+                        "merge": self.service.merge_sessions(
+                            book_id=book_id,
+                            user_id=user_id,
+                            left_session_id=left_session_id,
+                            right_session_id=right_session_id,
+                            target_session_id=target_session_id,
+                            limit=limit,
                         )
                     }
                 )
@@ -1459,11 +1811,11 @@ class BookRecallHandler(BaseHTTPRequestHandler):
 
     def _send_asset(self, asset_name: str) -> None:
         safe_name = Path(asset_name).name
-        asset_path = _asset_root() / safe_name
-        if safe_name not in {"app.css", "app.js"} or not asset_path.exists():
+        asset_path = _resolve_asset_path(safe_name)
+        if asset_path is None:
             self._send_error_json(HTTPStatus.NOT_FOUND, "静态资源不存在。")
             return
-        content_type = "text/css; charset=utf-8" if safe_name.endswith(".css") else "application/javascript; charset=utf-8"
+        content_type = _asset_content_type(asset_path)
         encoded = asset_path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -1501,14 +1853,47 @@ def _asset_root() -> Path:
     return Path(__file__).with_name("web_assets")
 
 
+def _frontend_dist_root() -> Path:
+    return Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+
 def _build_index_html() -> str:
+    dist_index = _frontend_dist_root() / "index.html"
+    if dist_index.exists():
+        return dist_index.read_text(encoding="utf-8")
     return (_asset_root() / "index.html").read_text(encoding="utf-8")
+
+
+def _resolve_asset_path(safe_name: str) -> Path | None:
+    dist_asset = _frontend_dist_root() / "assets" / safe_name
+    if dist_asset.exists() and dist_asset.is_file():
+        return dist_asset
+    legacy_asset = _asset_root() / safe_name
+    if safe_name in {"app.css", "app.js"} and legacy_asset.exists():
+        return legacy_asset
+    return None
+
+
+def _asset_content_type(asset_path: Path) -> str:
+    if asset_path.suffix == ".js":
+        return "application/javascript; charset=utf-8"
+    if asset_path.suffix == ".css":
+        return "text/css; charset=utf-8"
+    guessed, _ = mimetypes.guess_type(str(asset_path))
+    return guessed or "application/octet-stream"
 
 
 def _branch_session_id(session_id: str, turn_index: int) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     safe_session = "".join(char if char.isalnum() or char in ("-", "_") else "-" for char in session_id).strip("-")
     return f"{safe_session or 'session'}-branch-t{turn_index}-{stamp}"
+
+
+def _merge_session_id(left_session_id: str, right_session_id: str) -> str:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    raw = f"{left_session_id}-with-{right_session_id}"
+    safe_session = "".join(char if char.isalnum() or char in ("-", "_") else "-" for char in raw).strip("-")
+    return f"{safe_session or 'session'}-merge-{stamp}"
 
 
 def _common_turn_prefix(left_turns: list[dict[str, object]], right_turns: list[dict[str, object]]) -> int:
@@ -1544,3 +1929,142 @@ def _collect_trace_tools(turns: list[dict[str, object]]) -> list[str]:
             if isinstance(item, dict) and item.get("tool_name"):
                 tools.append(str(item["tool_name"]))
     return sorted(set(tools))
+
+
+def _build_delta(left_items: list[str], right_items: list[str]) -> dict[str, list[str]]:
+    left_set = set(left_items)
+    right_set = set(right_items)
+    return {
+        "shared": sorted(left_set & right_set),
+        "left_only": sorted(left_set - right_set),
+        "right_only": sorted(right_set - left_set),
+    }
+
+
+def _build_session_diff_insights(
+    *,
+    common_prefix: int,
+    left_session_id: str,
+    right_session_id: str,
+    left_unique: list[dict[str, object]],
+    right_unique: list[dict[str, object]],
+    entity_delta: dict[str, list[str]],
+    tool_delta: dict[str, list[str]],
+) -> list[dict[str, str]]:
+    insights: list[dict[str, str]] = []
+    if common_prefix == 0:
+        insights.append(
+            {
+                "kind": "divergence",
+                "title": "从第一轮开始分歧",
+                "detail": "两个会话没有共同前缀，合并前建议确认它们是否真的属于同一条阅读线索。",
+            }
+        )
+    else:
+        insights.append(
+            {
+                "kind": "divergence",
+                "title": f"共同前缀 {common_prefix} 轮",
+                "detail": f"两个分支在第 {common_prefix + 1} 轮开始分歧，可重点检查后续独有轮次。",
+            }
+        )
+
+    if len(left_unique) != len(right_unique):
+        longer = left_session_id if len(left_unique) > len(right_unique) else right_session_id
+        insights.append(
+            {
+                "kind": "coverage",
+                "title": "分支推进长度不同",
+                "detail": f"{longer} 包含更多独有轮次，可能覆盖了更多追问上下文。",
+            }
+        )
+    elif left_unique and right_unique:
+        insights.append(
+            {
+                "kind": "coverage",
+                "title": "两侧都有独有推进",
+                "detail": "两个分支都包含独有轮次，适合先对比差异，再合并为新的会话继续追问。",
+            }
+        )
+
+    left_only_entities = entity_delta.get("left_only") or []
+    right_only_entities = entity_delta.get("right_only") or []
+    if left_only_entities or right_only_entities:
+        insights.append(
+            {
+                "kind": "entity",
+                "title": "实体焦点不同",
+                "detail": (
+                    f"左侧独有实体：{', '.join(left_only_entities) or '无'}；"
+                    f"右侧独有实体：{', '.join(right_only_entities) or '无'}。"
+                ),
+            }
+        )
+
+    left_only_tools = tool_delta.get("left_only") or []
+    right_only_tools = tool_delta.get("right_only") or []
+    if left_only_tools or right_only_tools:
+        insights.append(
+            {
+                "kind": "tool",
+                "title": "工具调用路径不同",
+                "detail": (
+                    f"左侧独有工具：{', '.join(left_only_tools) or '无'}；"
+                    f"右侧独有工具：{', '.join(right_only_tools) or '无'}。"
+                ),
+            }
+        )
+    return insights
+
+
+def _build_turn_diffs(
+    left_turns: list[dict[str, object]],
+    right_turns: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    diffs: list[dict[str, object]] = []
+    max_len = max(len(left_turns), len(right_turns))
+    for index in range(max_len):
+        left = left_turns[index] if index < len(left_turns) else None
+        right = right_turns[index] if index < len(right_turns) else None
+        left_question = str(left.get("question") or "") if left else ""
+        right_question = str(right.get("question") or "") if right else ""
+        if left is None:
+            status = "right_only"
+        elif right is None:
+            status = "left_only"
+        elif left_question == right_question:
+            status = "same_question"
+        else:
+            status = "different_question"
+        diffs.append(
+            {
+                "offset": index + 1,
+                "status": status,
+                "left_turn_index": left.get("turn_index") if left else None,
+                "right_turn_index": right.get("turn_index") if right else None,
+                "left_question": left_question,
+                "right_question": right_question,
+                "left_answer_excerpt": _excerpt(str(left.get("answer") or "")) if left else "",
+                "right_answer_excerpt": _excerpt(str(right.get("answer") or "")) if right else "",
+                "left_summary": str(left.get("summary") or "") if left else "",
+                "right_summary": str(right.get("summary") or "") if right else "",
+                "left_tools": _turn_tool_names(left) if left else [],
+                "right_tools": _turn_tool_names(right) if right else [],
+            }
+        )
+    return diffs
+
+
+def _turn_tool_names(turn: dict[str, object]) -> list[str]:
+    trace = turn.get("trace")
+    if not isinstance(trace, list):
+        return []
+    names = [str(item["tool_name"]) for item in trace if isinstance(item, dict) and item.get("tool_name")]
+    return list(dict.fromkeys(names))
+
+
+def _excerpt(text: str, limit: int = 120) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit].rstrip()}..."

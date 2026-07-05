@@ -19,6 +19,8 @@ class ToolCallTrace:
     observation_summary: str
     spoiler_blocked: bool = False
     hit_count: int = 0
+    elapsed_ms: float | None = None
+    status: str = "ok"
 
     def observation(self) -> dict:
         """把摘要还原为结构化观察，由工具在 ingest 时挂入。"""

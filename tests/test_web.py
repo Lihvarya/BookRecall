@@ -159,6 +159,61 @@ class BookRecallWebTest(unittest.TestCase):
         langgraph_policy = next(item for item in data["agent_policies"] if item["id"] == "langgraph")
         self.assertEqual(langgraph_policy["ready"], data["dependencies"]["langgraph"])
 
+    def test_diagnostics_endpoint(self) -> None:
+        data = self._get_json("/api/diagnostics")
+        self.assertTrue(data["ok"])
+        self.assertIn("database", data)
+        self.assertTrue(data["database"]["exists"])
+        self.assertIn("frontend", data)
+        self.assertIn(data["frontend"]["mode"], {"legacy_static", "vue_dist"})
+        self.assertIn("storage", data)
+        self.assertIn("vector_dir", data["storage"])
+        self.assertIn("model_cache_dir", data["storage"])
+        self.assertIn("dependencies", data)
+        self.assertIn("faiss", data["dependencies"])
+        self.assertIn("stats", data)
+        self.assertGreaterEqual(data["stats"]["books"], 1)
+
+    def test_agent_tools_endpoint_and_tool_run(self) -> None:
+        tools = self._get_json("/api/agent/tools")
+        names = [item["name"] for item in tools["tools"]]
+        self.assertIn("lookup_first_appearance", names)
+        self.assertIn("search_evidence", names)
+
+        result = self._post_json(
+            "/api/books/sample/agent/tools/run",
+            {
+                "user_id": "alice",
+                "session_id": "toolbox",
+                "tool_name": "lookup_first_appearance",
+                "arguments": {"entity": "黑衣人"},
+                "progress_chapter": 2,
+                "retriever": "lexical",
+            },
+        )
+        tool_run = result["tool_run"]
+        self.assertEqual(tool_run["tool_name"], "lookup_first_appearance")
+        self.assertEqual(tool_run["arguments"]["entity"], "黑衣人")
+        self.assertEqual(tool_run["progress_chapter"], 2)
+        self.assertIn("elapsed_ms", tool_run)
+        self.assertGreaterEqual(tool_run["elapsed_ms"], 0)
+        self.assertEqual(tool_run["status"], "ok")
+        self.assertTrue(tool_run["result"]["found"])
+        self.assertEqual(tool_run["result"]["first_chapter_number"], 2)
+
+        evidence = self._post_json(
+            "/api/books/sample/agent/tools/run",
+            {
+                "user_id": "alice",
+                "tool_name": "search_evidence",
+                "arguments": {"query": "黑衣人 雨里", "max_chapter": 99},
+                "progress_chapter": 2,
+                "retriever": "lexical",
+            },
+        )
+        self.assertEqual(evidence["tool_run"]["arguments"]["max_chapter"], 2)
+        self.assertTrue(evidence["tool_run"]["result"]["hits"])
+
     def test_stats_themes_events_and_relations_endpoints(self) -> None:
         stats = self._get_json("/api/books/sample/stats")
         self.assertGreaterEqual(stats["stats"]["themes"], 1)
@@ -416,6 +471,10 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertEqual(len(second["session"]["turns"]), 2)
         self.assertIn("turn_id", second["session"]["turns"][0])
         self.assertTrue(second["trace"])
+        self.assertIn("elapsed_ms", second["trace"][0])
+        self.assertGreaterEqual(second["trace"][0]["elapsed_ms"], 0)
+        self.assertIn(second["trace"][0]["status"], {"ok", "blocked"})
+        self.assertIn("blocked_by_spoiler", second["trace"][0])
 
     def test_rerun_session_from_turn_replaces_following_turns(self) -> None:
         first = self._post_json(
@@ -516,6 +575,75 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertEqual(len(comparison["right_unique_turns"]), 1)
         self.assertIn("黑衣人", comparison["left_entities"])
         self.assertIn("星辰之匙", comparison["right_entities"])
+        self.assertTrue(comparison["diff_insights"])
+        self.assertIn("left_only", comparison["entity_delta"])
+        self.assertIn("right_only", comparison["tool_delta"])
+        self.assertEqual(len(comparison["turn_diffs"]), 2)
+        self.assertEqual(comparison["turn_diffs"][0]["status"], "different_question")
+        self.assertIn("left_answer_excerpt", comparison["turn_diffs"][0])
+
+    def test_merge_sessions_creates_combined_session(self) -> None:
+        first = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "merge-source",
+                "question": "黑袍人第一次出现在哪一章？",
+            },
+        )
+        second = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "merge-source",
+                "question": "后来还有出现过吗？",
+            },
+        )
+        second_turn_id = second["session"]["turns"][1]["turn_id"]
+
+        branched = self._post_json(
+            f"/api/books/sample/session/turns/{second_turn_id}",
+            {
+                "operation": "branch",
+                "user_id": "alice",
+                "session_id": "merge-source",
+                "target_session_id": "merge-target",
+                "question": "星辰之匙第一次出现在哪一章？",
+                "agent_policy": "rule_based",
+                "retriever": "lexical",
+            },
+        )
+        self.assertEqual(branched["branch"]["copied_turns"], 1)
+
+        merged = self._post_json(
+            "/api/books/sample/sessions/merge",
+            {
+                "user_id": "alice",
+                "left_session_id": "merge-source",
+                "right_session_id": "merge-target",
+                "target_session_id": "merge-combined",
+            },
+        )
+        merge = merged["merge"]
+        self.assertEqual(merge["target_session_id"], "merge-combined")
+        self.assertEqual(merge["common_prefix_turns"], 1)
+        self.assertEqual(merge["left_unique_turns"], 1)
+        self.assertEqual(merge["right_unique_turns"], 1)
+        self.assertEqual(merge["copied_turns"], 3)
+
+        turns = merge["session"]["turns"]
+        self.assertEqual([turn["question"] for turn in turns], [
+            first["session"]["turns"][0]["question"],
+            "后来还有出现过吗？",
+            "星辰之匙第一次出现在哪一章？",
+        ])
+
+        original = self._get_json("/api/books/sample/session?user=alice&session=merge-source&limit=10")
+        branch = self._get_json("/api/books/sample/session?user=alice&session=merge-target&limit=10")
+        self.assertEqual(len(original["turns"]), 2)
+        self.assertEqual(len(branch["turns"]), 2)
 
     def test_session_endpoint(self) -> None:
         self._post_json(
@@ -532,6 +660,8 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertEqual(len(data["turns"]), 1)
         self.assertEqual(data["turns"][0]["entity_name"], "黑衣人")
         self.assertTrue(data["turns"][0]["trace"])
+        self.assertIn("elapsed_ms", data["turns"][0]["trace"][0])
+        self.assertIn("status", data["turns"][0]["trace"][0])
         turn_id = data["turns"][0]["turn_id"]
 
         updated = self._post_json(
@@ -560,10 +690,54 @@ class BookRecallWebTest(unittest.TestCase):
         empty = self._get_json("/api/books/sample/session?user=alice&session=thread-2&limit=10")
         self.assertEqual(empty["turns"], [])
 
+    def test_session_digest_and_delete_endpoint(self) -> None:
+        self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "memory-admin",
+                "question": "黑袍人第一次出现在哪一章？",
+            },
+        )
+        self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "memory-admin",
+                "question": "后来还有出现过吗？",
+            },
+        )
+
+        digest_data = self._get_json("/api/books/sample/session/digest?user=alice&session=memory-admin&limit=20")
+        digest = digest_data["digest"]
+        self.assertEqual(digest["session_id"], "memory-admin")
+        self.assertEqual(digest["turn_count"], 2)
+        self.assertIn("黑衣人", digest["entities"])
+        self.assertTrue(digest["tools"])
+        self.assertIn("该会话共有 2 轮", digest["synopsis"])
+
+        deleted = self._post_json(
+            "/api/books/sample/session/delete",
+            {"user_id": "alice", "session_id": "memory-admin"},
+        )
+        self.assertEqual(deleted["session"]["deleted_turns"], 2)
+        empty = self._get_json("/api/books/sample/session?user=alice&session=memory-admin&limit=10")
+        self.assertEqual(empty["turns"], [])
+        digest_after_delete = self._get_json("/api/books/sample/session/digest?user=alice&session=memory-admin&limit=20")
+        self.assertEqual(digest_after_delete["digest"]["turn_count"], 0)
+
     def test_index_page(self) -> None:
         with urllib.request.urlopen(f"{self.base_url}/") as response:
             html = response.read().decode("utf-8")
         self.assertIn("BookRecall", html)
+        if 'src="/assets/index-' in html:
+            self.assertIn('type="module"', html)
+            self.assertIn('href="/assets/index-', html)
+            self.assertIn('<div id="app"></div>', html)
+            return
+
         self.assertIn('/assets/app.css', html)
         self.assertIn('/assets/app.js', html)
         self.assertIn("会话历史", html)
@@ -587,6 +761,10 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("会话与分支", html)
         self.assertIn("刷新会话列表", html)
         self.assertIn("对比分支差异", html)
+        self.assertIn("生成会话摘要", html)
+        self.assertIn("清空当前会话记忆", html)
+        self.assertIn("Agent 工具箱", html)
+        self.assertIn("执行 Agent 工具", html)
         self.assertIn("长期回答偏好", html)
         self.assertIn("保存长期偏好", html)
 
@@ -626,6 +804,14 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("summarizeTrace", js)
         self.assertIn("renderTraceSummary", js)
         self.assertIn("compareSessionsFromPanel", js)
+        self.assertIn("loadCurrentSessionDigest", js)
+        self.assertIn("deleteCurrentSessionMemory", js)
+        self.assertIn("loadAgentTools", js)
+        self.assertIn("runSelectedAgentTool", js)
+        self.assertIn("/api/agent/tools", js)
+        self.assertIn("/agent/tools/run", js)
+        self.assertIn("/session/digest?user=", js)
+        self.assertIn("/session/delete", js)
         self.assertIn("/sessions?user=", js)
         self.assertIn("/sessions/compare?user=", js)
         self.assertIn("refreshSessionsBtn", js)

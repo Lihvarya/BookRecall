@@ -1257,6 +1257,17 @@ class BookRecallStore:
         self.connection.commit()
         return int(cursor.rowcount)
 
+    def delete_agent_session(self, *, book_id: str, user_id: str, session_id: str) -> int:
+        cursor = self.connection.execute(
+            """
+            DELETE FROM agent_memory
+            WHERE book_id = ? AND user_id = ? AND session_id = ?
+            """,
+            (book_id, user_id, session_id),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
+
     def get_max_chapter(self, book_id: str) -> int:
         row = self.connection.execute(
             "SELECT COALESCE(MAX(chapter_number), 0) AS max_chapter FROM chapters WHERE book_id = ?",

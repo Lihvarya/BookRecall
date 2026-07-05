@@ -628,6 +628,7 @@ details {
 .search-results,
 .session-list,
 .session-compare,
+.session-digest,
 .diff-column {
   display: flex;
   flex-direction: column;

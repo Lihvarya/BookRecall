@@ -12,7 +12,8 @@ const state = {
   currentTurns: [],
   currentSessions: [],
   entities: [],
-  themes: []
+  themes: [],
+  agentTools: []
 };
 
 const PREFERENCES_KEY = "bookrecall.preferences";
@@ -45,6 +46,7 @@ const els = {
   compareLeftSessionSelect: document.getElementById("compareLeftSessionSelect"),
   compareRightSessionSelect: document.getElementById("compareRightSessionSelect"),
   sessionComparePanel: document.getElementById("sessionComparePanel"),
+  sessionDigestPanel: document.getElementById("sessionDigestPanel"),
   sessionPanel: document.getElementById("sessionPanel"),
   tracePanel: document.getElementById("tracePanel"),
   answerCard: document.getElementById("answerCard"),
@@ -77,7 +79,11 @@ const els = {
   vectorResultPanel: document.getElementById("vectorResultPanel"),
   searchQueryInput: document.getElementById("searchQueryInput"),
   searchLimitInput: document.getElementById("searchLimitInput"),
-  searchResultPanel: document.getElementById("searchResultPanel")
+  searchResultPanel: document.getElementById("searchResultPanel"),
+  agentToolSelect: document.getElementById("agentToolSelect"),
+  agentToolDescriptionPanel: document.getElementById("agentToolDescriptionPanel"),
+  agentToolArgumentsInput: document.getElementById("agentToolArgumentsInput"),
+  agentToolResultPanel: document.getElementById("agentToolResultPanel")
 };
 
 function setStatus(text) {
@@ -985,6 +991,145 @@ async function compareSessionsFromPanel() {
   setStatus(`已对比 ${left} 与 ${right}。`);
 }
 
+function defaultToolArguments(tool) {
+  const args = {};
+  const parameters = tool?.parameters || {};
+  for (const [name, meta] of Object.entries(parameters)) {
+    if (name === "entity" || name === "source_entity") {
+      args[name] = state.entities[0]?.name || "";
+    } else if (name === "target_entity") {
+      args[name] = state.entities[1]?.name || "";
+    } else if (name === "theme") {
+      args[name] = state.themes[0]?.name || "";
+    } else if (name === "query") {
+      args[name] = els.questionInput.value.trim() || "";
+    } else if (name === "chapter") {
+      args[name] = Number(els.progressInput.value || 1);
+    } else if (name === "max_chapter") {
+      args[name] = Number(els.progressInput.value || 0) || undefined;
+    } else if (meta && meta.required) {
+      args[name] = "";
+    }
+  }
+  return JSON.stringify(args, null, 2);
+}
+
+function renderAgentToolSelection() {
+  if (!state.agentTools.length) {
+    els.agentToolSelect.innerHTML = "";
+    els.agentToolDescriptionPanel.textContent = "暂无工具 schema。";
+    return;
+  }
+  els.agentToolSelect.innerHTML = state.agentTools
+    .map((tool) => `<option value="${escapeHtml(tool.name)}">${escapeHtml(tool.name)}</option>`)
+    .join("");
+  const selected = state.agentTools[0];
+  els.agentToolDescriptionPanel.textContent = selected.description || "该工具暂无说明。";
+  els.agentToolArgumentsInput.value = defaultToolArguments(selected);
+}
+
+async function loadAgentTools() {
+  const data = await requestJson("/api/agent/tools");
+  state.agentTools = data.tools || [];
+  renderAgentToolSelection();
+}
+
+function updateSelectedAgentTool() {
+  const selected = state.agentTools.find((tool) => tool.name === els.agentToolSelect.value);
+  if (!selected) return;
+  els.agentToolDescriptionPanel.textContent = selected.description || "该工具暂无说明。";
+  els.agentToolArgumentsInput.value = defaultToolArguments(selected);
+}
+
+async function runSelectedAgentTool() {
+  if (!state.currentBookId) {
+    setStatus("请先选择一本书。");
+    return;
+  }
+  let args = {};
+  try {
+    args = JSON.parse(els.agentToolArgumentsInput.value || "{}");
+  } catch (_err) {
+    throw new Error("工具参数不是合法 JSON。");
+  }
+  els.agentToolResultPanel.innerHTML = '<div class="empty tiny">正在执行 Agent 工具...</div>';
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/agent/tools/run`, {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: state.currentUserId,
+      session_id: state.currentSessionId,
+      tool_name: els.agentToolSelect.value,
+      arguments: args,
+      question: els.questionInput.value.trim(),
+      progress_chapter: els.progressInput.value ? Number(els.progressInput.value) : null,
+      retriever: els.retrieverSelect.value
+    })
+  });
+  els.agentToolResultPanel.innerHTML = `
+    <div class="trace-item">
+      <strong>${escapeHtml(data.tool_run?.tool_name || els.agentToolSelect.value)} 结果</strong>
+      <div class="muted tiny">进度上限：第 ${escapeHtml(data.tool_run?.progress_chapter || "?")} 章 · 检索器：${escapeHtml(data.tool_run?.retriever || "")}</div>
+      <pre class="mono">${escapeHtml(JSON.stringify(data.tool_run?.result || {}, null, 2))}</pre>
+    </div>
+  `;
+  setStatus(`工具 ${els.agentToolSelect.value} 执行完成。`);
+}
+
+function renderSessionDigest(digest) {
+  if (!digest) {
+    els.sessionDigestPanel.innerHTML = '<div class="empty tiny">暂无会话摘要。</div>';
+    return;
+  }
+  els.sessionDigestPanel.innerHTML = `
+    <div class="compare-summary">
+      <strong>会话记忆摘要</strong>
+      <p>${escapeHtml(digest.synopsis || "当前会话还没有可摘要的记忆。")}</p>
+      <div class="pill-row">
+        <span class="pill ready">轮次 ${escapeHtml(digest.turn_count || 0)}</span>
+        <span class="pill">章节 ${escapeHtml(digest.progress_min || "?")} - ${escapeHtml(digest.progress_max || "?")}</span>
+      </div>
+      <div class="muted tiny">主要实体：${escapeHtml((digest.entities || []).join("、") || "无")}</div>
+      <div class="muted tiny">工具路径：${escapeHtml((digest.tools || []).join(" → ") || "无")}</div>
+      <div class="muted tiny">最近问题：${escapeHtml((digest.recent_questions || []).join(" / ") || "无")}</div>
+    </div>
+  `;
+}
+
+async function loadCurrentSessionDigest() {
+  if (!state.currentBookId) {
+    setStatus("请先选择一本书。");
+    return;
+  }
+  const sessionId = state.currentSessionId || "default-session";
+  els.sessionDigestPanel.innerHTML = '<div class="empty tiny">正在生成当前会话记忆摘要...</div>';
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session/digest?user=${encodeURIComponent(state.currentUserId)}&session=${encodeURIComponent(sessionId)}&limit=200`);
+  renderSessionDigest(data.digest || {});
+  setStatus(`已生成会话 ${sessionId} 的记忆摘要。`);
+}
+
+async function deleteCurrentSessionMemory() {
+  if (!state.currentBookId) {
+    setStatus("请先选择一本书。");
+    return;
+  }
+  const sessionId = state.currentSessionId || "default-session";
+  if (!window.confirm(`清空当前会话「${sessionId}」的全部 Agent 记忆？这不会删除书籍索引。`)) {
+    return;
+  }
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session/delete`, {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: state.currentUserId,
+      session_id: sessionId
+    })
+  });
+  renderSessionDigest(null);
+  renderSession([]);
+  renderTrace([]);
+  await loadSessionList();
+  setStatus(`已清空当前会话记忆，删除 ${data.session?.deleted_turns || 0} 轮。`);
+}
+
 function applyUserPreferences(preferences) {
   const data = preferences || {};
   els.answerStyleSelect.value = data.answer_style || "";
@@ -1311,6 +1456,19 @@ document.getElementById("compareSessionsBtn").addEventListener("click", () => co
   els.sessionComparePanel.innerHTML = `<div class="empty tiny">${escapeHtml(err.message)}</div>`;
   setStatus(err.message);
 }));
+document.getElementById("digestSessionBtn").addEventListener("click", () => loadCurrentSessionDigest().catch((err) => {
+  els.sessionDigestPanel.innerHTML = `<div class="empty tiny">${escapeHtml(err.message)}</div>`;
+  setStatus(err.message);
+}));
+document.getElementById("deleteSessionBtn").addEventListener("click", () => deleteCurrentSessionMemory().catch((err) => {
+  els.sessionDigestPanel.innerHTML = `<div class="empty tiny">${escapeHtml(err.message)}</div>`;
+  setStatus(err.message);
+}));
+els.agentToolSelect.addEventListener("change", updateSelectedAgentTool);
+document.getElementById("runAgentToolBtn").addEventListener("click", () => runSelectedAgentTool().catch((err) => {
+  els.agentToolResultPanel.innerHTML = `<div class="empty tiny">${escapeHtml(err.message)}</div>`;
+  setStatus(err.message);
+}));
 document.getElementById("savePreferencesBtn").addEventListener("click", () => saveUserPreferences().catch((err) => {
   els.preferencesResultPanel.textContent = err.message;
   setStatus(err.message);
@@ -1382,4 +1540,7 @@ loadBooks().catch((err) => {
   console.error(err);
   setStatus(err.message);
   els.bookMeta.textContent = "加载失败。";
+});
+loadAgentTools().catch((err) => {
+  els.agentToolDescriptionPanel.textContent = err.message;
 });

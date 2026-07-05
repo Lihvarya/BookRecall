@@ -312,6 +312,32 @@ python bookrecall.py ask \
 
 ## Web 界面
 
+### 一键启动（Windows）
+
+双击项目根目录的 `start_bookrecall.bat`，或在 PowerShell 中运行：
+
+```powershell
+.\start_bookrecall.ps1
+```
+
+默认行为：
+
+- 使用 `.\.venv\Scripts\python.exe`，如果不存在则回退到系统 `python`。
+- 默认启动 `http://127.0.0.1:8000` 并自动打开浏览器。
+- 如果 `frontend/dist` 已存在，直接使用已构建的 Vue 控制台。
+- 如果 `frontend/dist` 不存在但 `frontend/node_modules` 存在，会自动运行 `npm run build`。
+- 不会自动执行 `npm install`、`pip install`，也不会主动安装任何依赖。
+- 默认把 Hugging Face / sentence-transformers 缓存指向项目内 `.bookrecall/model_cache`，避免继续写到 C 盘用户缓存目录。
+
+可选参数：
+
+```powershell
+.\start_bookrecall.ps1 -Port 8010
+.\start_bookrecall.ps1 -NoBrowser
+.\start_bookrecall.ps1 -BuildFrontend
+.\start_bookrecall.ps1 -SkipFrontendBuild
+```
+
 启动本地网页：
 
 ```bash

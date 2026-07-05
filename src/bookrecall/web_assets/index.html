@@ -76,6 +76,13 @@
             <div class="session-compare" id="sessionComparePanel">
               <div class="empty tiny">选择两个会话后，可以查看共同前缀、分歧轮次和各自独有线索。</div>
             </div>
+            <div class="grid-two">
+              <button class="secondary" id="digestSessionBtn" type="button">生成会话摘要</button>
+              <button class="ghost danger-action" id="deleteSessionBtn" type="button">清空当前会话记忆</button>
+            </div>
+            <div class="session-digest" id="sessionDigestPanel">
+              <div class="empty tiny">生成摘要后，可以查看当前会话的轮次、实体、工具路径和最近问题。</div>
+            </div>
             <div class="session-list" id="sessionListPanel">
               <div class="empty tiny">当前书籍还没有会话历史。</div>
             </div>
@@ -175,6 +182,22 @@
         <p class="eyebrow">Control Center</p>
         <h2>Agent 设置</h2>
       </header>
+
+      <div class="section">
+        <details open>
+          <summary>Agent 工具箱</summary>
+          <div class="stack">
+            <select id="agentToolSelect"></select>
+            <div class="empty tiny" id="agentToolDescriptionPanel">选择工具后可查看说明并直接执行。工具执行不会写入会话记忆。</div>
+            <label class="label" for="agentToolArgumentsInput">工具参数 JSON</label>
+            <textarea class="compact mono" id="agentToolArgumentsInput" placeholder='{"entity": "黑衣人"}'></textarea>
+            <button class="secondary" id="runAgentToolBtn" type="button">执行 Agent 工具</button>
+            <div class="search-results" id="agentToolResultPanel">
+              <div class="empty tiny">工具执行结果会显示在这里。</div>
+            </div>
+          </div>
+        </details>
+      </div>
 
       <div class="section">
         <details>

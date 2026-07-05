@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from time import perf_counter
+
 from ..cloud import OpenAICompatibleReasoner
 from ..config import DEFAULT_SEARCH_SETTINGS
 from ..models import EvidenceCard, MemoryCard
@@ -83,8 +85,10 @@ class BookRecallAgent:
                 continue
 
             arguments = self._clamp_max_chapter(tool, decision.tool_call.arguments, state.progress_chapter)
+            started = perf_counter()
             result = tool.run(state, arguments)
-            self._ingest_result(state, tool.schema.name, decision.tool_call, result)
+            elapsed_ms = (perf_counter() - started) * 1000
+            self._ingest_result(state, tool.schema.name, decision.tool_call, result, elapsed_ms=elapsed_ms)
             self._prune_evidence(state)
 
         card = self._finalize_memory_card(state)
@@ -182,9 +186,17 @@ class BookRecallAgent:
                 fallback.append(resolved)
         return fallback
 
-    def _ingest_result(self, state: AgentState, tool_name: str, call, result: dict) -> None:
+    def _ingest_result(
+        self,
+        state: AgentState,
+        tool_name: str,
+        call,
+        result: dict,
+        *,
+        elapsed_ms: float | None = None,
+    ) -> None:
         state.called_tools.add(tool_name)
-        trace = _trace_for(state.step, tool_name, call, result)
+        trace = _trace_for(state.step, tool_name, call, result, elapsed_ms=elapsed_ms)
         trace._observation = result  # type: ignore[attr-defined]
         state.trace.append(trace)
 
@@ -378,7 +390,10 @@ class BookRecallAgent:
                 "thought": trace.thought,
                 "observation_summary": trace.observation_summary,
                 "spoiler_blocked": trace.spoiler_blocked,
+                "blocked_by_spoiler": trace.spoiler_blocked,
                 "hit_count": trace.hit_count,
+                "elapsed_ms": trace.elapsed_ms,
+                "status": trace.status,
             }
             for trace in trace_items
         ]
@@ -404,7 +419,7 @@ class BookRecallAgent:
         return f"第 {chapter_number} 章"
 
 
-def _trace_for(step: int, tool_name: str, call, result: dict) -> ToolCallTrace:
+def _trace_for(step: int, tool_name: str, call, result: dict, *, elapsed_ms: float | None = None) -> ToolCallTrace:
     hit_count = 0
     if "hits" in result:
         hit_count = len(result.get("hits", []))
@@ -420,6 +435,8 @@ def _trace_for(step: int, tool_name: str, call, result: dict) -> ToolCallTrace:
         observation_summary=_summarize_observation(result),
         spoiler_blocked=bool(result.get("spoiler_blocked")),
         hit_count=hit_count,
+        elapsed_ms=round(float(elapsed_ms), 2) if elapsed_ms is not None else None,
+        status="blocked" if result.get("spoiler_blocked") else "ok",
     )
 
 
