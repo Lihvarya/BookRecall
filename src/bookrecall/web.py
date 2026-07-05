@@ -42,8 +42,10 @@ from .entity_index import (
     build_relation_records,
     build_theme_records,
 )
+from .local_llm import LocalChatClient, LocalLLMError, LocalLLMSettings
 from .parser import parse_chapters
 from .retrieval import LocalRetriever, Retriever
+from .smart_index import build_smart_relation_event_records, discover_entities_with_llm
 from .storage import BookRecallStore
 
 
@@ -69,6 +71,23 @@ def _parse_inline_lexicon(raw: str) -> dict[str, list[str]]:
         else:
             items[stripped] = []
     return items
+
+
+def _make_smart_index_client(config: dict[str, object] | None) -> LocalChatClient | None:
+    if not config or not bool(config.get("enabled")):
+        return None
+    model_path = str(config.get("model_path", "") or "").strip()
+    endpoint = str(config.get("endpoint", "") or "").strip()
+    if not model_path and not endpoint:
+        raise ValueError("已开启智能索引，但没有填写 Qwen3 GGUF 模型路径或本地服务 endpoint。")
+    return LocalChatClient(
+        LocalLLMSettings(
+            model_path=model_path,
+            endpoint=endpoint,
+            n_ctx=int(config.get("n_ctx") or 4096),
+            max_tokens=int(config.get("max_tokens") or 2048),
+        )
+    )
 
 
 class BookRecallWebService:
@@ -106,6 +125,7 @@ class BookRecallWebService:
         text: str,
         entity_lexicon: str = "",
         theme_lexicon: str = "",
+        smart_index: dict[str, object] | None = None,
         overwrite: bool = False,
         source_path: str = "web://imported-text",
     ) -> dict[str, object]:
@@ -126,6 +146,7 @@ class BookRecallWebService:
                 text=text,
                 entity_lexicon=entity_lexicon,
                 theme_lexicon=theme_lexicon,
+                smart_index=smart_index,
             )
             store.replace_book(
                 book_id=book_id,
@@ -160,6 +181,7 @@ class BookRecallWebService:
         book_id: str,
         entity_lexicon: str = "",
         theme_lexicon: str = "",
+        smart_index: dict[str, object] | None = None,
     ) -> dict[str, object]:
         store = self._open_store()
         try:
@@ -176,6 +198,7 @@ class BookRecallWebService:
                 text=text,
                 entity_lexicon=entity_lexicon,
                 theme_lexicon=theme_lexicon,
+                smart_index=smart_index,
             )
             store.replace_book(
                 book_id=book_id,
@@ -229,16 +252,39 @@ class BookRecallWebService:
         text: str,
         entity_lexicon: str = "",
         theme_lexicon: str = "",
+        smart_index: dict[str, object] | None = None,
     ) -> dict[str, object]:
         parent_chunks, child_chunks = build_chunk_hierarchy(book_id, chapters, DEFAULT_CHUNK_SETTINGS)
+        smart_client = _make_smart_index_client(smart_index)
+        max_chapters = int((smart_index or {}).get("max_chapters") or 0)
         entity_names = _parse_inline_lexicon(entity_lexicon)
         if not entity_names:
             entity_names = auto_discover_entities(text)
+        if smart_client is not None:
+            entity_names = discover_entities_with_llm(
+                chapters,
+                smart_client,
+                seed_entities=entity_names,
+                max_chapters=max_chapters,
+            )
         entity_records = build_entity_records(chapters, entity_names, DEFAULT_CHUNK_SETTINGS)
-        relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
         theme_names = auto_discover_themes(text, extra_terms=_parse_inline_lexicon(theme_lexicon))
         theme_records = build_theme_records(chapters, theme_names, DEFAULT_CHUNK_SETTINGS)
-        event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+        if smart_client is not None:
+            relation_records, event_records = build_smart_relation_event_records(
+                chapters,
+                entity_records,
+                DEFAULT_CHUNK_SETTINGS,
+                smart_client,
+                max_chapters=max_chapters,
+            )
+            if not relation_records:
+                relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+            if not event_records:
+                event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+        else:
+            relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+            event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
         return {
             "parent_chunks": parent_chunks,
             "child_chunks": child_chunks,
@@ -1441,6 +1487,9 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 theme_lexicon = str(payload.get("themes", ""))
                 overwrite = bool(payload.get("overwrite"))
                 source_name = str(payload.get("source_name", "")).strip()
+                smart_index = payload.get("smart_index")
+                if not isinstance(smart_index, dict):
+                    smart_index = None
                 if not book_id or not text.strip():
                     self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和书籍正文不能为空。")
                     return
@@ -1452,6 +1501,7 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                             text=text,
                             entity_lexicon=entity_lexicon,
                             theme_lexicon=theme_lexicon,
+                            smart_index=smart_index,
                             overwrite=overwrite,
                             source_path=f"web://file/{source_name}" if source_name else "web://imported-text",
                         )
@@ -1464,12 +1514,16 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 if payload is None:
                     return
                 book_id = parsed.path[len("/api/books/") : -len("/rebuild")].strip("/")
+                smart_index = payload.get("smart_index")
+                if not isinstance(smart_index, dict):
+                    smart_index = None
                 self._send_json(
                     {
                         "book": self.service.rebuild_book_index(
                             book_id=book_id,
                             entity_lexicon=str(payload.get("entities", "")),
                             theme_lexicon=str(payload.get("themes", "")),
+                            smart_index=smart_index,
                         )
                     }
                 )
@@ -1773,6 +1827,9 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 return
         except LocalModelError as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except LocalLLMError as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, f"智能索引本地模型调用失败：{exc}")
             return
         except (TypeError, ValueError) as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, f"请求参数不合法：{exc}")

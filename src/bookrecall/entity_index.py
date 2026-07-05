@@ -29,6 +29,10 @@ _STOPWORDS: set[str] = {
     "那些", "这些", "这是", "那是", "那里", "这里", "于是", "可是", "而且", "或许",
     "一些", "所有", "这是", "不是", "不得", "但也", "不论", "以上", "以下", "以为",
     "一时", "一方", "大事", "大事", "之中", "之间", "之内", "之外", "以后", "以前",
+    "就是", "没有", "他的", "她的", "它的", "时间", "一声", "还有", "中的", "心中",
+    "之前", "手段", "有一", "还是", "都是", "正在", "突然", "不能", "不会", "不是",
+    "然而", "显然", "似乎", "其中", "这种", "那种", "如此", "如此", "当中", "时候",
+    "起来", "下去", "过来", "过去", "出来", "进去", "所有人", "其他人", "年轻人",
 }
 
 DEFAULT_THEME_TERMS: tuple[str, ...] = (
@@ -75,6 +79,12 @@ def _is_candidate_name(token: str) -> bool:
     # 排除全数字或纯标点
     if all(ch in "零一二三四五六七八九十百千万两〇0123456789" for ch in token):
         return False
+    if len(token) <= 3 and any(ch in token for ch in "的是了在有也就都很还没不"):
+        return False
+    if token.startswith(("第", "这", "那", "有", "没", "不", "很", "还", "又", "再")) and len(token) <= 3:
+        return False
+    if token.endswith(("的", "了", "着", "过", "中", "里", "上", "下")) and len(token) <= 3:
+        return False
     return True
 
 
@@ -98,10 +108,13 @@ def discover_entities_by_frequency(text: str, *, top_k: int = 60) -> dict[str, l
         for token, freq in counter.most_common()
         if freq >= 8 and _is_candidate_name(token)
     ]
+    candidates.sort(key=lambda item: (-len(item[0]), -item[1], item[0]))
     chosen: list[str] = []
     for token, _freq in candidates:
         if len(chosen) >= top_k:
             break
+        if any(token in existing and len(existing) > len(token) for existing in chosen):
+            continue
         chosen.append(token)
     chosen.sort(key=lambda item: (-len(item), item))
     return {item: [] for item in chosen}
@@ -271,37 +284,67 @@ def build_relation_records(
     entity_records: list[EntityRecord],
     settings: ChunkSettings,
 ) -> list[RelationRecord]:
-    mentions_by_chapter: dict[int, dict[str, list[EntityMention]]] = {}
-    for record in entity_records:
-        for mention in record.mentions:
-            mentions_by_chapter.setdefault(mention.chapter_number, {}).setdefault(record.name, []).append(mention)
-
     relation_mentions: dict[tuple[str, str, str], list[RelationMention]] = {}
-    chapter_by_number = {chapter.number: chapter for chapter in chapters}
+    entity_names = [record.name for record in entity_records]
 
-    for chapter_number, entity_map in mentions_by_chapter.items():
-        names = sorted(entity_map)
-        if len(names) < 2:
-            continue
-        chapter = chapter_by_number.get(chapter_number)
-        content = chapter.content if chapter is not None else ""
-        for left_index, source in enumerate(names):
-            for target in names[left_index + 1 :]:
-                source_pos = entity_map[source][0].position_in_chapter
-                target_pos = entity_map[target][0].position_in_chapter
-                excerpt = _relation_excerpt(content, source_pos, target_pos, settings.max_excerpt_chars)
-                relation_type = _infer_relation_type(excerpt)
-                ordered_source, ordered_target = sorted((source, target))
-                key = (ordered_source, ordered_target, relation_type)
-                relation_mentions.setdefault(key, []).append(
-                    RelationMention(
-                        source_entity=ordered_source,
-                        target_entity=ordered_target,
-                        relation_type=relation_type,
-                        chapter_number=chapter_number,
-                        excerpt=excerpt,
+    for chapter in chapters:
+        for sentence in _iter_relation_windows(chapter.content, settings.max_excerpt_chars):
+            names = sorted(name for name in entity_names if name in sentence)
+            if len(names) < 2:
+                continue
+            for left_index, source in enumerate(names):
+                for target in names[left_index + 1 :]:
+                    relation_type = _infer_relation_type(sentence)
+                    if relation_type == "共现/关联":
+                        continue
+                    ordered_source, ordered_target = sorted((source, target))
+                    key = (ordered_source, ordered_target, relation_type)
+                    relation_mentions.setdefault(key, []).append(
+                        RelationMention(
+                            source_entity=ordered_source,
+                            target_entity=ordered_target,
+                            relation_type=relation_type,
+                            chapter_number=chapter.number,
+                            excerpt=sentence,
+                        )
                     )
-                )
+
+    if not relation_mentions:
+        # 最后兜底：只有当两个实体距离很近时，才认为它们有弱关系。
+        mentions_by_chapter: dict[int, dict[str, list[EntityMention]]] = {}
+        for record in entity_records:
+            for mention in record.mentions:
+                mentions_by_chapter.setdefault(mention.chapter_number, {}).setdefault(record.name, []).append(mention)
+        chapter_by_number = {chapter.number: chapter for chapter in chapters}
+        for chapter_number, entity_map in mentions_by_chapter.items():
+            names = sorted(entity_map)
+            if len(names) < 2:
+                continue
+            chapter = chapter_by_number.get(chapter_number)
+            content = chapter.content if chapter is not None else ""
+            for left_index, source in enumerate(names):
+                for target in names[left_index + 1 :]:
+                    source_pos = entity_map[source][0].position_in_chapter
+                    target_pos = entity_map[target][0].position_in_chapter
+                    if abs(source_pos - target_pos) > settings.max_excerpt_chars:
+                        continue
+                    excerpt = _relation_excerpt(content, source_pos, target_pos, settings.max_excerpt_chars)
+                    if not excerpt:
+                        continue
+                    if _infer_relation_type(excerpt) == "共现/关联":
+                        continue
+                    relation_type = _infer_relation_type(excerpt)
+                    ordered_source, ordered_target = sorted((source, target))
+                    key = (ordered_source, ordered_target, relation_type)
+                    relation_mentions.setdefault(key, []).append(
+                        RelationMention(
+                            source_entity=ordered_source,
+                            target_entity=ordered_target,
+                            relation_type=relation_type,
+                            chapter_number=chapter_number,
+                            excerpt=excerpt,
+                        )
+                    )
 
     records: list[RelationRecord] = []
     for (source, target, relation_type), mentions in sorted(relation_mentions.items()):
@@ -360,6 +403,21 @@ def _iter_event_sentences(content: str) -> list[str]:
         if 8 <= len(cleaned) <= 220:
             sentences.append(cleaned)
     return sentences
+
+
+def _iter_relation_windows(content: str, max_chars: int) -> list[str]:
+    parts = re.split(r"(?<=[。！？!?；;])\s*|\n+", content)
+    windows: list[str] = []
+    for part in parts:
+        cleaned = " ".join(part.split()).strip()
+        if 8 <= len(cleaned) <= max_chars:
+            windows.append(cleaned)
+        elif len(cleaned) > max_chars:
+            for start in range(0, len(cleaned), max_chars):
+                window = cleaned[start : start + max_chars].strip()
+                if len(window) >= 8:
+                    windows.append(window)
+    return windows
 
 
 def _infer_event_type(sentence: str) -> str:

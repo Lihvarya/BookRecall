@@ -43,6 +43,10 @@ interface FormState {
   buildEntities: string;
   buildThemes: string;
   buildOverwrite: boolean;
+  smartIndexEnabled: boolean;
+  smartIndexModelPath: string;
+  smartIndexEndpoint: string;
+  smartIndexMaxChapters: string | number;
   vectorModel: string;
   vectorBackend: string;
   vectorLimit: string | number;
@@ -167,6 +171,10 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       buildEntities: "",
       buildThemes: "",
       buildOverwrite: false,
+      smartIndexEnabled: false,
+      smartIndexModelPath: "D:\\BookRecall\\models\\llm\\qwen3-4b-instruct-2507-q4_k_m.gguf",
+      smartIndexEndpoint: "",
+      smartIndexMaxChapters: "",
       vectorModel: "BAAI/bge-small-zh-v1.5",
       vectorBackend: "auto",
       vectorLimit: "",
@@ -213,7 +221,8 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       ["sentence-transformers", deps.sentence_transformers],
       ["torch", deps.torch],
       ["faiss", deps.faiss],
-      ["langgraph", deps.langgraph]
+      ["langgraph", deps.langgraph],
+      ["llama-cpp", deps.llama_cpp]
     ] as Array<[string, unknown]>;
   });
 
@@ -294,6 +303,10 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     state.form.apiKey = String(saved.apiKey || "");
     state.form.cloudEnabled = Boolean(saved.cloud_enabled);
     state.form.rememberApi = Boolean(saved.remember_api);
+    state.form.smartIndexEnabled = Boolean(saved.smart_index_enabled);
+    state.form.smartIndexModelPath = String(saved.smart_index_model_path || state.form.smartIndexModelPath);
+    state.form.smartIndexEndpoint = String(saved.smart_index_endpoint || state.form.smartIndexEndpoint);
+    state.form.smartIndexMaxChapters = String(saved.smart_index_max_chapters || state.form.smartIndexMaxChapters);
   }
 
   function saveLocalPreferences() {
@@ -311,7 +324,11 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
         model: state.form.apiModel,
         apiKey: state.form.rememberApi ? state.form.apiKey : "",
         cloud_enabled: state.form.cloudEnabled,
-        remember_api: state.form.rememberApi
+        remember_api: state.form.rememberApi,
+        smart_index_enabled: state.form.smartIndexEnabled,
+        smart_index_model_path: state.form.smartIndexModelPath,
+        smart_index_endpoint: state.form.smartIndexEndpoint,
+        smart_index_max_chapters: state.form.smartIndexMaxChapters
       })
     );
     localStorage.removeItem(LEGACY_KEY);
@@ -799,7 +816,8 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
         entities: state.form.buildEntities,
         themes: state.form.buildThemes,
         overwrite: state.form.buildOverwrite,
-        source_name: state.importedBookSourceName
+        source_name: state.importedBookSourceName,
+        smart_index: smartIndexPayload()
       }
     );
     state.buildResult = `创建成功：${data.book.book_id}，章节 ${data.book.chapter_count}，实体 ${data.book.entities}，主题 ${data.book.themes}。`;
@@ -815,12 +833,24 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       `/api/books/${encodeURIComponent(state.currentBookId)}/rebuild`,
       {
         entities: state.form.buildEntities,
-        themes: state.form.buildThemes
+        themes: state.form.buildThemes,
+        smart_index: smartIndexPayload()
       }
     );
     state.buildResult = `重建完成：${data.book.book_id}，章节 ${data.book.chapter_count}，实体 ${data.book.entities}。`;
     await loadBooks(state.currentBookId);
     setStatus("结构化索引已重建。");
+  }
+
+  function smartIndexPayload() {
+    return {
+      enabled: state.form.smartIndexEnabled,
+      model_path: state.form.smartIndexModelPath,
+      endpoint: state.form.smartIndexEndpoint,
+      max_chapters: state.form.smartIndexMaxChapters ? Number(state.form.smartIndexMaxChapters) : 0,
+      n_ctx: 4096,
+      max_tokens: 2048
+    };
   }
 
   async function deleteCurrentBook() {

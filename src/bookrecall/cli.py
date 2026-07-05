@@ -26,8 +26,10 @@ from .entity_index import (
     load_entity_lexicon,
     load_theme_lexicon,
 )
+from .local_llm import LocalChatClient, LocalLLMSettings
 from .parser import parse_chapters
 from .retrieval import LocalRetriever
+from .smart_index import build_smart_relation_event_records, discover_entities_with_llm
 from .storage import BookRecallStore
 from .web import run_server
 
@@ -39,14 +41,35 @@ def build_index(args: argparse.Namespace) -> None:
     title = args.title or source_path.stem
 
     parent_chunks, child_chunks = build_chunk_hierarchy(args.book_id, chapters, DEFAULT_CHUNK_SETTINGS)
+    smart_client = _make_smart_index_client(args)
     entity_names = load_entity_lexicon(args.entities)
     if not entity_names:
         entity_names = auto_discover_entities(text)
+    if smart_client is not None:
+        entity_names = discover_entities_with_llm(
+            chapters,
+            smart_client,
+            seed_entities=entity_names,
+            max_chapters=args.smart_index_max_chapters or 0,
+        )
     entity_records = build_entity_records(chapters, entity_names, DEFAULT_CHUNK_SETTINGS)
-    relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
     theme_names = auto_discover_themes(text, extra_terms=load_theme_lexicon(args.themes))
     theme_records = build_theme_records(chapters, theme_names, DEFAULT_CHUNK_SETTINGS)
-    event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+    if smart_client is not None:
+        relation_records, event_records = build_smart_relation_event_records(
+            chapters,
+            entity_records,
+            DEFAULT_CHUNK_SETTINGS,
+            smart_client,
+            max_chapters=args.smart_index_max_chapters or 0,
+        )
+        if not relation_records:
+            relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+        if not event_records:
+            event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+    else:
+        relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
+        event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
 
     store = BookRecallStore(args.db)
     try:
@@ -71,6 +94,19 @@ def build_index(args: argparse.Namespace) -> None:
         f"parent_chunks={len(parent_chunks)}，child_chunks={len(child_chunks)}，"
         f"实体数={len(entity_records)}，关系数={len(relation_records)}，"
         f"主题数={len(theme_records)}，事件数={len(event_records)}"
+    )
+
+
+def _make_smart_index_client(args: argparse.Namespace) -> LocalChatClient | None:
+    if not getattr(args, "smart_index", False):
+        return None
+    return LocalChatClient(
+        LocalLLMSettings(
+            model_path=str(getattr(args, "smart_index_model", "") or ""),
+            endpoint=str(getattr(args, "smart_index_endpoint", "") or ""),
+            n_ctx=int(getattr(args, "smart_index_ctx", 4096) or 4096),
+            max_tokens=int(getattr(args, "smart_index_max_tokens", 2048) or 2048),
+        )
     )
 
 
@@ -361,6 +397,12 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_cmd.add_argument("--entities", help="实体词表路径，每行一个实体")
     build_parser_cmd.add_argument("--themes", help="主题词表路径，格式同实体词表；不传时自动发现常见主题词")
     build_parser_cmd.add_argument("--encoding", default="utf-8", help="文本编码，默认 utf-8")
+    build_parser_cmd.add_argument("--smart-index", action="store_true", help="启用本地 LLM 智能实体/关系/事件索引")
+    build_parser_cmd.add_argument("--smart-index-model", default="", help="Qwen3 4bit GGUF 模型路径")
+    build_parser_cmd.add_argument("--smart-index-endpoint", default="", help="OpenAI-compatible 本地服务地址，例如 http://127.0.0.1:8080")
+    build_parser_cmd.add_argument("--smart-index-max-chapters", type=int, default=0, help="智能索引最多处理章节数；0 表示全部")
+    build_parser_cmd.add_argument("--smart-index-ctx", type=int, default=4096, help="本地 LLM 上下文长度")
+    build_parser_cmd.add_argument("--smart-index-max-tokens", type=int, default=2048, help="单次智能索引最大输出 token")
     build_parser_cmd.set_defaults(func=build_index)
 
     ask_parser_cmd = subparsers.add_parser("ask", help="针对书籍提问")

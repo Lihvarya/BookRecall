@@ -779,6 +779,14 @@ button {
   @apply h-4 w-4 accent-primary;
 }
 
+.smart-index-card {
+  @apply rounded-[24px] border border-primary/15 bg-gradient-to-br from-primarySoft/80 to-white/70 p-4 shadow-sm;
+}
+
+.smart-index-card p {
+  @apply mt-2 text-xs leading-6 text-muted;
+}
+
 @keyframes page-rise {
   from {
     opacity: 0;

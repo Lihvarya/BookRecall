@@ -260,7 +260,7 @@ def _tool_search_evidence(retriever: LocalRetriever) -> Tool:
     )
 
 
-def _tool_lookup_relations(store: BookRecallStore) -> Tool:
+def _tool_lookup_relations(store: BookRecallStore, retriever: Retriever) -> Tool:
     def run(state: AgentState, args: dict) -> dict:
         source = str(args.get("source_entity", "")).strip()
         target = str(args.get("target_entity", "")).strip()
@@ -271,6 +271,8 @@ def _tool_lookup_relations(store: BookRecallStore) -> Tool:
         if target:
             rows = store.get_relation_mentions(state.book_id, source, target, max_chapter=progress)
             relations = _relation_mentions_to_payload(rows)
+            if not relations:
+                relations = _relation_search_fallback(store, retriever, state.book_id, source, target, progress)
         else:
             rows = store.list_relations_for_entity(state.book_id, source, max_chapter=progress)
             relations = [
@@ -311,6 +313,68 @@ def _tool_lookup_relations(store: BookRecallStore) -> Tool:
         ),
         run=run,
     )
+
+
+def _relation_search_fallback(
+    store: BookRecallStore,
+    retriever: Retriever,
+    book_id: str,
+    source: str,
+    target: str,
+    progress: int,
+) -> list[dict]:
+    hits = retriever.search(book_id, f"{source} {target} 关系 互动", max_chapter=progress)
+    fragments: list[dict] = []
+    for hit in hits:
+        text = hit.child_text or hit.parent_text
+        if source not in text or target not in text:
+            continue
+        fragments.append(
+            {
+                "chapter_number": hit.chapter_number,
+                "excerpt": text,
+            }
+        )
+        if len(fragments) >= 3:
+            break
+    if not fragments:
+        source_mentions = store.get_entity_mentions(book_id, source, max_chapter=progress)
+        target_mentions = store.get_entity_mentions(book_id, target, max_chapter=progress)
+        for left in source_mentions:
+            for right in target_mentions:
+                if int(left["chapter_number"]) != int(right["chapter_number"]):
+                    continue
+                if abs(int(left["position_in_chapter"]) - int(right["position_in_chapter"])) > 220:
+                    continue
+                excerpt = str(left["excerpt"])
+                if target not in excerpt:
+                    excerpt = str(right["excerpt"])
+                fragments.append(
+                    {
+                        "chapter_number": int(left["chapter_number"]),
+                        "excerpt": excerpt,
+                    }
+                )
+                break
+            if len(fragments) >= 3:
+                break
+        if not fragments:
+            return []
+    return [
+        {
+            "source_entity": source,
+            "target_entity": target,
+            "relation_type": "检索证据/待确认",
+            "first_chapter_number": min(int(item["chapter_number"]) for item in fragments),
+            "mention_count": len(fragments),
+            "fragments": fragments,
+            "stages": _relation_stages(fragments),
+            "evolution_summary": (
+                f"结构化关系索引尚未确认 {source} 与 {target} 的关系；"
+                "以下是召回层找到的同场证据，建议重建智能索引后再固定进图谱。"
+            ),
+        }
+    ]
 
 
 def _relation_mentions_to_payload(rows) -> list[dict]:
@@ -685,7 +749,7 @@ def build_default_registry(store: BookRecallStore, retriever: Retriever) -> Tool
     registry = ToolRegistry()
     registry.register(_tool_lookup_first_appearance(store))
     registry.register(_tool_lookup_timeline(store))
-    registry.register(_tool_lookup_relations(store))
+    registry.register(_tool_lookup_relations(store, retriever))
     registry.register(_tool_search_theme(store))
     registry.register(_tool_search_events(store))
     registry.register(_tool_search_evidence(retriever))

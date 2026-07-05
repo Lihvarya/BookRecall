@@ -42,7 +42,9 @@ def dependency_report() -> dict[str, object]:
         "torch": importlib.util.find_spec("torch") is not None,
         "faiss": importlib.util.find_spec("faiss") is not None,
         "langgraph": importlib.util.find_spec("langgraph.graph") is not None,
+        "llama_cpp": importlib.util.find_spec("llama_cpp") is not None,
         "recommended_embedding_model": DEFAULT_EMBEDDING_SETTINGS.model_name,
+        "recommended_index_llm": "Qwen3-4B-Instruct-2507 4bit GGUF",
     }
 
 

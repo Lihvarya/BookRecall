@@ -22,7 +22,7 @@ const sessionHint = computed(() => {
 });
 
 const latestCurrentQuestion = computed(() => {
-  return orderedTurns.value.at(-1)?.question || activeSession.value?.last_question || "";
+  return orderedTurns.value[orderedTurns.value.length - 1]?.question || activeSession.value?.last_question || "";
 });
 
 const questionTemplates = [

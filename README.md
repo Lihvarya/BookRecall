@@ -159,11 +159,15 @@ Optional Cloud Layer
   - `faiss-cpu>=1.8.0`
 - `graph`
   - `langgraph>=0.2.0`
+- `local-llm`
+  - `llama-cpp-python>=0.2.90`
+  - 用于直接加载 Qwen3 4bit GGUF 模型做智能结构化索引
 - `full`
   - `numpy>=1.26.0`
   - `langgraph>=0.2.0`
   - `llama-index>=0.11.0`
   - `faiss-cpu>=1.8.0`
+  - `llama-cpp-python>=0.2.90`
   - `sentence-transformers>=3.0.0`
   - `streamlit>=1.36.0`
 
@@ -212,6 +216,40 @@ pip install -e .[embedding]
 ```bash
 pip install -e .[faiss,graph]
 ```
+
+### 安装本地 Qwen3 智能索引能力
+
+BookRecall 支持使用 `Qwen3-4B-Instruct-2507` 的 4bit GGUF 量化模型升级实体、关系和事件索引。
+
+推荐把模型文件放在：
+
+```powershell
+D:\BookRecall\models\llm\
+```
+
+如果要让 BookRecall 进程内直接加载 GGUF，需要安装可选依赖：
+
+```powershell
+pip install -e .[local-llm]
+```
+
+也可以不安装 `llama-cpp-python`，改用 llama.cpp server、LM Studio、Ollama/OpenAI-compatible 网关等本地服务，然后在网页端填写 endpoint，例如：
+
+```text
+http://127.0.0.1:8080
+```
+
+CLI 示例：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py build `
+  --book-id my_book `
+  --input D:\Books\my_book.txt `
+  --smart-index `
+  --smart-index-model D:\BookRecall\models\llm\qwen3-4b-instruct-2507-q4_k_m.gguf
+```
+
+智能索引会先用本地规则生成候选，再让 Qwen3 判断实体、关系和事件是否有证据，最后做 JSON 校验和实体名校验。没有明确证据的关系不会进入图谱。
 
 如果你在 Windows + NVIDIA GPU 上使用，也可以手动先装好适配你 CUDA 版本的 `torch`，再安装：
 
@@ -396,9 +434,11 @@ http://127.0.0.1:8000
 - 控制台偏好使用 `bookrecall.preferences`，旧版 `bookrecall.apiSettings` 会自动兼容读取。
 - `langgraph` 是可选依赖；当前本地 `.venv` 已安装时，Web 会显示 `LangGraph ReAct` 可用。未安装时会显示缺依赖，选择它提问会返回明确提示。
 - `faiss` 是可选向量后端；当前本地 `.venv` 已安装时，Web 会显示 `faiss` 可用，并可构建 FAISS 索引。未安装时选择 Auto/Numpy 仍可构建和检索向量索引。
+- `llama-cpp-python` 是可选本地 LLM 后端；缺失时仍可使用本地 OpenAI-compatible endpoint，或继续使用规则索引。
 - 网页端“导入书籍并建索引”不会自动下载 embedding 模型；它只构建 SQLite 本地结构化索引。
 - 如果要使用本地 embedding 检索，可以在网页端点击“构建当前书向量索引”，也可以继续用 CLI 的 `embed-build`。
 - 构建向量索引会加载本地 embedding 模型；如果本地缓存不存在，`sentence-transformers` 可能联网下载模型。
+- 网页端“启用 Qwen3 智能结构化索引”不会自动下载 Qwen3 模型；需要你先准备 GGUF 文件或启动本地模型服务。
 
 ### Web 前端结构
 

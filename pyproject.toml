@@ -24,12 +24,16 @@ faiss = [
 graph = [
   "langgraph>=0.2.0"
 ]
+local-llm = [
+  "llama-cpp-python>=0.2.90"
+]
 cloud = []
 full = [
   "numpy>=1.26.0",
   "langgraph>=0.2.0",
   "llama-index>=0.11.0",
   "faiss-cpu>=1.8.0",
+  "llama-cpp-python>=0.2.90",
   "sentence-transformers>=3.0.0",
   "streamlit>=1.36.0"
 ]
