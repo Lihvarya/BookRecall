@@ -38,6 +38,7 @@ class AgentState:
     matched_themes: list[str] = field(default_factory=list)
     primary_entity: str | None = None
     recent_turns: list[dict[str, object]] = field(default_factory=list)
+    user_preferences: dict[str, object] = field(default_factory=dict)
     evidence: list[EvidenceCard] = field(default_factory=list)
     spoiler_blocked: bool = False
     raw_hits: list[dict] = field(default_factory=list)

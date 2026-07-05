@@ -15,6 +15,10 @@ def render_text(card: MemoryCard) -> str:
     lines.append(f"结论：{card.answer}")
     if card.summary:
         lines.append(f"补充说明：{card.summary}")
+    if card.user_preferences:
+        preference_text = _format_preferences(card.user_preferences)
+        if preference_text:
+            lines.append(f"已应用偏好：{preference_text}")
     if card.evidence:
         lines.append("证据定位：")
         lines.extend(
@@ -46,8 +50,23 @@ def to_payload(card: MemoryCard) -> dict[str, object]:
             for item in card.evidence
         ],
         "suggestions": card.suggestions,
+        "user_preferences": card.user_preferences,
     }
 
 
 def render_json(card: MemoryCard) -> str:
     return json.dumps(to_payload(card), ensure_ascii=False, indent=2)
+
+
+def _format_preferences(preferences: dict[str, object]) -> str:
+    parts: list[str] = []
+    style = str(preferences.get("answer_style") or "").strip()
+    focus = str(preferences.get("focus") or "").strip()
+    custom = str(preferences.get("custom_prompt") or "").strip()
+    if style:
+        parts.append(f"风格={style}")
+    if focus:
+        parts.append(f"关注={focus}")
+    if custom:
+        parts.append(f"自定义={custom[:40]}")
+    return "；".join(parts)

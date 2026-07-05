@@ -10,6 +10,7 @@ const state = {
   importedBookText: "",
   importedBookSourceName: "",
   currentTurns: [],
+  currentSessions: [],
   entities: [],
   themes: []
 };
@@ -29,6 +30,10 @@ const els = {
   bookGroupInput: document.getElementById("bookGroupInput"),
   bookTagsInput: document.getElementById("bookTagsInput"),
   bookMetaResultPanel: document.getElementById("bookMetaResultPanel"),
+  answerStyleSelect: document.getElementById("answerStyleSelect"),
+  preferenceFocusInput: document.getElementById("preferenceFocusInput"),
+  preferenceCustomInput: document.getElementById("preferenceCustomInput"),
+  preferencesResultPanel: document.getElementById("preferencesResultPanel"),
   booksPanel: document.getElementById("booksPanel"),
   statsPanel: document.getElementById("statsPanel"),
   entitiesPanel: document.getElementById("entitiesPanel"),
@@ -36,6 +41,10 @@ const els = {
   eventsPanel: document.getElementById("eventsPanel"),
   relationsPanel: document.getElementById("relationsPanel"),
   chaptersPanel: document.getElementById("chaptersPanel"),
+  sessionListPanel: document.getElementById("sessionListPanel"),
+  compareLeftSessionSelect: document.getElementById("compareLeftSessionSelect"),
+  compareRightSessionSelect: document.getElementById("compareRightSessionSelect"),
+  sessionComparePanel: document.getElementById("sessionComparePanel"),
   sessionPanel: document.getElementById("sessionPanel"),
   tracePanel: document.getElementById("tracePanel"),
   answerCard: document.getElementById("answerCard"),
@@ -192,7 +201,8 @@ function renderModels(runtime) {
     ["numpy", deps.numpy],
     ["sentence-transformers", deps.sentence_transformers],
     ["torch", deps.torch],
-    ["faiss", deps.faiss]
+    ["faiss", deps.faiss],
+    ["langgraph", deps.langgraph]
   ].map(([name, ok]) => `
     <div class="mini-card">
       <strong>${escapeHtml(name)}</strong>
@@ -330,6 +340,7 @@ function renderChapters(chapters) {
 
 function renderSession(turns) {
   if (!turns || !turns.length) {
+    state.currentTurns = [];
     els.sessionPanel.innerHTML = '<div class="empty">当前会话还没有历史记录。</div>';
     return;
   }
@@ -346,6 +357,8 @@ function renderSession(turns) {
       ${turn.summary ? `<div class="muted tiny">${escapeHtml(turn.summary)}</div>` : ""}
       <div class="inline-actions">
         <button class="ghost tiny" type="button" data-session-action="reask" data-turn-id="${escapeHtml(turn.turn_id || "")}" data-question="${escapeHtml(turn.question || "")}">重新提问</button>
+        <button class="ghost tiny" type="button" data-session-action="rerun" data-turn-id="${escapeHtml(turn.turn_id || "")}" data-question="${escapeHtml(turn.question || "")}">从此重算</button>
+        <button class="ghost tiny" type="button" data-session-action="branch" data-turn-id="${escapeHtml(turn.turn_id || "")}" data-question="${escapeHtml(turn.question || "")}">新建分支</button>
         <button class="ghost tiny" type="button" data-session-action="trace" data-turn-id="${escapeHtml(turn.turn_id || "")}">查看轨迹</button>
         <button class="ghost tiny" type="button" data-session-action="edit" data-turn-id="${escapeHtml(turn.turn_id || "")}" data-question="${escapeHtml(turn.question || "")}" data-answer="${escapeHtml(turn.answer || "")}" data-summary="${escapeHtml(turn.summary || "")}">编辑保存</button>
         <button class="ghost tiny danger-action" type="button" data-session-action="delete" data-turn-id="${escapeHtml(turn.turn_id || "")}">删除此轮</button>
@@ -357,12 +370,176 @@ function renderSession(turns) {
   });
 }
 
+function renderSessionList(sessions) {
+  state.currentSessions = sessions || [];
+  if (!sessions || !sessions.length) {
+    renderSessionCompareOptions([]);
+    els.sessionListPanel.innerHTML = '<div class="empty tiny">当前书籍还没有会话历史。提问后会自动出现在这里。</div>';
+    return;
+  }
+  renderSessionCompareOptions(sessions);
+  els.sessionListPanel.innerHTML = sessions.map((session) => {
+    const active = session.session_id === state.currentSessionId;
+    const lastQuestion = session.last_question || "暂无问题";
+    const lastAnswer = session.last_summary || session.last_answer || "";
+    return `
+      <button class="session-item ${active ? "active" : ""}" type="button" data-session-id="${escapeHtml(session.session_id)}">
+        <div class="pill-row">
+          <span class="pill ${active ? "ready" : ""}">${active ? "当前" : "会话"}</span>
+          <span class="pill">${escapeHtml(session.turn_count || 0)} 轮</span>
+          <span class="pill">最近第 ${escapeHtml(session.last_turn_index || 0)} 轮</span>
+        </div>
+        <strong>${escapeHtml(session.session_id)}</strong>
+        <div class="muted tiny">问：${escapeHtml(lastQuestion.slice(0, 70))}${lastQuestion.length > 70 ? "..." : ""}</div>
+        ${lastAnswer ? `<div class="muted tiny">答：${escapeHtml(lastAnswer.slice(0, 70))}${lastAnswer.length > 70 ? "..." : ""}</div>` : ""}
+        <div class="muted mono">${escapeHtml(session.updated_at || "")}</div>
+      </button>
+    `;
+  }).join("");
+  els.sessionListPanel.querySelectorAll("[data-session-id]").forEach((item) => {
+    item.addEventListener("click", async () => {
+      state.currentSessionId = item.dataset.sessionId || "default-session";
+      els.sessionInput.value = state.currentSessionId;
+      saveLocalPreferences();
+      await loadBookDetails();
+      setStatus(`已切换到会话：${state.currentSessionId}`);
+    });
+  });
+}
+
+function renderSessionCompareOptions(sessions) {
+  const options = (sessions || []).map((session) => (
+    `<option value="${escapeHtml(session.session_id)}">${escapeHtml(session.session_id)} · ${escapeHtml(session.turn_count || 0)} 轮</option>`
+  )).join("");
+  els.compareLeftSessionSelect.innerHTML = options;
+  els.compareRightSessionSelect.innerHTML = options;
+  if (!sessions || !sessions.length) {
+    els.sessionComparePanel.innerHTML = '<div class="empty tiny">暂无可对比会话。</div>';
+    return;
+  }
+  const sessionIds = sessions.map((session) => session.session_id);
+  const currentIndex = Math.max(0, sessionIds.indexOf(state.currentSessionId));
+  const fallbackRight = sessionIds.find((id) => id !== state.currentSessionId) || sessionIds[0];
+  els.compareLeftSessionSelect.value = sessionIds.includes(els.compareLeftSessionSelect.value)
+    ? els.compareLeftSessionSelect.value
+    : sessionIds[currentIndex];
+  els.compareRightSessionSelect.value = sessionIds.includes(els.compareRightSessionSelect.value)
+    ? els.compareRightSessionSelect.value
+    : fallbackRight;
+}
+
+function renderTurnDiffList(turns, label) {
+  if (!turns || !turns.length) {
+    return `<div class="empty tiny">${escapeHtml(label)}没有独有轮次。</div>`;
+  }
+  return turns.map((turn) => `
+    <div class="turn-diff-item">
+      <span class="pill">第 ${escapeHtml(turn.turn_index)} 轮</span>
+      ${turn.entity_name ? `<span class="pill">实体：${escapeHtml(turn.entity_name)}</span>` : ""}
+      <p><strong>问：</strong>${escapeHtml(turn.question || "")}</p>
+      <p><strong>答：</strong>${escapeHtml((turn.answer || "").slice(0, 140))}${(turn.answer || "").length > 140 ? "..." : ""}</p>
+    </div>
+  `).join("");
+}
+
+function renderSessionComparison(comparison) {
+  if (!comparison) {
+    els.sessionComparePanel.innerHTML = '<div class="empty tiny">暂无会话对比结果。</div>';
+    return;
+  }
+  const leftLabel = comparison.left_session_id || "左侧会话";
+  const rightLabel = comparison.right_session_id || "右侧会话";
+  els.sessionComparePanel.innerHTML = `
+    <div class="compare-summary">
+      <strong>${escapeHtml(comparison.summary || "分支对比完成。")}</strong>
+      <div class="pill-row">
+        <span class="pill ready">共同前缀 ${escapeHtml(comparison.common_prefix_turns || 0)} 轮</span>
+        <span class="pill">分歧点：第 ${escapeHtml(comparison.divergence_turn || 1)} 轮</span>
+        <span class="pill">${escapeHtml(leftLabel)}：${escapeHtml(comparison.left_turn_count || 0)} 轮</span>
+        <span class="pill">${escapeHtml(rightLabel)}：${escapeHtml(comparison.right_turn_count || 0)} 轮</span>
+      </div>
+      <div class="grid-two">
+        <div class="mini-card">
+          <strong>${escapeHtml(leftLabel)} 独有</strong>
+          <div class="muted tiny">实体：${escapeHtml((comparison.left_entities || []).join("、") || "无")}</div>
+          <div class="muted tiny">工具：${escapeHtml((comparison.left_tools || []).join("、") || "无")}</div>
+        </div>
+        <div class="mini-card">
+          <strong>${escapeHtml(rightLabel)} 独有</strong>
+          <div class="muted tiny">实体：${escapeHtml((comparison.right_entities || []).join("、") || "无")}</div>
+          <div class="muted tiny">工具：${escapeHtml((comparison.right_tools || []).join("、") || "无")}</div>
+        </div>
+      </div>
+      <div class="muted tiny">共同实体：${escapeHtml((comparison.shared_entities || []).join("、") || "无")} · 共同工具：${escapeHtml((comparison.shared_tools || []).join("、") || "无")}</div>
+    </div>
+    <div class="grid-two">
+      <div class="diff-column">
+        <span class="label">${escapeHtml(leftLabel)} 的独有轮次</span>
+        ${renderTurnDiffList(comparison.left_unique_turns || [], leftLabel)}
+      </div>
+      <div class="diff-column">
+        <span class="label">${escapeHtml(rightLabel)} 的独有轮次</span>
+        ${renderTurnDiffList(comparison.right_unique_turns || [], rightLabel)}
+      </div>
+    </div>
+  `;
+}
+
+function summarizeTrace(trace) {
+  const items = trace || [];
+  const toolCounts = {};
+  let totalHits = 0;
+  let spoilerBlocks = 0;
+  for (const item of items) {
+    const tool = item.tool_name || "unknown";
+    toolCounts[tool] = (toolCounts[tool] || 0) + 1;
+    totalHits += Number(item.hit_count || 0);
+    if (item.spoiler_blocked) {
+      spoilerBlocks += 1;
+    }
+  }
+  return {
+    steps: items.length,
+    totalHits,
+    spoilerBlocks,
+    toolCounts,
+    path: items.map((item) => item.tool_name || "unknown")
+  };
+}
+
+function renderTraceSummary(trace) {
+  const summary = summarizeTrace(trace);
+  const toolBadges = Object.entries(summary.toolCounts).map(([tool, count]) => (
+    `<span class="pill">${escapeHtml(tool)} x${escapeHtml(count)}</span>`
+  )).join("");
+  const path = summary.path.length
+    ? summary.path.map((tool, index) => `
+        <span class="trace-node">
+          <span class="mono">step ${index + 1}</span>
+          <strong>${escapeHtml(tool)}</strong>
+        </span>
+      `).join('<span class="trace-arrow">→</span>')
+    : '<span class="muted tiny">暂无工具路径</span>';
+  return `
+    <div class="trace-summary">
+      <div class="pill-row">
+        <span class="pill ready">工具步数 ${escapeHtml(summary.steps)}</span>
+        <span class="pill">总命中 ${escapeHtml(summary.totalHits)}</span>
+        <span class="pill ${summary.spoilerBlocks ? "warn" : ""}">防剧透 ${escapeHtml(summary.spoilerBlocks)}</span>
+        <span class="pill">耗时：未采集</span>
+      </div>
+      <div class="trace-path">${path}</div>
+      <div class="pill-row">${toolBadges || '<span class="pill">暂无工具调用</span>'}</div>
+    </div>
+  `;
+}
+
 function renderTrace(trace) {
   if (!trace || !trace.length) {
     els.tracePanel.innerHTML = '<div class="empty">提问后会显示本轮工具调用轨迹。</div>';
     return;
   }
-  els.tracePanel.innerHTML = trace.map((item) => `
+  const detailHtml = trace.map((item) => `
     <div class="trace-item">
       <div class="pill-row">
         <span class="pill">step ${escapeHtml(item.step)}</span>
@@ -378,6 +555,26 @@ function renderTrace(trace) {
       <div class="muted">${escapeHtml(item.observation_summary || "")}</div>
     </div>
   `).join("");
+  els.tracePanel.innerHTML = `${renderTraceSummary(trace)}${detailHtml}`;
+}
+
+function renderAppliedPreferences(preferences) {
+  if (!preferences || !Object.keys(preferences).length) {
+    return "";
+  }
+  const parts = [];
+  if (preferences.answer_style) {
+    parts.push(`风格：${preferences.answer_style}`);
+  }
+  if (preferences.focus) {
+    parts.push(`关注：${preferences.focus}`);
+  }
+  if (preferences.custom_prompt) {
+    parts.push(`自定义：${preferences.custom_prompt}`);
+  }
+  return parts.length
+    ? `<div class="pill-row"><span class="pill ready">已应用长期偏好</span>${parts.map((part) => `<span class="pill">${escapeHtml(part)}</span>`).join("")}</div>`
+    : "";
 }
 
 function renderAnswer(card) {
@@ -411,6 +608,7 @@ function renderAnswer(card) {
     </div>
     <p class="answer-text">${escapeHtml(card.answer)}</p>
     ${card.summary ? `<p class="muted">${escapeHtml(card.summary)}</p>` : ""}
+    ${renderAppliedPreferences(card.user_preferences || {})}
     <div class="section"><span class="label">证据定位</span>${evidenceHtml}</div>
     ${suggestionsHtml}
     <details class="section">
@@ -761,6 +959,58 @@ async function searchEvidenceFromPanel() {
   setStatus("召回层检索完成。");
 }
 
+async function loadSessionList() {
+  if (!state.currentBookId) {
+    renderSessionList([]);
+    return;
+  }
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/sessions?user=${encodeURIComponent(state.currentUserId)}&limit=50`);
+  renderSessionList(data.sessions || []);
+}
+
+async function compareSessionsFromPanel() {
+  if (!state.currentBookId) {
+    setStatus("请先选择一本书。");
+    return;
+  }
+  const left = els.compareLeftSessionSelect.value;
+  const right = els.compareRightSessionSelect.value;
+  if (!left || !right || left === right) {
+    setStatus("请选择两个不同的会话进行对比。");
+    return;
+  }
+  els.sessionComparePanel.innerHTML = '<div class="empty tiny">正在对比分支差异...</div>';
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/sessions/compare?user=${encodeURIComponent(state.currentUserId)}&left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}&limit=100`);
+  renderSessionComparison(data.comparison || {});
+  setStatus(`已对比 ${left} 与 ${right}。`);
+}
+
+function applyUserPreferences(preferences) {
+  const data = preferences || {};
+  els.answerStyleSelect.value = data.answer_style || "";
+  els.preferenceFocusInput.value = data.focus || "";
+  els.preferenceCustomInput.value = data.custom_prompt || "";
+  els.preferencesResultPanel.textContent = data.updated_at ? `上次更新：${data.updated_at}` : "尚未保存长期偏好。";
+}
+
+async function saveUserPreferences() {
+  if (!state.currentBookId) {
+    setStatus("请先选择一本书。");
+    return;
+  }
+  const data = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/preferences`, {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: state.currentUserId,
+      answer_style: els.answerStyleSelect.value,
+      focus: els.preferenceFocusInput.value,
+      custom_prompt: els.preferenceCustomInput.value
+    })
+  });
+  applyUserPreferences(data.preferences || {});
+  setStatus("长期回答偏好已保存。");
+}
+
 async function loadBooks(preferredBookId = "") {
   const [booksData, runtime] = await Promise.all([
     requestJson("/api/books"),
@@ -813,11 +1063,13 @@ async function loadBookDetails() {
     `;
   els.bookGroupInput.value = book.book_group || "";
   els.bookTagsInput.value = (book.tags || []).join(", ");
-  const [entitiesData, chaptersData, progressData, sessionData, statsData, themesData, eventsData, relationsData] = await Promise.all([
+  const [entitiesData, chaptersData, progressData, preferencesData, sessionData, sessionsData, statsData, themesData, eventsData, relationsData] = await Promise.all([
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/entities`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/chapters?limit=60`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/progress?user=${encodeURIComponent(state.currentUserId)}`),
+    requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/preferences?user=${encodeURIComponent(state.currentUserId)}`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session?user=${encodeURIComponent(state.currentUserId)}&session=${encodeURIComponent(state.currentSessionId)}&limit=50`),
+    requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/sessions?user=${encodeURIComponent(state.currentUserId)}&limit=50`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/stats`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/themes`),
     requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/events?limit=20`),
@@ -831,7 +1083,9 @@ async function loadBookDetails() {
   renderEvents(eventsData.events || []);
   renderRelations(relationsData.relations || []);
   renderChapters(chaptersData.chapters || []);
+  applyUserPreferences(preferencesData.preferences || {});
   renderSession(sessionData.turns || []);
+  renderSessionList(sessionsData.sessions || []);
   renderTrace([]);
   els.progressInput.value = progressData.progress_chapter || progressData.max_chapter || "";
   setStatus(`已加载《${book.title}》。`);
@@ -906,6 +1160,7 @@ async function askQuestion() {
     body: JSON.stringify(payload)
   });
   renderAnswer(card);
+  await loadSessionList();
   setStatus("完成。");
 }
 
@@ -930,6 +1185,58 @@ async function handleSessionAction(btn) {
     }
     renderTrace(turn.trace || []);
     setStatus(`已回放第 ${turn.turn_index} 轮工具轨迹。`);
+    return;
+  }
+  if (action === "rerun") {
+    const question = window.prompt("从这一轮开始重算。可先修改问题：", btn.dataset.question || "");
+    if (question === null) return;
+    if (!window.confirm("这会删除该轮及其后续会话历史，然后用这个问题重新提问。继续吗？")) {
+      return;
+    }
+    setStatus("正在从历史轮次重新生成会话分支...");
+    const card = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session/turns/${encodeURIComponent(turnId)}`, {
+      method: "POST",
+      body: JSON.stringify({
+        operation: "rerun",
+        user_id: state.currentUserId,
+        session_id: state.currentSessionId,
+        question,
+        progress_chapter: els.progressInput.value ? Number(els.progressInput.value) : null,
+        agent_policy: els.policySelect.value,
+        retriever: els.retrieverSelect.value,
+        cloud_config: buildCloudConfig()
+      })
+    });
+    renderAnswer(card);
+    await loadSessionList();
+    setStatus(`已从第 ${card.rerun?.from_turn_index || ""} 轮重算，删除后续 ${card.rerun?.deleted_turns || 0} 轮并生成新回答。`);
+    return;
+  }
+  if (action === "branch") {
+    const question = window.prompt("创建新会话分支。可先修改这一轮问题：", btn.dataset.question || "");
+    if (question === null) return;
+    setStatus("正在创建新的会话分支...");
+    const card = await requestJson(`/api/books/${encodeURIComponent(state.currentBookId)}/session/turns/${encodeURIComponent(turnId)}`, {
+      method: "POST",
+      body: JSON.stringify({
+        operation: "branch",
+        user_id: state.currentUserId,
+        session_id: state.currentSessionId,
+        question,
+        progress_chapter: els.progressInput.value ? Number(els.progressInput.value) : null,
+        agent_policy: els.policySelect.value,
+        retriever: els.retrieverSelect.value,
+        cloud_config: buildCloudConfig()
+      })
+    });
+    const targetSession = card.branch?.target_session_id;
+    if (targetSession) {
+      state.currentSessionId = targetSession;
+      els.sessionInput.value = targetSession;
+    }
+    renderAnswer(card);
+    await loadSessionList();
+    setStatus(`已创建新分支：${targetSession || "未命名分支"}。原会话未修改。`);
     return;
   }
   if (action === "delete") {
@@ -999,6 +1306,15 @@ els.buildTextInput.addEventListener("input", () => {
   }
 });
 document.getElementById("saveProgressBtn").addEventListener("click", () => saveProgress().catch((err) => setStatus(err.message)));
+document.getElementById("refreshSessionsBtn").addEventListener("click", () => loadSessionList().catch((err) => setStatus(err.message)));
+document.getElementById("compareSessionsBtn").addEventListener("click", () => compareSessionsFromPanel().catch((err) => {
+  els.sessionComparePanel.innerHTML = `<div class="empty tiny">${escapeHtml(err.message)}</div>`;
+  setStatus(err.message);
+}));
+document.getElementById("savePreferencesBtn").addEventListener("click", () => saveUserPreferences().catch((err) => {
+  els.preferencesResultPanel.textContent = err.message;
+  setStatus(err.message);
+}));
 document.getElementById("saveBookMetaBtn").addEventListener("click", () => saveBookMetadata().catch((err) => {
   els.bookMetaResultPanel.textContent = err.message;
   setStatus(err.message);

@@ -130,3 +130,4 @@ class MemoryCard:
     summary: str | None = None
     evidence: list[EvidenceCard] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
+    user_preferences: dict[str, object] = field(default_factory=dict)

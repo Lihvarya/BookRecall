@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 from unittest.mock import patch
+import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -142,6 +143,10 @@ class BookRecallWebTest(unittest.TestCase):
     def test_runtime_endpoint(self) -> None:
         data = self._get_json("/api/runtime")
         self.assertIn("dependencies", data)
+        self.assertIn("faiss", data["dependencies"])
+        self.assertIn("langgraph", data["dependencies"])
+        self.assertEqual(data["dependencies"]["faiss"], importlib.util.find_spec("faiss") is not None)
+        self.assertEqual(data["dependencies"]["langgraph"], importlib.util.find_spec("langgraph.graph") is not None)
         self.assertIn("model_cache_dir", data)
         self.assertIn("vector_indexes", data)
         providers = data["cloud"]["providers"]
@@ -151,6 +156,8 @@ class BookRecallWebTest(unittest.TestCase):
         policy_ids = [item["id"] for item in data["agent_policies"]]
         self.assertIn("rule_based", policy_ids)
         self.assertIn("langgraph", policy_ids)
+        langgraph_policy = next(item for item in data["agent_policies"] if item["id"] == "langgraph")
+        self.assertEqual(langgraph_policy["ready"], data["dependencies"]["langgraph"])
 
     def test_stats_themes_events_and_relations_endpoints(self) -> None:
         stats = self._get_json("/api/books/sample/stats")
@@ -187,6 +194,37 @@ class BookRecallWebTest(unittest.TestCase):
         sample = next(item for item in books["books"] if item["book_id"] == "sample")
         self.assertEqual(sample["book_group"], "测试分组")
         self.assertIn("重点", sample["tags"])
+
+    def test_user_preferences_endpoint_and_ask_payload(self) -> None:
+        saved = self._post_json(
+            "/api/books/sample/preferences",
+            {
+                "user_id": "alice",
+                "answer_style": "brief",
+                "focus": "人物关系和伏笔",
+                "custom_prompt": "先给章节定位，再给一句话解释。",
+            },
+        )
+        preferences = saved["preferences"]
+        self.assertEqual(preferences["answer_style"], "brief")
+        self.assertEqual(preferences["focus"], "人物关系和伏笔")
+
+        loaded = self._get_json("/api/books/sample/preferences?user=alice")
+        self.assertEqual(loaded["preferences"]["custom_prompt"], "先给章节定位，再给一句话解释。")
+
+        answer = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "question": "黑袍人后来还有出现过吗？",
+                "agent_policy": "rule_based",
+                "retriever": "lexical",
+            },
+        )
+        self.assertEqual(answer["user_preferences"]["answer_style"], "brief")
+        self.assertEqual(answer["user_preferences"]["focus"], "人物关系和伏笔")
+        self.assertIn("已应用偏好", answer["rendered_text"])
 
     def test_build_book_endpoint_from_pasted_text(self) -> None:
         created = self._post_json(
@@ -379,6 +417,106 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("turn_id", second["session"]["turns"][0])
         self.assertTrue(second["trace"])
 
+    def test_rerun_session_from_turn_replaces_following_turns(self) -> None:
+        first = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "branch-1",
+                "question": "黑袍人第一次出现在哪一章？",
+            },
+        )
+        self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "branch-1",
+                "question": "后来还有出现过吗？",
+            },
+        )
+        first_turn_id = first["session"]["turns"][0]["turn_id"]
+
+        rerun = self._post_json(
+            f"/api/books/sample/session/turns/{first_turn_id}",
+            {
+                "operation": "rerun",
+                "user_id": "alice",
+                "session_id": "branch-1",
+                "question": "星辰之匙第一次出现在哪一章？",
+                "agent_policy": "rule_based",
+                "retriever": "lexical",
+            },
+        )
+        self.assertEqual(rerun["rerun"]["deleted_turns"], 2)
+        self.assertEqual(rerun["rerun"]["from_turn_index"], 1)
+        self.assertEqual(rerun["entity_name"], "星辰之匙")
+        self.assertEqual(len(rerun["session"]["turns"]), 1)
+        self.assertEqual(rerun["session"]["turns"][0]["question"], "星辰之匙第一次出现在哪一章？")
+
+    def test_branch_session_from_turn_preserves_original_session(self) -> None:
+        first = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "branch-source",
+                "question": "黑袍人第一次出现在哪一章？",
+            },
+        )
+        self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "branch-source",
+                "question": "后来还有出现过吗？",
+            },
+        )
+        first_turn_id = first["session"]["turns"][0]["turn_id"]
+
+        branched = self._post_json(
+            f"/api/books/sample/session/turns/{first_turn_id}",
+            {
+                "operation": "branch",
+                "user_id": "alice",
+                "session_id": "branch-source",
+                "target_session_id": "branch-target",
+                "question": "星辰之匙第一次出现在哪一章？",
+                "agent_policy": "rule_based",
+                "retriever": "lexical",
+            },
+        )
+        self.assertEqual(branched["branch"]["source_session_id"], "branch-source")
+        self.assertEqual(branched["branch"]["target_session_id"], "branch-target")
+        self.assertEqual(branched["branch"]["copied_turns"], 0)
+        self.assertEqual(branched["session"]["session_id"], "branch-target")
+        self.assertEqual(branched["session"]["turns"][0]["question"], "星辰之匙第一次出现在哪一章？")
+
+        original = self._get_json("/api/books/sample/session?user=alice&session=branch-source&limit=10")
+        self.assertEqual(len(original["turns"]), 2)
+
+        sessions = self._get_json("/api/books/sample/sessions?user=alice&limit=10")
+        session_ids = [item["session_id"] for item in sessions["sessions"]]
+        self.assertIn("branch-source", session_ids)
+        self.assertIn("branch-target", session_ids)
+        target = next(item for item in sessions["sessions"] if item["session_id"] == "branch-target")
+        self.assertEqual(target["turn_count"], 1)
+        self.assertEqual(target["last_question"], "星辰之匙第一次出现在哪一章？")
+
+        compared = self._get_json(
+            "/api/books/sample/sessions/compare?user=alice&left=branch-source&right=branch-target"
+        )
+        comparison = compared["comparison"]
+        self.assertEqual(comparison["left_session_id"], "branch-source")
+        self.assertEqual(comparison["right_session_id"], "branch-target")
+        self.assertEqual(comparison["common_prefix_turns"], 0)
+        self.assertEqual(len(comparison["left_unique_turns"]), 2)
+        self.assertEqual(len(comparison["right_unique_turns"]), 1)
+        self.assertIn("黑衣人", comparison["left_entities"])
+        self.assertIn("星辰之匙", comparison["right_entities"])
+
     def test_session_endpoint(self) -> None:
         self._post_json(
             "/api/ask",
@@ -446,6 +584,11 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("书籍分组与标签", html)
         self.assertIn("Agent 执行策略", html)
         self.assertIn("保存控制台偏好", html)
+        self.assertIn("会话与分支", html)
+        self.assertIn("刷新会话列表", html)
+        self.assertIn("对比分支差异", html)
+        self.assertIn("长期回答偏好", html)
+        self.assertIn("保存长期偏好", html)
 
     def test_static_assets(self) -> None:
         with urllib.request.urlopen(f"{self.base_url}/assets/app.css") as response:
@@ -454,6 +597,8 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("--primary", css)
         self.assertIn(".answer-card", css)
         self.assertIn(".chapter-reader", css)
+        self.assertIn(".trace-summary", css)
+        self.assertIn(".trace-path", css)
 
         with urllib.request.urlopen(f"{self.base_url}/assets/app.js") as response:
             js = response.read().decode("utf-8")
@@ -465,15 +610,34 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertIn("bookrecall.preferences", js)
         self.assertIn("bookrecall.apiSettings", js)
         self.assertIn("saveLocalPreferences", js)
+        self.assertIn("saveUserPreferences", js)
+        self.assertIn("renderAppliedPreferences", js)
+        self.assertIn("/preferences?user=", js)
         self.assertIn("policySelect", js)
+        self.assertIn('["langgraph", deps.langgraph]', js)
         self.assertIn("readSelectedBookFile", js)
         self.assertIn("importedBookText", js)
         self.assertNotIn("els.buildTextInput.value = text", js)
         self.assertIn("deleteCurrentBook", js)
         self.assertIn("deleteCurrentVectorIndex", js)
         self.assertIn("handleSessionAction", js)
+        self.assertIn("renderSessionList", js)
+        self.assertIn("renderSessionComparison", js)
+        self.assertIn("summarizeTrace", js)
+        self.assertIn("renderTraceSummary", js)
+        self.assertIn("compareSessionsFromPanel", js)
+        self.assertIn("/sessions?user=", js)
+        self.assertIn("/sessions/compare?user=", js)
+        self.assertIn("refreshSessionsBtn", js)
+        self.assertIn("compareSessionsBtn", js)
         self.assertIn("查看轨迹", js)
+        self.assertIn("从此重算", js)
+        self.assertIn("新建分支", js)
         self.assertIn("renderTrace(turn.trace || [])", js)
+        self.assertIn("工具步数", js)
+        self.assertIn("耗时：未采集", js)
+        self.assertIn('operation: "rerun"', js)
+        self.assertIn('operation: "branch"', js)
         self.assertIn("searchEvidenceFromPanel", js)
         self.assertIn("renderSearchResults", js)
 

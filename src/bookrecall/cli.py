@@ -274,6 +274,7 @@ def show_models(args: argparse.Namespace) -> None:
     print(f"- sentence-transformers：{'可用' if report['sentence_transformers'] else '缺失'}")
     print(f"- torch：{'可用' if report['torch'] else '缺失'}")
     print(f"- faiss：{'可用' if report['faiss'] else '缺失'}（当前实现可用 numpy 精确检索，不强制依赖 faiss）")
+    print(f"- langgraph：{'可用' if report['langgraph'] else '缺失'}（可选 Agent 图策略依赖）")
     print(f"- 推荐 embedding 模型：{report['recommended_embedding_model']}")
     print(f"- 默认向量索引目录：{vector_dir}")
     print(f"- model cache: {cache_dir}")

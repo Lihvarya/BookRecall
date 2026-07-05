@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -367,6 +368,34 @@ class BookRecallWebService:
         finally:
             store.close()
 
+    def get_user_preferences(self, book_id: str, user_id: str) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            return store.get_user_preferences(book_id, user_id)
+        finally:
+            store.close()
+
+    def set_user_preferences(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        answer_style: str = "",
+        focus: str = "",
+        custom_prompt: str = "",
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            return store.set_user_preferences(
+                book_id=book_id,
+                user_id=user_id,
+                answer_style=answer_style,
+                focus=focus,
+                custom_prompt=custom_prompt,
+            )
+        finally:
+            store.close()
+
     def get_chapter(self, book_id: str, chapter_number: int) -> dict[str, object]:
         store = self._open_store()
         try:
@@ -550,6 +579,73 @@ class BookRecallWebService:
             "turns": turns,
         }
 
+    def list_sessions(self, book_id: str, user_id: str, *, limit: int = 30) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            sessions = store.list_agent_sessions(book_id, user_id, limit=limit)
+        finally:
+            store.close()
+        return {
+            "book_id": book_id,
+            "user_id": user_id,
+            "sessions": sessions,
+        }
+
+    def compare_sessions(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        left_session_id: str,
+        right_session_id: str,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        if not left_session_id or not right_session_id:
+            raise ValueError("请选择两个要对比的会话。")
+        if left_session_id == right_session_id:
+            raise ValueError("请选择两个不同的会话进行对比。")
+        store = self._open_store()
+        try:
+            left_turns = store.list_agent_turns(book_id, user_id, left_session_id, limit=limit)
+            right_turns = store.list_agent_turns(book_id, user_id, right_session_id, limit=limit)
+        finally:
+            store.close()
+        if not left_turns:
+            raise ValueError(f"会话 {left_session_id} 没有可对比的历史。")
+        if not right_turns:
+            raise ValueError(f"会话 {right_session_id} 没有可对比的历史。")
+
+        common_prefix = _common_turn_prefix(left_turns, right_turns)
+        left_unique = left_turns[common_prefix:]
+        right_unique = right_turns[common_prefix:]
+        left_entities = _collect_turn_entities(left_turns)
+        right_entities = _collect_turn_entities(right_turns)
+        left_tools = _collect_trace_tools(left_turns)
+        right_tools = _collect_trace_tools(right_turns)
+        return {
+            "book_id": book_id,
+            "user_id": user_id,
+            "left_session_id": left_session_id,
+            "right_session_id": right_session_id,
+            "common_prefix_turns": common_prefix,
+            "divergence_turn": common_prefix + 1,
+            "left_turn_count": len(left_turns),
+            "right_turn_count": len(right_turns),
+            "left_unique_turns": left_unique,
+            "right_unique_turns": right_unique,
+            "left_entities": left_entities,
+            "right_entities": right_entities,
+            "shared_entities": sorted(set(left_entities) & set(right_entities)),
+            "left_tools": left_tools,
+            "right_tools": right_tools,
+            "shared_tools": sorted(set(left_tools) & set(right_tools)),
+            "summary": (
+                f"两个会话共有 {common_prefix} 轮相同前缀；"
+                f"{left_session_id} 独有 {len(left_unique)} 轮，"
+                f"{right_session_id} 独有 {len(right_unique)} 轮。"
+            ),
+        }
+
     def update_session_turn(
         self,
         *,
@@ -640,6 +736,114 @@ class BookRecallWebService:
             }
         finally:
             store.close()
+
+    def rerun_session_from_turn(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        session_id: str,
+        turn_id: int,
+        question: str | None = None,
+        progress_chapter: int | None = None,
+        retriever_mode: str = "lexical",
+        agent_policy: str = "auto",
+        cloud_config: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            turn = store.get_agent_turn(
+                turn_id=turn_id,
+                book_id=book_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if turn is None:
+                raise ValueError("没有找到要重算的对话轮次。")
+            deleted = store.delete_agent_turns_from(
+                turn_id=turn_id,
+                book_id=book_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        finally:
+            store.close()
+        answer = self.ask(
+            book_id=book_id,
+            question=(question or str(turn["question"])).strip(),
+            user_id=user_id,
+            session_id=session_id,
+            progress_chapter=progress_chapter,
+            retriever_mode=retriever_mode,
+            agent_policy=agent_policy,
+            cloud_config=cloud_config,
+        )
+        answer["rerun"] = {
+            "from_turn_id": turn_id,
+            "from_turn_index": turn["turn_index"],
+            "deleted_turns": deleted,
+            "question": question or str(turn["question"]),
+        }
+        return answer
+
+    def branch_session_from_turn(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        session_id: str,
+        turn_id: int,
+        question: str | None = None,
+        target_session_id: str | None = None,
+        progress_chapter: int | None = None,
+        retriever_mode: str = "lexical",
+        agent_policy: str = "auto",
+        cloud_config: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            turn = store.get_agent_turn(
+                turn_id=turn_id,
+                book_id=book_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if turn is None:
+                raise ValueError("没有找到要创建分支的对话轮次。")
+            prefix_turns = store.list_agent_turns_before(
+                turn_id=turn_id,
+                book_id=book_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            target_session = target_session_id or _branch_session_id(session_id, int(turn["turn_index"]))
+            copied = store.copy_agent_turns_to_session(
+                book_id=book_id,
+                user_id=user_id,
+                source_turns=prefix_turns,
+                target_session_id=target_session,
+            )
+        finally:
+            store.close()
+        answer = self.ask(
+            book_id=book_id,
+            question=(question or str(turn["question"])).strip(),
+            user_id=user_id,
+            session_id=target_session,
+            progress_chapter=progress_chapter,
+            retriever_mode=retriever_mode,
+            agent_policy=agent_policy,
+            cloud_config=cloud_config,
+        )
+        answer["branch"] = {
+            "source_session_id": session_id,
+            "target_session_id": target_session,
+            "from_turn_id": turn_id,
+            "from_turn_index": turn["turn_index"],
+            "copied_turns": copied,
+            "question": question or str(turn["question"]),
+        }
+        return answer
 
     def ask(
         self,
@@ -884,6 +1088,13 @@ class BookRecallHandler(BaseHTTPRequestHandler):
             self._send_json(self.service.get_progress(book_id, user_id))
             return
 
+        if path.startswith("/api/books/") and path.endswith("/preferences"):
+            book_id = path[len("/api/books/") : -len("/preferences")].strip("/")
+            query = parse_qs(parsed.query)
+            user_id = query.get("user", ["default"])[0]
+            self._send_json({"preferences": self.service.get_user_preferences(book_id, user_id)})
+            return
+
         if path.startswith("/api/books/") and path.endswith("/session"):
             book_id = path[len("/api/books/") : -len("/session")].strip("/")
             query = parse_qs(parsed.query)
@@ -895,6 +1106,42 @@ class BookRecallHandler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 10
             self._send_json(self.service.get_session_history(book_id, user_id, session_id, limit=limit))
+            return
+
+        if path.startswith("/api/books/") and path.endswith("/sessions/compare"):
+            book_id = path[len("/api/books/") : -len("/sessions/compare")].strip("/")
+            query = parse_qs(parsed.query)
+            user_id = query.get("user", ["default"])[0]
+            left_session_id = query.get("left", [""])[0].strip()
+            right_session_id = query.get("right", [""])[0].strip()
+            limit_raw = query.get("limit", ["100"])[0]
+            try:
+                limit = max(1, min(200, int(limit_raw)))
+            except ValueError:
+                limit = 100
+            self._send_json(
+                {
+                    "comparison": self.service.compare_sessions(
+                        book_id=book_id,
+                        user_id=user_id,
+                        left_session_id=left_session_id,
+                        right_session_id=right_session_id,
+                        limit=limit,
+                    )
+                }
+            )
+            return
+
+        if path.startswith("/api/books/") and path.endswith("/sessions"):
+            book_id = path[len("/api/books/") : -len("/sessions")].strip("/")
+            query = parse_qs(parsed.query)
+            user_id = query.get("user", ["default"])[0]
+            limit_raw = query.get("limit", ["30"])[0]
+            try:
+                limit = max(1, min(100, int(limit_raw)))
+            except ValueError:
+                limit = 30
+            self._send_json(self.service.list_sessions(book_id, user_id, limit=limit))
             return
 
         if path == "/health":
@@ -1023,6 +1270,25 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 self._send_json({"book": self.service.update_book_metadata(book_id, book_group=book_group, tags=tags)})
                 return
 
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/preferences"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/preferences")].strip("/")
+                user_id = str(payload.get("user_id", "default")).strip() or "default"
+                self._send_json(
+                    {
+                        "preferences": self.service.set_user_preferences(
+                            book_id=book_id,
+                            user_id=user_id,
+                            answer_style=str(payload.get("answer_style", "")),
+                            focus=str(payload.get("focus", "")),
+                            custom_prompt=str(payload.get("custom_prompt", "")),
+                        )
+                    }
+                )
+                return
+
             if parsed.path.startswith("/api/books/") and "/session/turns/" in parsed.path:
                 payload = self._read_json_body()
                 if payload is None:
@@ -1043,6 +1309,48 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                                 turn_id=turn_id,
                             )
                         }
+                    )
+                    return
+                if operation == "rerun":
+                    progress_raw = payload.get("progress_chapter")
+                    progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
+                    cloud_config = payload.get("cloud_config")
+                    if not isinstance(cloud_config, dict):
+                        cloud_config = None
+                    self._send_json(
+                        self.service.rerun_session_from_turn(
+                            book_id=book_id,
+                            user_id=user_id,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            question=str(payload.get("question", "")).strip() or None,
+                            progress_chapter=progress_chapter,
+                            retriever_mode=str(payload.get("retriever", "lexical")).strip() or "lexical",
+                            agent_policy=str(payload.get("agent_policy", "auto")).strip() or "auto",
+                            cloud_config=cloud_config,
+                        )
+                    )
+                    return
+                if operation == "branch":
+                    progress_raw = payload.get("progress_chapter")
+                    progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
+                    cloud_config = payload.get("cloud_config")
+                    if not isinstance(cloud_config, dict):
+                        cloud_config = None
+                    target_session_id = str(payload.get("target_session_id", "")).strip() or None
+                    self._send_json(
+                        self.service.branch_session_from_turn(
+                            book_id=book_id,
+                            user_id=user_id,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            question=str(payload.get("question", "")).strip() or None,
+                            target_session_id=target_session_id,
+                            progress_chapter=progress_chapter,
+                            retriever_mode=str(payload.get("retriever", "lexical")).strip() or "lexical",
+                            agent_policy=str(payload.get("agent_policy", "auto")).strip() or "auto",
+                            cloud_config=cloud_config,
+                        )
                     )
                     return
                 question = str(payload.get("question", "")).strip()
@@ -1195,3 +1503,44 @@ def _asset_root() -> Path:
 
 def _build_index_html() -> str:
     return (_asset_root() / "index.html").read_text(encoding="utf-8")
+
+
+def _branch_session_id(session_id: str, turn_index: int) -> str:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_session = "".join(char if char.isalnum() or char in ("-", "_") else "-" for char in session_id).strip("-")
+    return f"{safe_session or 'session'}-branch-t{turn_index}-{stamp}"
+
+
+def _common_turn_prefix(left_turns: list[dict[str, object]], right_turns: list[dict[str, object]]) -> int:
+    count = 0
+    for left, right in zip(left_turns, right_turns):
+        if str(left.get("question") or "") != str(right.get("question") or ""):
+            break
+        if str(left.get("answer") or "") != str(right.get("answer") or ""):
+            break
+        count += 1
+    return count
+
+
+def _collect_turn_entities(turns: list[dict[str, object]]) -> list[str]:
+    entities: list[str] = []
+    for turn in turns:
+        entity_name = turn.get("entity_name")
+        if entity_name:
+            entities.append(str(entity_name))
+        matched_entities = turn.get("matched_entities")
+        if isinstance(matched_entities, list):
+            entities.extend(str(item) for item in matched_entities if item)
+    return sorted(set(entities))
+
+
+def _collect_trace_tools(turns: list[dict[str, object]]) -> list[str]:
+    tools: list[str] = []
+    for turn in turns:
+        trace = turn.get("trace")
+        if not isinstance(trace, list):
+            continue
+        for item in trace:
+            if isinstance(item, dict) and item.get("tool_name"):
+                tools.append(str(item["tool_name"]))
+    return sorted(set(tools))

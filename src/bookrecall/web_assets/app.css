@@ -246,7 +246,7 @@ button.danger-action:hover {
   gap: 20px;
 }
 
-.status, .mini-card, .book-item, .entity-item, .evidence-item, .turn-item, .trace-item, .search-hit {
+.status, .mini-card, .book-item, .entity-item, .evidence-item, .turn-item, .trace-item, .trace-summary, .search-hit, .session-item, .turn-diff-item, .compare-summary {
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -255,7 +255,7 @@ button.danger-action:hover {
   transition: all 0.2s ease;
 }
 
-.book-item:hover, .entity-item:hover, .mini-card:hover, .turn-item:hover, .trace-item:hover, .evidence-item:hover, .search-hit:hover {
+.book-item:hover, .entity-item:hover, .mini-card:hover, .turn-item:hover, .trace-item:hover, .trace-summary:hover, .evidence-item:hover, .search-hit:hover, .session-item:hover, .turn-diff-item:hover {
   border-color: #d1d5db;
   box-shadow: var(--shadow-sm);
   transform: translateY(-1px);
@@ -274,13 +274,13 @@ button.danger-action:hover {
 }
 
 /* JS 生成容器的内部距 */
-.books, .entities, .chapters, .themes, .events, .relations, .model-list, .evidence, .suggestions, .turns, .trace-list, .search-results {
+.books, .entities, .chapters, .themes, .events, .relations, .model-list, .evidence, .suggestions, .turns, .trace-list, .search-results, .session-list, .session-compare, .diff-column {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
-.mini-card strong, .book-item strong, .entity-item strong {
+.mini-card strong, .book-item strong, .entity-item strong, .session-item strong {
   display: block;
   margin-bottom: 6px;
   font-size: 15px;
@@ -297,6 +297,49 @@ button.danger-action:hover {
 .muted { color: var(--text-muted); }
 .mono { font-family: var(--font-mono); font-size: 12px; }
 .tiny { font-size: 12px; line-height: 1.5; }
+
+.session-item {
+  width: 100%;
+  color: var(--text-main);
+  text-align: left;
+  box-shadow: none;
+}
+.session-item.active {
+  border-color: rgba(20, 184, 166, 0.55);
+  background: linear-gradient(180deg, #ecfdf5, var(--bg-panel));
+}
+.compare-summary {
+  background: linear-gradient(180deg, #f0fdfa, var(--bg-panel));
+}
+.turn-diff-item p {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.trace-summary {
+  background: linear-gradient(180deg, #eff6ff, var(--bg-panel));
+}
+.trace-path {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+.trace-node {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 92px;
+  padding: 8px 10px;
+  border: 1px solid rgba(20, 184, 166, 0.28);
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+}
+.trace-arrow {
+  color: var(--text-faint);
+  font-weight: 800;
+}
 
 /* 标签 Pill */
 .pill-row {

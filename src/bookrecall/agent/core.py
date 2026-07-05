@@ -142,6 +142,7 @@ class BookRecallAgent:
             recent_entity = self._recent_session_entity(recent_turns)
             if recent_entity:
                 matched = [recent_entity]
+        user_preferences = self.store.get_user_preferences(book_id, user_id)
 
         state = AgentState(
             book_id=book_id,
@@ -153,6 +154,7 @@ class BookRecallAgent:
             matched_themes=matched_themes,
             primary_entity=matched[0] if matched else None,
             recent_turns=recent_turns,
+            user_preferences=user_preferences,
         )
         state.intent = "semantic_search"
         return state
@@ -334,6 +336,7 @@ class BookRecallAgent:
             evidence = evidence[:1]
         elif state.intent in {"theme_explore", "compare", "causal", "semantic_search"}:
             evidence = evidence[: DEFAULT_SEARCH_SETTINGS.top_k_parents]
+        evidence = _apply_preferred_evidence_depth(evidence, state.user_preferences)
 
         return MemoryCard(
             question=state.question,
@@ -345,6 +348,7 @@ class BookRecallAgent:
             summary=state.summary,
             evidence=evidence,
             suggestions=state.suggestions or [],
+            user_preferences=_public_preferences(state.user_preferences),
         )
 
     def _persist_session_turn(self, state: AgentState, card: MemoryCard) -> None:
@@ -441,3 +445,21 @@ def _summarize_observation(result: dict) -> str:
     if "summary" in result:
         return f"summary_len={len(str(result.get('summary', '')))}"
     return ""
+
+
+def _apply_preferred_evidence_depth(evidence: list[EvidenceCard], preferences: dict[str, object]) -> list[EvidenceCard]:
+    style = str(preferences.get("answer_style") or "").strip().lower()
+    if style in {"brief", "简洁"}:
+        return evidence[:1]
+    if style in {"detailed", "详细"}:
+        return evidence[: DEFAULT_SEARCH_SETTINGS.top_k_parents]
+    return evidence
+
+
+def _public_preferences(preferences: dict[str, object]) -> dict[str, object]:
+    result = {
+        "answer_style": str(preferences.get("answer_style") or ""),
+        "focus": str(preferences.get("focus") or ""),
+        "custom_prompt": str(preferences.get("custom_prompt") or ""),
+    }
+    return {key: value for key, value in result.items() if value}

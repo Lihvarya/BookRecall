@@ -90,12 +90,14 @@ class LLMReActPolicy(DecisionPolicy):
         ]
         trace_text = "\n".join(trace_lines) if trace_lines else "（尚未调用任何工具）"
         recent_turns_text = self._format_recent_turns(state)
+        preference_text = self._format_user_preferences(state)
         evidence_chapters = [e.chapter_number for e in state.evidence]
         tools_json = json.dumps(registry.describe_for_llm(), ensure_ascii=False, indent=2)
         prompt = (
             f"{_SYSTEM_PROMPT}\n"
             f"问题：{state.question}\n"
             f"阅读进度：第 {state.progress_chapter} 章（任何章节号都不许超过它）\n"
+            f"用户长期偏好：\n{preference_text}\n"
             f"已识别实体：{state.matched_entities} / 规范名：{state.primary_entity}\n"
             f"已识别主题：{state.matched_themes}\n"
             f"同会话最近几轮：\n{recent_turns_text}\n"
@@ -120,6 +122,21 @@ class LLMReActPolicy(DecisionPolicy):
             short_answer = answer[:120] + ("..." if len(answer) > 120 else "")
             lines.append(f"- 问：{question} | 实体：{entity or '无'} | 答：{short_answer}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_user_preferences(state: "AgentState") -> str:
+        preferences = state.user_preferences or {}
+        parts: list[str] = []
+        style = str(preferences.get("answer_style") or "").strip()
+        focus = str(preferences.get("focus") or "").strip()
+        custom = str(preferences.get("custom_prompt") or "").strip()
+        if style:
+            parts.append(f"- 回答风格：{style}")
+        if focus:
+            parts.append(f"- 关注重点：{focus}")
+        if custom:
+            parts.append(f"- 自定义说明：{custom}")
+        return "\n".join(parts) if parts else "（无）"
 
 
 def _decision_from_tool_calls(tool_calls: list[object], registry: "ToolRegistry") -> Decision:

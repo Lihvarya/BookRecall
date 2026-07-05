@@ -48,6 +48,43 @@
       <div class="status" id="bookMeta">正在加载书库...</div>
 
       <div class="section">
+        <details open>
+          <summary>会话与分支</summary>
+          <div class="stack">
+            <button class="secondary" id="refreshSessionsBtn" type="button">刷新会话列表</button>
+            <div class="grid-two">
+              <select id="compareLeftSessionSelect"></select>
+              <select id="compareRightSessionSelect"></select>
+            </div>
+            <button class="ghost" id="compareSessionsBtn" type="button">对比分支差异</button>
+            <div class="session-compare" id="sessionComparePanel">
+              <div class="empty tiny">选择两个会话后，可以查看共同前缀、分歧轮次和各自独有线索。</div>
+            </div>
+            <div class="session-list" id="sessionListPanel">
+              <div class="empty tiny">当前书籍还没有会话历史。</div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div class="section">
+        <details>
+          <summary>长期回答偏好</summary>
+          <div class="stack">
+            <select id="answerStyleSelect">
+              <option value="">回答风格：默认</option>
+              <option value="brief">回答风格：简洁，只保留最关键证据</option>
+              <option value="detailed">回答风格：详细，尽量展开证据</option>
+            </select>
+            <input id="preferenceFocusInput" placeholder="关注重点，例如 人物关系 / 伏笔 / 主题观点 / 时间线">
+            <textarea class="compact" id="preferenceCustomInput" placeholder="自定义长期偏好，例如：回答时先给章节定位，再用三句话解释前因后果。"></textarea>
+            <button class="secondary" id="savePreferencesBtn" type="button">保存长期偏好</button>
+            <div class="empty tiny" id="preferencesResultPanel">偏好按当前书籍和用户保存，会影响之后的 Agent 回答与云端规划提示。</div>
+          </div>
+        </details>
+      </div>
+
+      <div class="section">
         <details>
           <summary>书籍分组与标签</summary>
           <div class="stack">

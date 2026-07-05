@@ -155,6 +155,10 @@ Optional Cloud Layer
 - `embedding`
   - `numpy>=1.26.0`
   - `sentence-transformers>=3.0.0`
+- `faiss`
+  - `faiss-cpu>=1.8.0`
+- `graph`
+  - `langgraph>=0.2.0`
 - `full`
   - `numpy>=1.26.0`
   - `langgraph>=0.2.0`
@@ -165,7 +169,7 @@ Optional Cloud Layer
 
 注意：
 
-- 当前代码已经实际使用的是 `embedding` 这一组。
+- 当前代码已经实际使用的是 `embedding / faiss / graph` 这几组。
 - `full` 里的很多能力还没有全部在代码中接通，它更像未来路线预留。
 - `cloud` 依赖组目前为空，因为云端 API 走的是标准库。
 
@@ -201,6 +205,12 @@ bookrecall --help
 
 ```bash
 pip install -e .[embedding]
+```
+
+如果想启用 FAISS 向量后端和 LangGraph Agent 图策略，可以继续安装：
+
+```bash
+pip install -e .[faiss,graph]
 ```
 
 如果你在 Windows + NVIDIA GPU 上使用，也可以手动先装好适配你 CUDA 版本的 `torch`，再安装：
@@ -336,7 +346,10 @@ http://127.0.0.1:8000
 - 输入会话 ID
 - 提交问答
 - 查看会话历史和本轮工具 trace
-- 编辑、删除历史对话轮次，回放历史工具轨迹，或把历史问题放回输入框重新提问
+- 查看工具调用路径、命中数、防剧透触发次数和每步参数/观察摘要
+- 浏览、刷新并切换当前书籍下的会话与分支
+- 对比两个会话分支的共同前缀、分歧轮次、独有线索、实体和工具调用
+- 编辑、删除历史对话轮次，回放历史工具轨迹，把历史问题放回输入框重新提问，或从某一轮开始重算/新建会话分支
 - 使用“首次出现 / 轨迹追踪 / 关系回忆 / 主题变化 / 关键事件”快捷提问模板
 - 选择 Agent 执行策略：`auto / rule_based / llm_react / langgraph`
 - 选择检索器：`lexical / embedding / auto`
@@ -348,14 +361,15 @@ http://127.0.0.1:8000
 - 直接配置外部 OpenAI-compatible API
 - 快速套用 DeepSeek / OpenAI 预设
 - 保存控制台偏好：用户、会话、当前书籍、分组筛选、召回策略、云端开关和模型配置
+- 保存当前书籍与用户维度的长期回答偏好：回答风格、关注重点和自定义说明
 
 说明：
 
 - API Key 不会保存在服务端文件中。
 - 如果勾选“保存”，API Key 只会保存在当前浏览器的 `localStorage`。
 - 控制台偏好使用 `bookrecall.preferences`，旧版 `bookrecall.apiSettings` 会自动兼容读取。
-- `langgraph` 是可选依赖；未安装时 Web 会显示该策略缺依赖，选择它提问会返回明确提示。
-- `faiss` 是可选向量后端；网页显示缺失不是错误，选择 Auto/Numpy 仍可构建和检索向量索引。
+- `langgraph` 是可选依赖；当前本地 `.venv` 已安装时，Web 会显示 `LangGraph ReAct` 可用。未安装时会显示缺依赖，选择它提问会返回明确提示。
+- `faiss` 是可选向量后端；当前本地 `.venv` 已安装时，Web 会显示 `faiss` 可用，并可构建 FAISS 索引。未安装时选择 Auto/Numpy 仍可构建和检索向量索引。
 - 网页端“导入书籍并建索引”不会自动下载 embedding 模型；它只构建 SQLite 本地结构化索引。
 - 如果要使用本地 embedding 检索，可以在网页端点击“构建当前书向量索引”，也可以继续用 CLI 的 `embed-build`。
 - 构建向量索引会加载本地 embedding 模型；如果本地缓存不存在，`sentence-transformers` 可能联网下载模型。
@@ -391,9 +405,13 @@ http://127.0.0.1:8000
 - `GET /api/books/{book_id}/events`
 - `GET /api/books/{book_id}/relations`
 - `GET /api/books/{book_id}/chapters/{chapter_number}`
+- `GET /api/books/{book_id}/preferences`
+- `POST /api/books/{book_id}/preferences`
 - `POST /api/books/{book_id}/vectors`
 - `POST /api/books/{book_id}/vectors/delete`
 - `POST /api/books/{book_id}/search`
+- `GET /api/books/{book_id}/sessions`
+- `GET /api/books/{book_id}/sessions/compare`
 - `POST /api/books/{book_id}/session/turns/{turn_id}`
 - `POST /api/ask`
 - `POST /api/progress`
@@ -638,7 +656,7 @@ python -m unittest discover -s tests -v
 当前代码状态下测试数量为：
 
 ```text
-78 tests
+83 tests
 ```
 
 ## 项目结构
@@ -690,7 +708,7 @@ examples/
 - 虽然已经接入原生 tool calling 优先链路，但还没有做更完整的多供应商兼容验证
 - 人物关系第一版已接入，能做阶段摘要，但还不是事件级高质量关系图谱
 - 主题线索第一版已接入，能做阶段摘要，但还不是完整深层主题演化分析
-- 跨会话 Agent 记忆已有第一版，但长期偏好和摘要压缩还没完成
+- 跨会话 Agent 记忆和用户长期偏好已有第一版，但会话摘要压缩还没完成
 - FAISS 是可选后端，真实大规模性能还没有系统压测
 - Web 仍然是单页零依赖控制台，不是完整产品前端
 

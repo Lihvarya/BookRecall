@@ -168,6 +168,16 @@ class BookRecallStore:
                 PRIMARY KEY (book_id, user_id)
             );
 
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                book_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                answer_style TEXT NOT NULL DEFAULT '',
+                focus TEXT NOT NULL DEFAULT '',
+                custom_prompt TEXT NOT NULL DEFAULT '',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (book_id, user_id)
+            );
+
             CREATE TABLE IF NOT EXISTS agent_memory (
                 turn_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 book_id TEXT NOT NULL,
@@ -190,6 +200,10 @@ class BookRecallStore:
         self._ensure_column("books", "entity_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("books", "book_group", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("books", "tags_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("user_preferences", "answer_style", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("user_preferences", "focus", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("user_preferences", "custom_prompt", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("user_preferences", "updated_at", "TEXT DEFAULT CURRENT_TIMESTAMP")
         self.connection.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, ddl: str) -> None:
@@ -559,6 +573,57 @@ class BookRecallStore:
         )
         self.connection.commit()
         return self.get_book(book_id)
+
+    def get_user_preferences(self, book_id: str, user_id: str) -> dict[str, object]:
+        row = self.connection.execute(
+            """
+            SELECT answer_style, focus, custom_prompt, updated_at
+            FROM user_preferences
+            WHERE book_id = ? AND user_id = ?
+            """,
+            (book_id, user_id),
+        ).fetchone()
+        if row is None:
+            return {
+                "book_id": book_id,
+                "user_id": user_id,
+                "answer_style": "",
+                "focus": "",
+                "custom_prompt": "",
+                "updated_at": "",
+            }
+        return {
+            "book_id": book_id,
+            "user_id": user_id,
+            "answer_style": str(row["answer_style"] or ""),
+            "focus": str(row["focus"] or ""),
+            "custom_prompt": str(row["custom_prompt"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
+
+    def set_user_preferences(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        answer_style: str = "",
+        focus: str = "",
+        custom_prompt: str = "",
+    ) -> dict[str, object]:
+        self.connection.execute(
+            """
+            INSERT INTO user_preferences(book_id, user_id, answer_style, focus, custom_prompt, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(book_id, user_id) DO UPDATE SET
+                answer_style = excluded.answer_style,
+                focus = excluded.focus,
+                custom_prompt = excluded.custom_prompt,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (book_id, user_id, answer_style.strip(), focus.strip(), custom_prompt.strip()),
+        )
+        self.connection.commit()
+        return self.get_user_preferences(book_id, user_id)
 
     def list_entities(self, book_id: str) -> list[str]:
         rows = self.connection.execute(
@@ -950,22 +1015,122 @@ class BookRecallStore:
         ).fetchall()
         turns: list[dict[str, object]] = []
         for row in reversed(rows):
-            turns.append(
+            turns.append(_agent_turn_from_row(row))
+        return turns
+
+    def list_agent_sessions(self, book_id: str, user_id: str, *, limit: int = 30) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            """
+            SELECT
+                session_id,
+                COUNT(*) AS turn_count,
+                MAX(turn_index) AS last_turn_index,
+                MAX(created_at) AS updated_at
+            FROM agent_memory
+            WHERE book_id = ? AND user_id = ?
+            GROUP BY session_id
+            ORDER BY updated_at DESC, session_id ASC
+            LIMIT ?
+            """,
+            (book_id, user_id, limit),
+        ).fetchall()
+        sessions: list[dict[str, object]] = []
+        for row in rows:
+            latest = self.connection.execute(
+                """
+                SELECT turn_id, turn_index, question, intent, entity_name, answer, summary,
+                       progress_chapter, matched_entities_json, trace_json, created_at
+                FROM agent_memory
+                WHERE book_id = ? AND user_id = ? AND session_id = ?
+                ORDER BY turn_index DESC, turn_id DESC
+                LIMIT 1
+                """,
+                (book_id, user_id, row["session_id"]),
+            ).fetchone()
+            latest_turn = _agent_turn_from_row(latest) if latest is not None else None
+            sessions.append(
                 {
-                    "turn_id": int(row["turn_id"]),
-                    "turn_index": int(row["turn_index"]),
-                    "question": str(row["question"]),
-                    "intent": str(row["intent"]),
-                    "entity_name": str(row["entity_name"]) if row["entity_name"] else None,
-                    "answer": str(row["answer"]),
-                    "summary": str(row["summary"]) if row["summary"] else None,
-                    "progress_chapter": int(row["progress_chapter"]),
-                    "matched_entities": _loads_json_list(row["matched_entities_json"]),
-                    "trace": _loads_json_list(row["trace_json"]),
-                    "created_at": str(row["created_at"]),
+                    "session_id": str(row["session_id"]),
+                    "turn_count": int(row["turn_count"]),
+                    "last_turn_index": int(row["last_turn_index"] or 0),
+                    "updated_at": str(row["updated_at"] or ""),
+                    "last_turn": latest_turn,
+                    "last_question": str(latest_turn["question"]) if latest_turn else "",
+                    "last_answer": str(latest_turn["answer"]) if latest_turn else "",
+                    "last_summary": str(latest_turn["summary"]) if latest_turn and latest_turn.get("summary") else "",
                 }
             )
-        return turns
+        return sessions
+
+    def get_agent_turn(self, *, turn_id: int, book_id: str, user_id: str, session_id: str) -> dict[str, object] | None:
+        row = self.connection.execute(
+            """
+            SELECT turn_id, turn_index, question, intent, entity_name, answer, summary, progress_chapter,
+                   matched_entities_json, trace_json, created_at
+            FROM agent_memory
+            WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
+            """,
+            (turn_id, book_id, user_id, session_id),
+        ).fetchone()
+        return None if row is None else _agent_turn_from_row(row)
+
+    def list_agent_turns_before(
+        self,
+        *,
+        turn_id: int,
+        book_id: str,
+        user_id: str,
+        session_id: str,
+    ) -> list[dict[str, object]]:
+        row = self.connection.execute(
+            """
+            SELECT turn_index
+            FROM agent_memory
+            WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
+            """,
+            (turn_id, book_id, user_id, session_id),
+        ).fetchone()
+        if row is None:
+            return []
+        rows = self.connection.execute(
+            """
+            SELECT turn_id, turn_index, question, intent, entity_name, answer, summary, progress_chapter,
+                   matched_entities_json, trace_json, created_at
+            FROM agent_memory
+            WHERE book_id = ? AND user_id = ? AND session_id = ? AND turn_index < ?
+            ORDER BY turn_index ASC, turn_id ASC
+            """,
+            (book_id, user_id, session_id, int(row["turn_index"])),
+        ).fetchall()
+        return [_agent_turn_from_row(item) for item in rows]
+
+    def copy_agent_turns_to_session(
+        self,
+        *,
+        book_id: str,
+        user_id: str,
+        source_turns: list[dict[str, object]],
+        target_session_id: str,
+    ) -> int:
+        copied = 0
+        for turn in source_turns:
+            trace = turn.get("trace")
+            matched_entities = turn.get("matched_entities")
+            self.append_agent_turn(
+                book_id=book_id,
+                user_id=user_id,
+                session_id=target_session_id,
+                question=str(turn.get("question") or ""),
+                intent=str(turn.get("intent") or "semantic_search"),
+                entity_name=str(turn["entity_name"]) if turn.get("entity_name") else None,
+                answer=str(turn.get("answer") or ""),
+                summary=str(turn["summary"]) if turn.get("summary") else None,
+                progress_chapter=int(turn.get("progress_chapter") or 0),
+                matched_entities=[str(item) for item in matched_entities] if isinstance(matched_entities, list) else [],
+                trace=[dict(item) for item in trace] if isinstance(trace, list) else [],
+            )
+            copied += 1
+        return copied
 
     def append_agent_turn(
         self,
@@ -1058,19 +1223,7 @@ class BookRecallStore:
         ).fetchone()
         if row is None:
             return None
-        return {
-            "turn_id": int(row["turn_id"]),
-            "turn_index": int(row["turn_index"]),
-            "question": str(row["question"]),
-            "intent": str(row["intent"]),
-            "entity_name": str(row["entity_name"]) if row["entity_name"] else None,
-            "answer": str(row["answer"]),
-            "summary": str(row["summary"]) if row["summary"] else None,
-            "progress_chapter": int(row["progress_chapter"]),
-            "matched_entities": _loads_json_list(row["matched_entities_json"]),
-            "trace": _loads_json_list(row["trace_json"]),
-            "created_at": str(row["created_at"]),
-        }
+        return _agent_turn_from_row(row)
 
     def delete_agent_turn(self, *, turn_id: int, book_id: str, user_id: str, session_id: str) -> int:
         cursor = self.connection.execute(
@@ -1079,6 +1232,27 @@ class BookRecallStore:
             WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
             """,
             (turn_id, book_id, user_id, session_id),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
+
+    def delete_agent_turns_from(self, *, turn_id: int, book_id: str, user_id: str, session_id: str) -> int:
+        row = self.connection.execute(
+            """
+            SELECT turn_index
+            FROM agent_memory
+            WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
+            """,
+            (turn_id, book_id, user_id, session_id),
+        ).fetchone()
+        if row is None:
+            return 0
+        cursor = self.connection.execute(
+            """
+            DELETE FROM agent_memory
+            WHERE book_id = ? AND user_id = ? AND session_id = ? AND turn_index >= ?
+            """,
+            (book_id, user_id, session_id, int(row["turn_index"])),
         )
         self.connection.commit()
         return int(cursor.rowcount)
@@ -1223,6 +1397,22 @@ def _loads_string_list(raw: object) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _agent_turn_from_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "turn_id": int(row["turn_id"]),
+        "turn_index": int(row["turn_index"]),
+        "question": str(row["question"]),
+        "intent": str(row["intent"]),
+        "entity_name": str(row["entity_name"]) if row["entity_name"] else None,
+        "answer": str(row["answer"]),
+        "summary": str(row["summary"]) if row["summary"] else None,
+        "progress_chapter": int(row["progress_chapter"]),
+        "matched_entities": _loads_json_list(row["matched_entities_json"]),
+        "trace": _loads_json_list(row["trace_json"]),
+        "created_at": str(row["created_at"]),
+    }
 
 
 def _event_query_tokens(query_text: str) -> list[str]:
