@@ -12,7 +12,7 @@ BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。它的
 
 BookRecall 和普通 RAG 的区别在于：它不是只靠向量检索，而是把章节解析、结构化索引、向量召回、重排模型、阅读进度保护和 Agent 工具规划组合在一起，尽量做到“定位准确、有原文证据、不过度剧透”。
 
-![BookRecall](image/README/1783146838804.png)
+![1783338657318](image/README/1783338657318.png)
 
 ## 当前状态
 
@@ -100,10 +100,10 @@ D:\BookRecall
 
 当前默认推荐：
 
-| 用途 | 推荐模型 | 说明 |
-| --- | --- | --- |
-| Embedding 粗召回 | `Qwen/Qwen3-Embedding-0.6B` | 替代旧的 `BAAI/bge-small-zh-v1.5`，语义召回更强 |
-| Reranker 精排 | `Qwen/Qwen3-Reranker-0.6B` | 对候选证据重新排序，提高命中准确率 |
+| 用途                        | 推荐模型                         | 说明                                                           |
+| --------------------------- | -------------------------------- | -------------------------------------------------------------- |
+| Embedding 粗召回            | `Qwen/Qwen3-Embedding-0.6B`    | 替代旧的`BAAI/bge-small-zh-v1.5`，语义召回更强               |
+| Reranker 精排               | `Qwen/Qwen3-Reranker-0.6B`     | 对候选证据重新排序，提高命中准确率                             |
 | 本地 Agent / 按需结构化理解 | 本地 Qwen3.5-4B 或 Qwen3-4B GGUF | 可通过 LM Studio / llama.cpp / OpenAI-compatible endpoint 接入 |
 
 注意：
@@ -396,22 +396,22 @@ Qwen/Qwen3-Reranker-0.6B
 
 当前主要命令：
 
-| 命令 | 用途 |
-| --- | --- |
-| `build` | 为 TXT 书籍建立本地结构化索引 |
-| `ask` | 针对书籍提问 |
-| `set-progress` | 保存阅读进度 |
-| `show-progress` | 查看阅读进度 |
-| `list-books` | 列出书库 |
-| `list-entities` | 列出实体索引 |
-| `list-themes` | 列出主题索引 |
-| `chapters` | 查看章节解析结果 |
-| `stats` | 查看索引规模 |
-| `clear` | 删除某本书的索引数据 |
-| `serve` | 启动 Web |
-| `models` | 探测依赖、模型和向量索引状态 |
-| `embed-build` | 构建本地 embedding 向量索引 |
-| `embed-search` | 直接测试向量召回 |
+| 命令              | 用途                          |
+| ----------------- | ----------------------------- |
+| `build`         | 为 TXT 书籍建立本地结构化索引 |
+| `ask`           | 针对书籍提问                  |
+| `set-progress`  | 保存阅读进度                  |
+| `show-progress` | 查看阅读进度                  |
+| `list-books`    | 列出书库                      |
+| `list-entities` | 列出实体索引                  |
+| `list-themes`   | 列出主题索引                  |
+| `chapters`      | 查看章节解析结果              |
+| `stats`         | 查看索引规模                  |
+| `clear`         | 删除某本书的索引数据          |
+| `serve`         | 启动 Web                      |
+| `models`        | 探测依赖、模型和向量索引状态  |
+| `embed-build`   | 构建本地 embedding 向量索引   |
+| `embed-search`  | 直接测试向量召回              |
 
 ## 本地 Qwen / LM Studio 接入
 
