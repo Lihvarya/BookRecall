@@ -57,3 +57,4 @@ class AgentState:
     answer: str | None = None
     summary: str | None = None
     suggestions: list[str] = field(default_factory=list)
+    answer_synthesis: dict[str, object] = field(default_factory=dict)

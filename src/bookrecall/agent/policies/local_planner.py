@@ -58,7 +58,10 @@ class LocalPlannerPolicy(DecisionPolicy):
 
     @staticmethod
     def _resolve_dynamic_arguments(call: ToolCall, state: "AgentState") -> ToolCall:
-        args = dict(call.arguments)
+        args = {
+            key: _resolve_argument_value(value, state)
+            for key, value in dict(call.arguments).items()
+        }
         for key in ("entity", "source_entity"):
             if args.get(key) in {"$primary_entity", "$entity", ""} and state.primary_entity:
                 args[key] = state.primary_entity
@@ -66,6 +69,10 @@ class LocalPlannerPolicy(DecisionPolicy):
             args["target_entity"] = state.matched_entities[1]
         if args.get("query") in {"$question", ""}:
             args["query"] = state.question
+        if call.name == "search_evidence":
+            query = str(args.get("query", "")).strip()
+            if not query or "$" in query:
+                args["query"] = state.question
         return ToolCall(name=call.name, arguments=args, thought=call.thought)
 
 
@@ -74,6 +81,19 @@ def _should_delegate_to_rules(state: "AgentState") -> bool:
     if state.matched_entities or state.matched_themes:
         return False
     return any(keyword in question for keyword in ("条件", "标准", "要求", "步骤", "有哪些", "是什么"))
+
+
+def _resolve_argument_value(value: object, state: "AgentState") -> object:
+    if not isinstance(value, str):
+        return value
+    resolved = value
+    if state.primary_entity:
+        resolved = resolved.replace("$primary_entity", state.primary_entity)
+        resolved = resolved.replace("$entity", state.primary_entity)
+    if len(state.matched_entities) >= 2:
+        resolved = resolved.replace("$second_entity", state.matched_entities[1])
+    resolved = resolved.replace("$question", state.question)
+    return resolved.strip()
 
 
 def parse_local_plan(payload: dict[str, Any], registry: "ToolRegistry") -> list[ToolCall]:

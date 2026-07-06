@@ -27,6 +27,8 @@ SAMPLE_TEXT = """第1章 起点
 第3章 回声
 
 黑衣人再次提到【星辰之匙】。
+月影罗盘只在这一章短暂出现过一次。
+自由残缺变是白袍蛊仙提到的一记杀招，只在此处露面。
 """
 
 
@@ -84,6 +86,39 @@ class BookRecallAgentTest(unittest.TestCase):
         )
         self.assertIn("第 2 章", answer)
         self.assertIn("第 3 章", answer)
+
+    def test_agent_falls_back_to_exact_text_for_unindexed_low_frequency_term(self) -> None:
+        class BlindRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                return []
+
+        agent = BookRecallAgent(self.store, retriever=BlindRetriever())
+        card = agent.ask_card(
+            book_id="sample",
+            question="月影罗盘第一次出现在哪一章？",
+            progress_chapter=3,
+        )
+
+        self.assertIn("第 3 章", card.answer)
+        self.assertIn("月影罗盘", card.evidence[0].excerpt)
+        self.assertIn("原文精确命中", card.evidence[0].reason)
+
+    def test_force_exact_search_runs_before_semantic_reasoning(self) -> None:
+        class BlindRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                return []
+
+        agent = BookRecallAgent(self.store, retriever=BlindRetriever(), force_exact_search=True)
+        card = agent.ask_card(
+            book_id="sample",
+            question="自由残缺变是什么？",
+            progress_chapter=3,
+        )
+
+        self.assertTrue(card.query_understanding["force_exact_search"])
+        self.assertEqual(card.query_understanding["forced_exact_keyword"], "自由残缺变")
+        self.assertIn("自由残缺变", card.evidence[0].excerpt)
+        self.assertIn("原文精确命中", card.evidence[0].reason)
 
     def test_alias_resolution(self) -> None:
         card = self.agent.ask_card(
@@ -341,6 +376,105 @@ class BookRecallAgentTest(unittest.TestCase):
         self.assertIn("三十万规模", card.answer)
         self.assertIn("无上大宗师", card.answer)
         self.assertIn("天道封锁", card.answer)
+
+    def test_death_truth_answer_builds_evidence_chain(self) -> None:
+        class FakeRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                return [
+                    SearchHit(
+                        score=0.98,
+                        chapter_number=181,
+                        chapter_title="历史回放",
+                        parent_id="p181",
+                        child_text="四代族长趁花酒行者当场击毙，但自身亦受重创，不久逝世。",
+                        parent_text="四代族长心慈仁善，不妨他突然偷袭。四代族长将花酒行者当场击毙，但自身亦受重创，不久逝世。",
+                    ),
+                    SearchHit(
+                        score=0.92,
+                        chapter_number=18,
+                        chapter_title="影壁留声",
+                        parent_id="p18",
+                        child_text="石缝联通着外界，也不会隔绝外界的声音响动。方源在此处，听见小瀑布的轰鸣声。",
+                        parent_text="石缝联通着外界，也不会隔绝外界的声音响动。方源在此处，发现影壁和留声线索。",
+                    ),
+                    SearchHit(
+                        score=0.88,
+                        chapter_number=48,
+                        chapter_title="影壁真相",
+                        parent_id="p48",
+                        child_text="影壁上出现一位身受重伤的蛊师，取代了原先的影像。",
+                        parent_text="影壁上出现一位身受重伤的蛊师，取代了原先的影像。",
+                    ),
+                    SearchHit(
+                        score=0.8,
+                        chapter_number=9,
+                        chapter_title="棺材",
+                        parent_id="p9",
+                        child_text="棺材里似乎留下了花酒行者的尸体线索。",
+                        parent_text="棺材里似乎留下了花酒行者的尸体线索。",
+                    ),
+                ]
+
+        agent = BookRecallAgent(self.store, retriever=FakeRetriever())
+        card = agent.ask_card(book_id="sample", question="花酒行者死亡真相是什么", progress_chapter=3000)
+
+        self.assertIn("线索链", card.answer)
+        self.assertIn("四代族长", card.answer)
+        self.assertIn("偷袭", card.answer)
+        self.assertIn("影壁", card.answer)
+        self.assertIn("尸体", card.answer)
+
+    def test_local_llm_synthesizes_final_answer_from_evidence(self) -> None:
+        class FakeRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                return [
+                    SearchHit(
+                        score=1.0,
+                        chapter_number=3,
+                        chapter_title="回声",
+                        parent_id="p3",
+                        child_text="黑衣人再次提到【星辰之匙】，说明这条线索仍在推进。",
+                        parent_text="黑衣人再次提到【星辰之匙】，说明这条线索仍在推进。",
+                    )
+                ]
+
+        class FakeLocalClient:
+            def complete_json(self, prompt: str) -> dict:
+                if "最终答案整理器" in prompt:
+                    return {
+                        "answer": "黑衣人后来确实再次出现，并且继续推动星辰之匙线索。",
+                        "summary": "本地小模型基于证据完成最终整理。",
+                        "confidence": 0.9,
+                    }
+                if "答案校验器" in prompt:
+                    return {
+                        "supported": True,
+                        "spoiler_safe": True,
+                        "speculation_risk": "low",
+                        "issues": [],
+                        "suggested_note": "",
+                        "confidence": 0.9,
+                    }
+                return {
+                    "intent": "semantic_search",
+                    "entities": [],
+                    "themes": [],
+                    "time_range": {"start_chapter": None, "end_chapter": None, "relative": ""},
+                    "spoiler_sensitive": True,
+                    "tools": ["search_evidence"],
+                    "confidence": 0.8,
+                }
+
+        agent = BookRecallAgent(
+            self.store,
+            retriever=FakeRetriever(),
+            query_understanding_client=FakeLocalClient(),
+        )
+        card = agent.ask_card(book_id="sample", question="黑衣人后来怎么样？", progress_chapter=3)
+
+        self.assertIn("继续推动星辰之匙线索", card.answer)
+        self.assertTrue(card.answer_synthesis["used"])
+        self.assertEqual(card.summary, "本地小模型基于证据完成最终整理。")
 
 
 if __name__ == "__main__":

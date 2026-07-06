@@ -53,6 +53,7 @@ BookRecall Agent
    |  |- search_theme
    |  |- search_events
    |  |- search_evidence
+   |  |- search_exact_text
    |  |- lookup_entity_aliases
    |  |- get_chapter_summary
    |  `- list_entities

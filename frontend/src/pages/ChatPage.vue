@@ -202,6 +202,10 @@ function askWithSuggestion(suggestion: string) {
             <span>进度：第 {{ state.form.progress || "?" }} 章</span>
             <span>{{ state.status }}</span>
           </div>
+          <label class="composer-toggle" title="先调用 search_exact_text 做全书精确词检索，适合杀招名、道具名、低频专名。">
+            <input v-model="state.form.forceExactSearch" type="checkbox" />
+            <span>强制原文检索</span>
+          </label>
           <button class="primary-button" type="submit" :disabled="state.isAsking">
             {{ state.isAsking ? "思考中..." : "发送" }}
           </button>

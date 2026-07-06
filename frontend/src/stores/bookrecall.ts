@@ -63,6 +63,7 @@ interface FormState {
   searchLimit: string | number;
   policy: string;
   retriever: string;
+  forceExactSearch: boolean;
   provider: string;
   apiEndpoint: string;
   apiModel: string;
@@ -219,6 +220,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       searchLimit: 6,
       policy: "auto",
       retriever: "auto",
+      forceExactSearch: false,
       provider: "deepseek",
       apiEndpoint: "",
       apiModel: "",
@@ -334,6 +336,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     state.currentGroupFilter = String(saved.group_filter || state.currentGroupFilter);
     state.form.policy = String(saved.agent_policy || state.form.policy);
     state.form.retriever = String(saved.retriever || state.form.retriever);
+    state.form.forceExactSearch = Boolean(saved.force_exact_search);
     state.form.provider = String(saved.provider || state.form.provider);
     state.form.apiEndpoint = String(saved.endpoint || state.form.apiEndpoint);
     state.form.apiModel = String(saved.model || state.form.apiModel);
@@ -366,6 +369,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
         group_filter: state.currentGroupFilter,
         agent_policy: state.form.policy,
         retriever: state.form.retriever,
+        force_exact_search: state.form.forceExactSearch,
         provider: state.form.provider,
         endpoint: state.form.apiEndpoint,
         model: state.form.apiModel,
@@ -686,6 +690,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
         progress_chapter: state.form.progress ? Number(state.form.progress) : null,
         agent_policy: state.form.policy,
         retriever: state.form.retriever,
+        force_exact_search: state.form.forceExactSearch,
         cloud_config: {
           enabled: state.form.cloudEnabled,
           endpoint: state.form.apiEndpoint.trim(),
@@ -789,6 +794,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
           progress_chapter: state.form.progress ? Number(state.form.progress) : null,
           agent_policy: state.form.policy,
           retriever: state.form.retriever,
+          force_exact_search: state.form.forceExactSearch,
           cloud_config: {
             enabled: state.form.cloudEnabled,
             endpoint: state.form.apiEndpoint.trim(),

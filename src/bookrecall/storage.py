@@ -1119,6 +1119,55 @@ class BookRecallStore:
         query += " ORDER BY c.chapter_number ASC, c.chunk_index ASC"
         return self.connection.execute(query, params).fetchall()
 
+    def search_exact_text(
+        self,
+        book_id: str,
+        keyword: str,
+        *,
+        max_chapter: int | None = None,
+        limit: int = 12,
+        context_chars: int = 120,
+    ) -> list[dict[str, object]]:
+        keyword = keyword.strip()
+        if not keyword:
+            return []
+        limit = max(1, min(int(limit or 12), 50))
+        context_chars = max(20, min(int(context_chars or 120), 500))
+        query = """
+            SELECT chapter_number, title, content, instr(content, ?) AS hit_pos
+            FROM chapters
+            WHERE book_id = ? AND instr(content, ?) > 0
+        """
+        params: list[object] = [keyword, book_id, keyword]
+        if max_chapter is not None:
+            query += " AND chapter_number <= ?"
+            params.append(max_chapter)
+        query += " ORDER BY chapter_number ASC LIMIT ?"
+        params.append(limit)
+        rows = self.connection.execute(query, params).fetchall()
+        hits: list[dict[str, object]] = []
+        for row in rows:
+            content = str(row["content"])
+            # SQLite instr() is 1-based; Python slices are 0-based.
+            position = max(0, int(row["hit_pos"]) - 1)
+            start = max(0, position - context_chars)
+            end = min(len(content), position + len(keyword) + context_chars)
+            excerpt = content[start:end].strip()
+            if start > 0:
+                excerpt = "..." + excerpt
+            if end < len(content):
+                excerpt += "..."
+            hits.append(
+                {
+                    "chapter_number": int(row["chapter_number"]),
+                    "chapter_title": str(row["title"]),
+                    "position": position,
+                    "excerpt": excerpt,
+                    "keyword": keyword,
+                }
+            )
+        return hits
+
     def set_progress(self, book_id: str, user_id: str, progress_chapter: int) -> None:
         self.connection.execute(
             """

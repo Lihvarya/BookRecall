@@ -171,6 +171,40 @@ class ReactParseTest(unittest.TestCase):
         self.assertEqual(decision.tool_call.arguments, {"entity": "方源"})
         self.assertIn("工具清单", planner.prompt)
 
+    def test_local_planner_replaces_embedded_primary_entity_placeholder(self) -> None:
+        call = ToolCall(
+            name="search_evidence",
+            arguments={"query": "$primary_entity 怎么死的"},
+            thought="查死亡原因",
+        )
+        state = AgentState(
+            book_id="sample",
+            question="花酒行者怎么死的",
+            progress_chapter=10,
+            matched_entities=["花酒行者"],
+            primary_entity="花酒行者",
+        )
+
+        resolved = LocalPlannerPolicy._resolve_dynamic_arguments(call, state)
+
+        self.assertEqual(resolved.arguments["query"], "花酒行者 怎么死的")
+
+    def test_local_planner_falls_back_to_question_when_placeholder_unresolved(self) -> None:
+        call = ToolCall(
+            name="search_evidence",
+            arguments={"query": "$primary_entity 怎么死的"},
+            thought="查死亡原因",
+        )
+        state = AgentState(
+            book_id="sample",
+            question="花酒行者怎么死的",
+            progress_chapter=10,
+        )
+
+        resolved = LocalPlannerPolicy._resolve_dynamic_arguments(call, state)
+
+        self.assertEqual(resolved.arguments["query"], "花酒行者怎么死的")
+
     @unittest.skipUnless(is_langgraph_available(), "langgraph optional dependency is not installed")
     def test_langgraph_policy_can_invoke_delegate(self) -> None:
         class FixedPolicy(DecisionPolicy):

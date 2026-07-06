@@ -1483,6 +1483,7 @@ class BookRecallWebService:
         cloud_config: dict[str, object] | None = None,
         local_llm_config: dict[str, object] | None = None,
         rerank_config: dict[str, object] | None = None,
+        force_exact_search: bool = False,
     ) -> dict[str, object]:
         store = self._open_store()
         try:
@@ -1496,6 +1497,7 @@ class BookRecallWebService:
                 retriever=retriever,
                 reasoner=reasoner,
                 query_understanding_client=query_understanding_client,
+                force_exact_search=force_exact_search,
             )
             card = agent.ask_card(
                 book_id=book_id,
@@ -1513,6 +1515,7 @@ class BookRecallWebService:
                 "cloud_reasoner_enabled": reasoner.enabled,
                 "cloud_model": reasoner.model if reasoner.enabled else None,
                 "local_query_understanding_enabled": query_understanding_client is not None,
+                "force_exact_search": force_exact_search,
             }
             if session_id:
                 session_data = {
@@ -2267,6 +2270,7 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 rerank_config = payload.get("rerank_config")
                 if not isinstance(rerank_config, dict):
                     rerank_config = None
+                force_exact_search = bool(payload.get("force_exact_search"))
                 if not book_id or not question:
                     self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和 question 不能为空。")
                     return
@@ -2282,6 +2286,7 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                         cloud_config=cloud_config,
                         local_llm_config=local_llm_config,
                         rerank_config=rerank_config,
+                        force_exact_search=force_exact_search,
                     )
                 )
                 return

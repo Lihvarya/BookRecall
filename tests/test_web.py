@@ -34,6 +34,7 @@ SAMPLE_TEXT = """第1章 起点
 第3章 回声
 
 黑衣人再次提到【星辰之匙】，林澈决定追查自由意志的真相。
+自由残缺变是白袍蛊仙提到的一记杀招，只在此处露面。
 """
 
 
@@ -381,6 +382,23 @@ class BookRecallWebTest(unittest.TestCase):
 
         self.assertEqual(answer["runtime"]["effective_policy"], "local_planner")
         self.assertTrue(any(item["tool_name"] == "search_evidence" for item in answer["trace"]))
+
+    def test_ask_endpoint_can_force_exact_text_search_first(self) -> None:
+        answer = self._post_json(
+            "/api/ask",
+            {
+                "book_id": "sample",
+                "user_id": "alice",
+                "session_id": "force-exact",
+                "question": "自由残缺变是什么？",
+                "progress_chapter": 3,
+                "force_exact_search": True,
+            },
+        )
+
+        self.assertTrue(answer["runtime"]["force_exact_search"])
+        self.assertTrue(any(item["tool_name"] == "search_exact_text" for item in answer["trace"]))
+        self.assertTrue(any("自由残缺变" in item["excerpt"] for item in answer["evidence"]))
 
     def test_diagnostics_endpoint(self) -> None:
         data = self._get_json("/api/diagnostics")

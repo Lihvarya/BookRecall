@@ -38,6 +38,7 @@ SAMPLE = """第1章 雨夜
 
 第3章 远行
 星辰之匙打开了石门，自由意志的含义就此浮现。
+月影罗盘只在这一章短暂出现过一次。
 """
 
 
@@ -114,6 +115,16 @@ class AgentToolsTest(unittest.TestCase):
         for hit in r["hits"]:
             self.assertLessEqual(hit["chapter_number"], 1)
 
+    def test_search_exact_text_finds_unindexed_low_frequency_term(self) -> None:
+        r = self.run_tool("search_exact_text", self._state(3), {"keyword": "月影罗盘"})
+        self.assertEqual(r["count"], 1)
+        self.assertEqual(r["hits"][0]["chapter_number"], 3)
+        self.assertIn("月影罗盘", r["hits"][0]["child_text"])
+
+    def test_search_exact_text_progress_filter(self) -> None:
+        r = self.run_tool("search_exact_text", self._state(2), {"keyword": "月影罗盘"})
+        self.assertEqual(r["count"], 0)
+
     def test_lookup_entity_aliases(self) -> None:
         r = self.run_tool("lookup_entity_aliases", self._state(3), {"entity": "黑袍人"})
         self.assertTrue(r["found"])
@@ -167,10 +178,10 @@ class AgentToolsTest(unittest.TestCase):
 
     def test_registry_describe_for_llm(self) -> None:
         desc = self.registry.describe_for_llm()
-        self.assertEqual(len(desc), 9)
+        self.assertEqual(len(desc), 10)
         names = {d["name"] for d in desc}
         self.assertEqual(names, {
-            "lookup_first_appearance", "lookup_timeline", "search_evidence",
+            "lookup_first_appearance", "lookup_timeline", "search_evidence", "search_exact_text",
             "lookup_relations", "search_theme", "search_events",
             "lookup_entity_aliases", "get_chapter_summary", "list_entities",
         })

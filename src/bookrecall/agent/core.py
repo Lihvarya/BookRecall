@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from time import perf_counter
 
+from ..answer_synthesis import synthesize_answer_with_llm
 from ..answer_validation import validate_answer_with_llm
 from ..cloud import OpenAICompatibleReasoner
 from ..config import DEFAULT_SEARCH_SETTINGS
@@ -18,8 +19,8 @@ from ..query_understanding import (
 from ..rerank import rerank_evidence_hits
 from ..retrieval import LocalRetriever, Retriever
 from ..storage import BookRecallStore
-from .policies.base import Decision, DecisionPolicy
-from .policies.rule_based import INTENT_LABELS, RuleBasedPolicy
+from .policies.base import Decision, DecisionPolicy, ToolCall
+from .policies.rule_based import INTENT_LABELS, RuleBasedPolicy, _extract_exact_keyword
 from .render import render_json, render_text, to_payload
 from .state import AgentState, ToolCallTrace
 from .tools import ToolRegistry, build_default_registry
@@ -34,12 +35,14 @@ class BookRecallAgent:
         retriever: Retriever | None = None,
         reasoner: OpenAICompatibleReasoner | None = None,
         query_understanding_client: JsonCompleter | None = None,
+        force_exact_search: bool = False,
     ) -> None:
         self.store = store
         self.retriever = retriever or LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
         self.reasoner = reasoner or OpenAICompatibleReasoner()
         self.query_understanding_client = query_understanding_client
         self._injected_policy = policy
+        self.force_exact_search = force_exact_search
 
     def _select_policy(self) -> DecisionPolicy:
         if self._injected_policy is not None:
@@ -65,6 +68,8 @@ class BookRecallAgent:
         state = self._init_state(book_id, question, user_id, progress_chapter, session_id)
         registry = build_default_registry(self.store, self.retriever)
         policy = self._select_policy()
+        if self.force_exact_search:
+            self._run_forced_exact_search(state, registry)
 
         llm_failures = 0
         max_llm_failures = 2
@@ -105,6 +110,31 @@ class BookRecallAgent:
         card = self._finalize_memory_card(state)
         self._persist_session_turn(state, card)
         return card
+
+    def _run_forced_exact_search(self, state: AgentState, registry: ToolRegistry) -> None:
+        keyword = _extract_exact_keyword(state.question, state.primary_entity or "")
+        if not keyword:
+            return
+        state.query_understanding["force_exact_search"] = True
+        state.query_understanding["forced_exact_keyword"] = keyword
+        # A long proper noun such as “自由残缺变” should not be hijacked by the short theme “自由”.
+        state.matched_themes = [theme for theme in state.matched_themes if theme == keyword or theme not in keyword]
+        if state.intent == "theme_explore" and not state.matched_themes:
+            state.intent = "semantic_search"
+        tool = registry.get("search_exact_text")
+        if tool is None:
+            return
+        state.step += 1
+        call = ToolCall(
+            name="search_exact_text",
+            arguments={"keyword": keyword, "limit": 16},
+            thought="用户开启强制原文检索，先全书精确定位该词出现上下文",
+        )
+        started = perf_counter()
+        result = tool.run(state, self._clamp_max_chapter(tool, call.arguments, state.progress_chapter))
+        elapsed_ms = (perf_counter() - started) * 1000
+        self._ingest_result(state, tool.schema.name, call, result, elapsed_ms=elapsed_ms)
+        self._prune_evidence(state)
 
     def ask(
         self,
@@ -373,6 +403,22 @@ class BookRecallAgent:
                     "与当前问题最相关的检索命中",
                 )
 
+        if tool_name == "search_exact_text":
+            exact_hits = result.get("hits", [])
+            if not exact_hits:
+                return
+            state.raw_hits = exact_hits
+            state.last_query = call.arguments.get("keyword") or call.arguments.get("query")
+            keyword = str(result.get("keyword") or state.last_query or "").strip()
+            for hit in state.raw_hits:
+                self._add_evidence_from(
+                    state,
+                    int(hit["chapter_number"]),
+                    str(hit.get("chapter_title", "")),
+                    str(hit.get("child_text", "")),
+                    f"原文精确命中“{keyword}”",
+                )
+
     def _maybe_rerank_evidence(self, state: AgentState, call, result: dict) -> dict:
         if self.query_understanding_client is None:
             return result
@@ -490,6 +536,7 @@ class BookRecallAgent:
         elif state.intent in {"theme_explore", "compare", "causal", "semantic_search"}:
             evidence = evidence[: DEFAULT_SEARCH_SETTINGS.top_k_parents]
         evidence = _apply_preferred_evidence_depth(evidence, state.user_preferences)
+        self._synthesize_answer(state, evidence)
         validation = self._validate_answer(state, evidence)
         suggestions = list(state.suggestions or [])
         if validation.get("suggested_note") and validation.get("suggested_note") not in suggestions:
@@ -507,8 +554,34 @@ class BookRecallAgent:
             suggestions=suggestions,
             user_preferences=_public_preferences(state.user_preferences),
             query_understanding=_public_query_understanding(state),
+            answer_synthesis=state.answer_synthesis,
             answer_validation=validation,
         )
+
+    def _synthesize_answer(self, state: AgentState, evidence: list[EvidenceCard]) -> None:
+        if self.query_understanding_client is None:
+            state.answer_synthesis = {"used": False, "source": "skipped", "reason": "local_llm_disabled"}
+            return
+        synthesis = synthesize_answer_with_llm(
+            question=state.question,
+            draft_answer=state.answer or "",
+            progress_chapter=state.progress_chapter,
+            evidence=[
+                {
+                    "chapter_number": item.chapter_number,
+                    "chapter_title": item.chapter_title,
+                    "excerpt": item.excerpt,
+                    "reason": item.reason,
+                }
+                for item in evidence
+            ],
+            client=self.query_understanding_client,
+        )
+        state.answer_synthesis = synthesis.to_dict()
+        if synthesis.used and synthesis.answer:
+            state.answer = synthesis.answer
+            if synthesis.summary:
+                state.summary = synthesis.summary
 
     def _validate_answer(self, state: AgentState, evidence: list[EvidenceCard]) -> dict[str, object]:
         if self.query_understanding_client is None:

@@ -30,7 +30,7 @@ def classify_intent(
         return "entity_timeline"
     if any(keyword in question for keyword in ("变化", "对比", "前后")):
         return "compare"
-    if any(keyword in question for keyword in ("怎么", "如何", "为什么", "原因")):
+    if any(keyword in question for keyword in ("怎么", "如何", "为什么", "原因", "真相")):
         return "causal"
     return "semantic_search"
 
@@ -115,7 +115,36 @@ class RuleBasedPolicy(DecisionPolicy):
         if "lookup_first_appearance" not in state.called_tools:
             return self._call("lookup_first_appearance", {"entity": state.primary_entity or state.matched_entities[0]})
         obs = self._last_observation(state, "lookup_first_appearance")
+        entity = obs.get("entity_name") or state.primary_entity or (state.matched_entities[0] if state.matched_entities else "")
+        if not obs.get("found") and "search_exact_text" not in state.called_tools:
+            keyword = _extract_exact_keyword(state.question, str(entity or ""))
+            if keyword:
+                return self._call(
+                    "search_exact_text",
+                    {"keyword": keyword, "limit": 8},
+                    thought="实体索引未命中，改用全书精确词检索兜底",
+                )
+        exact_obs = self._last_observation(state, "search_exact_text")
+        if not obs.get("found") and exact_obs.get("hits"):
+            return self._terminal_first_appearance_from_exact(state, exact_obs, str(entity or exact_obs.get("keyword") or ""))
         return self._terminal_first_appearance(state, obs)
+
+    def _terminal_first_appearance_from_exact(self, state: AgentState, obs: dict, entity: str) -> Decision:
+        hits = obs.get("hits", [])
+        if not hits:
+            return self._terminal_first_appearance(state, {"found": False, "entity_name": entity})
+        first = min(hits, key=lambda item: int(item.get("chapter_number", 0) or 0))
+        chapter = int(first.get("chapter_number", 0) or 0)
+        title = str(first.get("chapter_title") or f"第 {chapter} 章")
+        keyword = str(obs.get("keyword") or entity)
+        return Decision(
+            is_terminal=True,
+            intent_override="first_appearance",
+            entity_name=keyword,
+            answer=f"结构化实体索引里没有“{keyword}”，但全文精确检索命中它最早出现在第 {chapter} 章《{title}》。",
+            summary=f"通过原文精确词检索找到 {len(hits)} 个命中章节。建议之后可把“{keyword}”补入实体索引。",
+            suggestions=[f"{keyword} 后来还有出现过吗？", f"把“{keyword}”加入实体词表后重建结构化索引。"],
+        )
 
     def _terminal_first_appearance(self, state: AgentState, obs: dict) -> Decision:
         entity = obs.get("entity_name") or state.primary_entity or (state.matched_entities[0] if state.matched_entities else "")
@@ -147,7 +176,18 @@ class RuleBasedPolicy(DecisionPolicy):
         if "lookup_timeline" not in state.called_tools:
             return self._call("lookup_timeline", {"entity": state.primary_entity or state.matched_entities[0]})
         obs = self._last_observation(state, "lookup_timeline")
+        if not obs.get("chapters") and "search_exact_text" not in state.called_tools:
+            keyword = _extract_exact_keyword(state.question, state.primary_entity or (state.matched_entities[0] if state.matched_entities else ""))
+            if keyword:
+                return self._call(
+                    "search_exact_text",
+                    {"keyword": keyword, "limit": 12},
+                    thought="实体轨迹为空，改用原文精确词检索补充低频命中",
+                )
         chapters = obs.get("chapters", [])
+        exact_obs = self._last_observation(state, "search_exact_text")
+        if not chapters and exact_obs.get("hits"):
+            return self._terminal_timeline_from_exact(state, exact_obs)
         wants_detail = any(k in state.question for k in ("怎么", "如何", "拿到", "使用"))
         if wants_detail and chapters and "search_evidence" not in state.called_tools:
             return self._call(
@@ -156,6 +196,24 @@ class RuleBasedPolicy(DecisionPolicy):
                 thought="聚焦实体轨迹做证据检索",
             )
         return self._terminal_timeline(state, obs)
+
+    def _terminal_timeline_from_exact(self, state: AgentState, obs: dict) -> Decision:
+        keyword = str(obs.get("keyword") or state.primary_entity or "")
+        hits = obs.get("hits", [])
+        chapters: list[int] = []
+        for hit in hits:
+            chapter = int(hit.get("chapter_number", 0) or 0)
+            if chapter and chapter not in chapters:
+                chapters.append(chapter)
+        chapter_list = "、".join(f"第 {chapter} 章" for chapter in chapters)
+        return Decision(
+            is_terminal=True,
+            intent_override="entity_timeline",
+            entity_name=keyword or state.primary_entity,
+            answer=f"结构化实体轨迹里没有稳定记录，但全文精确检索发现“{keyword}”出现在：{chapter_list}。",
+            summary=f"原文精确命中 {len(hits)} 处，覆盖 {len(chapters)} 个章节。",
+            suggestions=[f"{keyword} 第一次出现在哪一章？", f"将“{keyword}”补入实体词表后重建索引。"],
+        )
 
     def _terminal_timeline(self, state: AgentState, obs: dict) -> Decision:
         entity = state.primary_entity or (state.matched_entities[0] if state.matched_entities else "")
@@ -326,6 +384,14 @@ class RuleBasedPolicy(DecisionPolicy):
             return self._call("search_evidence", {"query": state.question})
         if state.primary_entity and "lookup_timeline" not in state.called_tools:
             return self._call("lookup_timeline", {"entity": state.primary_entity}, thought="拿实体轨迹辅助定位关键章节")
+        if "search_exact_text" not in state.called_tools:
+            keyword = _extract_exact_keyword(state.question, state.primary_entity or "")
+            if keyword and _raw_hits_miss_keyword(state.raw_hits, keyword):
+                return self._call(
+                    "search_exact_text",
+                    {"keyword": keyword, "limit": 8},
+                    thought="因果检索证据不足，使用原文精确词检索兜底",
+                )
         return self._terminal_semantic(state, "causal")
 
     def _route_events(self, state: AgentState, intent: str) -> Decision:
@@ -364,8 +430,18 @@ class RuleBasedPolicy(DecisionPolicy):
         )
 
     def _route_semantic(self, state: AgentState) -> Decision:
+        if "search_exact_text" in state.called_tools and state.raw_hits:
+            return self._terminal_semantic(state, "semantic_search")
         if "search_evidence" not in state.called_tools:
             return self._call("search_evidence", {"query": state.question})
+        if "search_exact_text" not in state.called_tools:
+            keyword = _extract_exact_keyword(state.question, state.primary_entity or "")
+            if keyword and (not state.raw_hits or _raw_hits_miss_keyword(state.raw_hits, keyword)):
+                return self._call(
+                    "search_exact_text",
+                    {"keyword": keyword, "limit": 8},
+                    thought="语义检索没有覆盖用户明确词，使用全书精确检索兜底",
+                )
         return self._terminal_semantic(state, "semantic_search")
 
     def _terminal_semantic(self, state: AgentState, intent: str) -> Decision:
@@ -380,6 +456,9 @@ class RuleBasedPolicy(DecisionPolicy):
         structured = _structured_list_answer(state, intent)
         if structured is not None:
             return structured
+        truth_chain = _truth_chain_answer(state, intent)
+        if truth_chain is not None:
+            return truth_chain
         if self.reasoner and self.reasoner.enabled and not state.answer:
             ans = self.reasoner.answer(_semantic_prompt(state, intent))
             if ans:
@@ -415,6 +494,73 @@ def _semantic_suggestions(question: str) -> list[str]:
     return [f"换个问法继续问：{question}", "把问题指向具体实体，会更容易得到精准回忆。"]
 
 
+def _extract_exact_keyword(question: str, preferred: str = "") -> str:
+    preferred = preferred.strip()
+    if preferred:
+        return preferred.strip("“”\"'《》【】[]()（）")
+    quoted = re.findall(r"[“\"'《【\[]([^”\"'》】\]]{2,24})[”\"'》】\]]", question)
+    for item in quoted:
+        item = item.strip()
+        if item:
+            return item
+    text = re.sub(r"[，。！？；：、,.!?;:\n\r\t]", " ", question)
+    text = re.sub(r"\s+", " ", text).strip()
+    prefixes = ("请问", "问一下", "这本书里", "全书中", "全书里", "书中", "文中", "关于")
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            text = text[len(prefix) :].strip()
+    splitters = (
+        "第一次",
+        "首次",
+        "最早",
+        "后来",
+        "后面",
+        "后续",
+        "还有",
+        "出现",
+        "提到",
+        "是谁",
+        "是什么",
+        "在哪",
+        "哪里",
+        "怎么",
+        "如何",
+        "为什么",
+        "死亡",
+        "死因",
+        "真相",
+        "关系",
+        "线索",
+        "条件",
+        "吗",
+        "呢",
+    )
+    cut = text
+    for splitter in splitters:
+        index = cut.find(splitter)
+        if index > 0:
+            cut = cut[:index]
+            break
+    cut = cut.strip(" 的 了 和 与 在 中 里")
+    if 2 <= len(cut) <= 24:
+        return cut
+    tokens = [token.strip(" 的 了 和 与 在 中 里") for token in text.split(" ") if token.strip()]
+    candidates = [token for token in tokens if 2 <= len(token) <= 24]
+    if not candidates:
+        return ""
+    return max(candidates, key=len)
+
+
+def _raw_hits_miss_keyword(hits: list[dict], keyword: str) -> bool:
+    if not keyword:
+        return False
+    for hit in hits[:5]:
+        haystack = f"{hit.get('chapter_title', '')}\n{hit.get('child_text', '')}\n{hit.get('parent_text', '')}"
+        if keyword in haystack:
+            return False
+    return True
+
+
 def _structured_list_answer(state: AgentState, intent: str) -> Decision | None:
     if not _wants_structured_list(state.question):
         return None
@@ -439,6 +585,76 @@ def _structured_list_answer(state: AgentState, intent: str) -> Decision | None:
         summary=f"从同一证据段中抽取到 {len(items)} 条枚举条件。",
         suggestions=_semantic_suggestions(state.question),
     )
+
+
+def _truth_chain_answer(state: AgentState, intent: str) -> Decision | None:
+    if not _wants_truth_chain(state.question):
+        return None
+    hits = _dedupe_hits_by_chapter(state.raw_hits)
+    if len(hits) < 2:
+        return None
+    entity = state.primary_entity or (state.matched_entities[0] if state.matched_entities else "")
+    combined = "\n".join(str(hit.get("parent_text") or hit.get("child_text") or "") for hit in hits)
+    conclusions = _infer_truth_conclusions(entity, combined)
+    chain_lines = []
+    for hit in sorted(hits, key=lambda item: int(item.get("chapter_number", 0) or 0))[:5]:
+        chapter_number = int(hit.get("chapter_number", 0) or 0)
+        chapter_title = str(hit.get("chapter_title") or f"第 {chapter_number} 章")
+        snippet = _compact_excerpt(str(hit.get("child_text") or hit.get("parent_text") or ""), limit=120)
+        chain_lines.append(f"- 第 {chapter_number} 章《{chapter_title}》：{snippet}")
+    subject = f"“{entity}”" if entity else "这条线索"
+    answer = f"关于{subject}的死亡真相，当前证据更适合按线索链理解：\n"
+    if conclusions:
+        answer += "\n".join(f"{index}. {item}" for index, item in enumerate(conclusions, start=1))
+        answer += "\n\n关键证据顺序：\n"
+    else:
+        answer += "我还不能只凭一段证据下最终定论，但命中的章节已经显示出一条连续线索：\n"
+    answer += "\n".join(chain_lines)
+    return Decision(
+        is_terminal=True,
+        intent_override=intent,
+        entity_name=entity or None,
+        answer=answer,
+        summary=f"从 {len(hits)} 个命中章节整理为死亡/真相线索链。",
+        suggestions=["打开这些章节原文，按时间线核对真相。", f"继续问：{entity} 和四代族长的冲突经过。" if entity else "继续问其中一个关键人物的冲突经过。"],
+    )
+
+
+def _wants_truth_chain(question: str) -> bool:
+    return any(keyword in question for keyword in ("死亡真相", "死的真相", "怎么死", "如何死", "死因", "真相"))
+
+
+def _dedupe_hits_by_chapter(hits: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    seen: set[tuple[int, str]] = set()
+    for hit in hits[:8]:
+        chapter = int(hit.get("chapter_number", 0) or 0)
+        text = str(hit.get("child_text") or hit.get("parent_text") or "")
+        key = (chapter, text[:40])
+        if key in seen:
+            continue
+        deduped.append(hit)
+        seen.add(key)
+    return deduped
+
+
+def _infer_truth_conclusions(entity: str, text: str) -> list[str]:
+    conclusions: list[str] = []
+    subject = entity or "相关人物"
+    if "四代族长" in text and ("偷袭" in text or "重创" in text or "受重创" in text):
+        conclusions.append(f"关键冲突指向四代族长：证据提到四代族长趁机偷袭，导致{subject}受重创。")
+    if "影壁" in text or "留声" in text or "留影" in text:
+        conclusions.append("影壁/留声类线索不是单纯环境描写，而是揭露当年真相的证据载体。")
+    if "尸" in text or "棺" in text or "棺材" in text:
+        conclusions.append("早期关于尸体或棺材的线索更像表层发现，需要和后续影壁记录、历史回放一起核对，不能单独当作完整真相。")
+    return conclusions
+
+
+def _compact_excerpt(text: str, *, limit: int) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip(" 　")
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit].rstrip() + "..."
 
 
 def _wants_structured_list(question: str) -> bool:

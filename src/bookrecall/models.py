@@ -132,4 +132,5 @@ class MemoryCard:
     suggestions: list[str] = field(default_factory=list)
     user_preferences: dict[str, object] = field(default_factory=dict)
     query_understanding: dict[str, object] = field(default_factory=dict)
+    answer_synthesis: dict[str, object] = field(default_factory=dict)
     answer_validation: dict[str, object] = field(default_factory=dict)

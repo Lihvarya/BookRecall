@@ -35,6 +35,7 @@ TOOLS = {
     "search_theme",
     "search_events",
     "search_evidence",
+    "search_exact_text",
     "lookup_entity_aliases",
     "get_chapter_summary",
     "list_entities",
@@ -218,7 +219,7 @@ def _prompt(
 first_appearance, entity_timeline, relation_lookup, theme_explore, event_chain, compare, causal, semantic_search
 
 可选 tools 只能是：
-lookup_first_appearance, lookup_timeline, lookup_relations, search_theme, search_events, search_evidence, lookup_entity_aliases, get_chapter_summary, list_entities
+lookup_first_appearance, lookup_timeline, lookup_relations, search_theme, search_events, search_evidence, search_exact_text, lookup_entity_aliases, get_chapter_summary, list_entities
 
 规则：
 1. entities 必须优先使用已知实体或最近会话实体；不要编造实体。

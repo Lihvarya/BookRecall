@@ -279,6 +279,7 @@ export interface AnswerCard {
   trace?: TraceItem[];
   user_preferences?: UserPreferences;
   query_understanding?: Record<string, unknown>;
+  answer_synthesis?: Record<string, unknown>;
   answer_validation?: Record<string, unknown>;
   runtime?: Record<string, unknown>;
   session?: {

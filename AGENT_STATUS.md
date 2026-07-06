@@ -156,6 +156,7 @@ SQLite 已覆盖的核心表：
 | `search_theme` | 查主题线索 |
 | `search_events` | 查事件链 |
 | `search_evidence` | 检索证据片段 |
+| `search_exact_text` | 全书原文精确词检索，兜底低频/未入索引实体 |
 | `lookup_entity_aliases` | 查实体别名 |
 | `get_chapter_summary` | 查章节摘要 |
 | `list_entities` | 列出实体 |
@@ -166,6 +167,7 @@ SQLite 已覆盖的核心表：
 - 条件/标准/要求类问题会优先从证据段中抽取“第一、第二、第三、第四”等枚举结构。
 - 无实体条件类问题会绕开本地 LLM Planner 的误规划，优先走规则策略。
 - `search_evidence` 会返回 `parent_text`，便于规则策略从更完整上下文抽取答案。
+- 增加 `search_exact_text`，当结构化实体索引或语义召回漏掉只出现一次/少数几次的专名时，自动退回原文精确词检索。
 
 现状判断：
 

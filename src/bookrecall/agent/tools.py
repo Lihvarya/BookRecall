@@ -261,6 +261,61 @@ def _tool_search_evidence(retriever: LocalRetriever) -> Tool:
     )
 
 
+def _tool_search_exact_text(store: BookRecallStore) -> Tool:
+    def run(state: AgentState, args: dict) -> dict:
+        keyword = str(args.get("keyword") or args.get("query") or "").strip()
+        if not keyword:
+            return {"hits": [], "count": 0, "keyword": "", "spoiler_blocked": False}
+        progress = _normalize_max_chapter(state, args.get("max_chapter"))
+        limit = int(args.get("limit") or 12)
+        rows = store.search_exact_text(
+            state.book_id,
+            keyword,
+            max_chapter=progress,
+            limit=limit,
+        )
+        hits: list[dict] = []
+        for index, row in enumerate(rows, start=1):
+            excerpt = str(row["excerpt"])
+            hits.append(
+                {
+                    "chapter_number": int(row["chapter_number"]),
+                    "chapter_title": str(row["chapter_title"]),
+                    "child_text": excerpt,
+                    "parent_text": excerpt,
+                    "parent_id": f"exact:{state.book_id}:{row['chapter_number']}:{row['position']}",
+                    "score": 1.0 / index,
+                    "position": int(row["position"]),
+                    "keyword": str(row["keyword"]),
+                }
+            )
+        return {
+            "hits": hits,
+            "count": len(hits),
+            "keyword": keyword,
+            "spoiler_blocked": False,
+            "mode": "exact_text",
+        }
+
+    return Tool(
+        schema=ToolSchema(
+            name="search_exact_text",
+            description="在已读范围内做全书原文精确词检索，不依赖实体索引、向量或重排；适合查只出现一次/少数几次的专名、道具、地名、术语。",
+            parameters={
+                "keyword": {"type": "str", "required": True, "desc": "要精确查找的词或短语，例如人物名、道具名、地名。"},
+                "max_chapter": {"type": "int", "required": False},
+                "limit": {"type": "int", "required": False, "desc": "最多返回多少个命中章节，默认 12，最高 50。"},
+            },
+            returns={
+                "hits": "list[{chapter_number,chapter_title,child_text,parent_text,position,keyword,score}]",
+                "count": "int",
+                "keyword": "str",
+            },
+        ),
+        run=run,
+    )
+
+
 def _tool_lookup_relations(store: BookRecallStore, retriever: Retriever) -> Tool:
     def run(state: AgentState, args: dict) -> dict:
         source = str(args.get("source_entity", "")).strip()
@@ -757,6 +812,7 @@ def build_default_registry(store: BookRecallStore, retriever: Retriever) -> Tool
     registry.register(_tool_search_theme(store))
     registry.register(_tool_search_events(store))
     registry.register(_tool_search_evidence(retriever))
+    registry.register(_tool_search_exact_text(store))
     registry.register(_tool_lookup_entity_aliases(store))
     registry.register(_tool_get_chapter_summary(store))
     registry.register(_tool_list_entities(store))
