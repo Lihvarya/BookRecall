@@ -1,104 +1,50 @@
 # BookRecall
 
-BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。
+BookRecall 是一个面向长篇阅读场景的本地阅读记忆 Agent。它的目标不是“替你读书”，而是在你读完很久以后，帮你快速找回人物、道具、事件、主题和原文证据。
 
-它的目标不是“替你读书”，而是帮你在读完很久之后，仍然能快速找回：
+它特别适合这类问题：
 
-- 某个人物第一次出现在哪一章
-- 某个道具后来还出现过没有
-- 某条线索在你已读范围内是怎么发展的
-- 某个主题在前后章节里发生了什么变化
+- “某个人物第一次出现在哪一章？”
+- “这个道具后来还有出现过吗？”
+- “第 50 章那个黑衣人后来是谁？”
+- “成为尊者条件是什么？”
+- “这本书里关于自由意志的观点前后有什么变化？”
 
-和普通 RAG 不同，BookRecall 不是只靠向量检索。它把结构化实体索引、章节级上下文、细粒度证据片段和一个可控的 ReAct Agent 组合起来，优先解决“第一次出现”“有没有再出现”“不要剧透”这类阅读回忆问题。
+BookRecall 和普通 RAG 的区别在于：它不是只靠向量检索，而是把章节解析、结构化索引、向量召回、重排模型、阅读进度保护和 Agent 工具规划组合在一起，尽量做到“定位准确、有原文证据、不过度剧透”。
 
-![1783146838804](image/README/1783146838804.png)
+![BookRecall](image/README/1783146838804.png)
 
-## 项目特点
+## 当前状态
 
-- 本地三层索引：章节解析 -> parent/child chunk -> 结构化实体索引。
-- 章节解析支持常见网文目录，包括“第一卷 卷名 / 第一节：小节名”这类分卷结构。
-- 强顺序问题可精确回答：例如“第一次出现在哪一章”。
-- 三重防剧透：用户阅读进度会限制检索、工具调用和最终证据输出。
-- 默认零运行时依赖：核心链路只用 Python 标准库。
-- 可选本地 embedding：支持 `sentence-transformers` 本地语义检索。
-- 可选外部大模型：支持 OpenAI-compatible API，例如 DeepSeek。
-- 内置网页端：可以查看书库、设置阅读进度、切换检索器、配置外部 API、查看本地模型状态。
-- 人物关系第一版：基于同章共现和关键词粗分类，支持按阶段回答“谁和谁是什么关系/后来如何变化”。
-- 主题线索第一版：支持自动发现/手工指定主题词，并按阶段回答“某个观点前后有什么变化”。
-- 事件链第一版：基于实体共现和事件关键词抽取关键事件，支持回答“某个实体涉及哪些关键事件/主线发生了什么”。
+BookRecall 目前是一个可运行的本地 Agent MVP，已经具备：
 
-## 当前能力
+- 本地 SQLite 书库和索引。
+- 中文长篇 TXT 章节解析，支持“卷 / 节 / 章”结构。
+- Parent / Child 分层切块。
+- 实体、关系、主题、事件、章节摘要等结构化索引。
+- 阅读进度保护，工具调用和最终证据都会被限制在已读范围内。
+- CLI 命令行工具。
+- Vue 3 + Vite + TypeScript Web 控制台。
+- TXT 文件导入，不在页面预览全文，避免大文件卡住前端。
+- Two-Phase Indexing：导入阶段优先构建基础索引和向量索引，复杂结构化理解按需调用本地 LLM。
+- Qwen3 Embedding + Qwen3 Reranker 本地召回链路。
+- 本地 Qwen / LM Studio / OpenAI-compatible endpoint 接入入口。
+- 多轮对话、会话历史、历史轮次编辑、工具调用轨迹展示。
 
-截至当前代码状态，BookRecall 已经具备以下能力：
+更细的工程状态请看 [AGENT_STATUS.md](AGENT_STATUS.md)。
 
-- CLI 可用：
-  - `build`
-  - `ask`
-  - `set-progress`
-  - `show-progress`
-  - `list-books`
-  - `list-entities`
-  - `list-themes`
-  - `chapters`
-  - `stats`
-  - `clear`
-  - `serve`
-  - `models`
-  - `embed-build`
-  - `embed-search`
-- Agent 可用：
-  - 手写 ReAct 状态机
-  - 规则策略 `RuleBasedPolicy`
-  - 可选云端策略 `LLMReActPolicy`
-  - 原生 tool calling 优先，文本协议回退
-  - 会话级连续追问记忆
-  - 关系查询意图 `relation_lookup`
-  - 主题线索意图 `theme_explore`
-  - 事件链回忆意图 `event_chain`
-  - 可选 `LangGraphPolicy` 图策略（安装 `langgraph` 后可用）
-- Web 可用：
-  - 书库总览
-  - 本地 TXT 文件导入并创建索引
-  - 索引规模统计
-  - 实体索引浏览
-  - 主题线索浏览
-  - 事件链浏览
-  - 关系索引浏览
-  - 章节概览
-  - 原文阅读器与证据片段高亮
-  - 阅读进度管理
-  - 会话级连续追问
-  - 本轮工具 trace
-  - 快捷提问模板
-  - 问答卡片
-  - 检索器切换
-  - DeepSeek / OpenAI-compatible API 设置
-  - 本地 embedding 与向量索引状态查看
-  - 当前书向量索引构建
-  - 召回层证据检索测试
-  - 多本书分组与标签管理
-  - 控制台偏好本地持久化
-  - 删除书籍数据、删除向量索引、重建结构化索引
-  - 长会话历史查看、编辑、删除与重新提问
-- 本地 embedding 可用：
-  - `sentence-transformers`
-  - 推荐模型：`BAAI/bge-small-zh-v1.5`
-  - 本地向量索引保存到 `.bookrecall/vectors/`
-  - 支持 `numpy / faiss` 双后端，环境无 `faiss` 时自动回退
+## 推荐架构
 
-如果你想看“已经实现了什么、还差什么”，请看 [AGENT_STATUS.md](/D:/BookRecall/AGENT_STATUS.md)。
-
-## 技术架构
+当前推荐链路是：
 
 ```text
-User Question
+User Query
    |
    v
 BookRecall Agent
-   |- Policy
-   |  |- RuleBasedPolicy
-   |  |- LLMReActPolicy (optional)
-   |  `- LangGraphPolicy (optional)
+   |
+   |- Query Understanding / Planner
+   |  `- 本地 Qwen3.5-4B 或 OpenAI-compatible API
    |
    |- Tools
    |  |- lookup_first_appearance
@@ -111,675 +57,534 @@ BookRecall Agent
    |  |- get_chapter_summary
    |  `- list_entities
    |
-   |- Retriever
-   |  |- LocalRetriever
-   |  `- EmbeddingRetriever (optional)
+   |- Retrieval
+   |  |- LocalRetriever：倒排检索，稳定兜底
+   |  |- EmbeddingRetriever：Qwen3-Embedding-0.6B 粗召回
+   |  `- CrossEncoderReranker：Qwen3-Reranker-0.6B 精排
    |
-   `- Render
-      |- text
-      `- json
-
-Local Storage Layer
-   |- SQLite
-   |- chapters
-   |- parent_chunks
-   |- child_chunks
-   |- entities / aliases / mentions
-   |- relations / relation_mentions
-   |- themes / theme_aliases / theme_mentions
-   |- events / event_entities
-   |- reader_state
-   `- agent_memory
-
-Optional Cloud Layer
-   `- OpenAI-compatible Chat Completions
+   `- MemoryCard
+      |- 回答
+      |- 章节定位
+      |- 原文证据
+      |- 工具 trace
+      `- 防剧透状态
 ```
 
-## 依赖说明
+本地数据层：
 
-### 核心模式
+```text
+D:\BookRecall
+   |- .bookrecall/
+   |  |- bookrecall.db        SQLite 数据库
+   |  `- vectors/             FAISS / numpy 向量索引
+   |
+   |- .cache/
+   |  |- huggingface/         Hugging Face / sentence-transformers 缓存
+   |  `- torch/               torch 缓存
+   |
+   |- models/
+   |  |- Qwen3-Embedding-0.6B
+   |  |- Qwen3-Reranker-0.6B
+   |  `- llm/
+   |
+   |- frontend/               Vue 前端源码
+   |- src/bookrecall/         Python 后端和 Agent
+   |- tests/                  单元测试
+   |- start_bookrecall.ps1    Windows 一键启动脚本
+   `- bookrecall.py           CLI 入口
+```
 
-核心模式默认没有第三方运行时依赖。
+`models/`、`.cache/`、`.bookrecall/` 都不会进入 Git。
 
-- Python `>=3.11`
-- SQLite 使用 Python 标准库内置模块
-- Web 使用 Python 标准库 `http.server`
-- 云端 API 调用使用 Python 标准库 `urllib`
+## 模型选择
 
-也就是说，最基础的 `build / ask / serve` 可以不安装任何额外包。
+当前默认推荐：
 
-### 可选依赖
-
-`pyproject.toml` 中目前定义了这些可选依赖组：
-
-- `embedding`
-  - `numpy>=1.26.0`
-  - `sentence-transformers>=3.0.0`
-- `faiss`
-  - `faiss-cpu>=1.8.0`
-- `graph`
-  - `langgraph>=0.2.0`
-- `local-llm`
-  - `llama-cpp-python>=0.2.90`
-  - 用于直接加载 Qwen3 4bit GGUF 模型做智能结构化索引
-- `full`
-  - `numpy>=1.26.0`
-  - `langgraph>=0.2.0`
-  - `llama-index>=0.11.0`
-  - `faiss-cpu>=1.8.0`
-  - `llama-cpp-python>=0.2.90`
-  - `sentence-transformers>=3.0.0`
-  - `streamlit>=1.36.0`
+| 用途 | 推荐模型 | 说明 |
+| --- | --- | --- |
+| Embedding 粗召回 | `Qwen/Qwen3-Embedding-0.6B` | 替代旧的 `BAAI/bge-small-zh-v1.5`，语义召回更强 |
+| Reranker 精排 | `Qwen/Qwen3-Reranker-0.6B` | 对候选证据重新排序，提高命中准确率 |
+| 本地 Agent / 按需结构化理解 | 本地 Qwen3.5-4B 或 Qwen3-4B GGUF | 可通过 LM Studio / llama.cpp / OpenAI-compatible endpoint 接入 |
 
 注意：
 
-- 当前代码已经实际使用的是 `embedding / faiss / graph` 这几组。
-- `full` 里的很多能力还没有全部在代码中接通，它更像未来路线预留。
-- `cloud` 依赖组目前为空，因为云端 API 走的是标准库。
+- 当前 embedding / reranker 代码使用 `sentence-transformers`，需要 Hugging Face 原版模型目录，不是 GGUF 单文件。
+- GGUF 更适合本地对话 LLM，不适合直接填到 embedding / reranker 字段。
+- 旧 BGE 向量索引不会自动变成 Qwen 索引。切换 Qwen embedding 后，需要重建向量索引。
 
-## 安装方式
+## 环境要求
 
-### 方式一：直接运行仓库
+最低要求：
 
-```bash
-git clone <your-repo-url>
-cd BookRecall
-python bookrecall.py --help
-```
+- Python `>=3.11`
+- Windows / macOS / Linux 均可，当前项目主要在 Windows 路径下验证
+- 基础 CLI 和基础 Web 可只使用 Python 标准库
 
-这是最简单的方式，不需要先安装成包。
+推荐本地模型配置：
 
-### 方式二：开发模式安装
+- NVIDIA GPU：RTX 3060 Laptop 6GB 或更高
+- CPU：Intel 12700H 级别或更高
+- 内存：16GB 起步，32GB 更舒服
+- 磁盘：建议预留 10GB 以上
 
-```bash
-git clone <your-repo-url>
-cd BookRecall
+前端开发需要：
+
+- Node.js
+- npm
+
+## 安装
+
+### 1. 创建虚拟环境
+
+PowerShell：
+
+```powershell
+cd D:\BookRecall
 python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+.\.venv\Scripts\python.exe -m pip install -U pip
 ```
 
-安装后可以直接使用：
+### 2. 安装 Python 依赖
 
-```bash
-bookrecall --help
-```
-
-### 安装本地 embedding 能力
-
-```bash
-pip install -e .[embedding]
-```
-
-如果想启用 FAISS 向量后端和 LangGraph Agent 图策略，可以继续安装：
-
-```bash
-pip install -e .[faiss,graph]
-```
-
-### 安装本地 Qwen3 智能索引能力
-
-BookRecall 支持使用 `Qwen3-4B-Instruct-2507` 的 4bit GGUF 量化模型升级实体、关系和事件索引。
-
-推荐把模型文件放在：
+基础安装：
 
 ```powershell
-D:\BookRecall\models\llm\
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-如果要让 BookRecall 进程内直接加载 GGUF，需要安装可选依赖：
+推荐安装本地召回能力：
 
 ```powershell
-pip install -e .[local-llm]
+.\.venv\Scripts\python.exe -m pip install -e ".[embedding,faiss,graph]"
 ```
 
-也可以不安装 `llama-cpp-python`，改用 llama.cpp server、LM Studio、Ollama/OpenAI-compatible 网关等本地服务，然后在网页端填写 endpoint，例如：
-
-```text
-http://127.0.0.1:8080
-```
-
-CLI 示例：
+如果要在进程内直接加载 GGUF 本地 LLM，可额外安装：
 
 ```powershell
-.\.venv\Scripts\python.exe bookrecall.py build `
-  --book-id my_book `
-  --input D:\Books\my_book.txt `
-  --smart-index `
-  --smart-index-model D:\BookRecall\models\llm\qwen3-4b-instruct-2507-q4_k_m.gguf
-```
-
-智能索引会先用本地规则生成候选，再让 Qwen3 判断实体、关系和事件是否有证据，最后做 JSON 校验和实体名校验。没有明确证据的关系不会进入图谱。
-
-如果你在 Windows + NVIDIA GPU 上使用，也可以手动先装好适配你 CUDA 版本的 `torch`，再安装：
-
-```bash
-pip install sentence-transformers
-```
-
-## 快速开始
-
-### 1. 用示例书建索引
-
-```bash
-python bookrecall.py build \
-  --book-id sample \
-  --input examples/sample_book.txt \
-  --entities examples/sample_entities.txt
-```
-
-如果你有主题词表，也可以加：
-
-```bash
-python bookrecall.py build \
-  --book-id sample \
-  --input examples/sample_book.txt \
-  --entities examples/sample_entities.txt \
-  --themes examples/sample_themes.txt
-```
-
-### 2. 设置阅读进度
-
-```bash
-python bookrecall.py set-progress \
-  --book-id sample \
-  --user default \
-  --chapter 3
-```
-
-### 3. 提问
-
-```bash
-python bookrecall.py ask \
-  --book-id sample \
-  --question "黑袍人第一次出现在哪一章？"
-```
-
-也可以询问两个实体的关系和阶段变化：
-
-```bash
-python bookrecall.py ask \
-  --book-id sample \
-  --question "林澈和黑衣人是什么关系？"
-```
-
-也可以询问主题线索：
-
-```bash
-python bookrecall.py ask \
-  --book-id sample \
-  --question "自由意志的观点前后有什么变化？"
-```
-
-也可以询问事件链：
-
-```bash
-python bookrecall.py ask \
-  --book-id sample \
-  --question "星辰之匙涉及哪些关键事件？"
-```
-
-### 4. 输出 JSON 卡片
-
-```bash
-python bookrecall.py ask \
-  --book-id sample \
-  --format json \
-  --question "黑袍人第一次出现在哪一章？"
-```
-
-### 5. 在同一会话里连续追问
-
-```bash
-python bookrecall.py ask \
-  --book-id sample \
-  --session demo-thread \
-  --question "黑袍人第一次出现在哪一章？"
-
-python bookrecall.py ask \
-  --book-id sample \
-  --session demo-thread \
-  --question "后来还有出现过吗？"
+.\.venv\Scripts\python.exe -m pip install -e ".[local-llm]"
 ```
 
 说明：
 
-- `--session` 是可选参数。
-- 只要 `book_id + user + session_id` 一致，Agent 就会复用同一会话最近几轮的上下文。
-- 当前第一版主要复用“最近主实体”和简短问答摘要，适合连续追问“后来呢”“那他还有出现吗”这类问题。
+- `embedding` 包含 `numpy` 和 `sentence-transformers`。
+- `faiss` 包含 `faiss-cpu`，用于更快的向量索引。
+- `graph` 包含 `langgraph`，用于可选图策略。
+- 云端 OpenAI-compatible API 调用使用 Python 标准库，不需要额外 cloud 依赖。
 
-## Web 界面
+### 3. 安装前端依赖
 
-### 一键启动（Windows）
-
-双击项目根目录的 `start_bookrecall.bat`，或在 PowerShell 中运行：
+如果你要修改或重新构建 Web 前端：
 
 ```powershell
+cd D:\BookRecall\frontend
+npm install
+npm run build
+```
+
+仓库里 Python Web 服务会优先读取 `frontend/dist`。如果没有构建产物，会回退到后端内置的 legacy 静态页面。
+
+## 下载本地模型
+
+推荐把模型下载到 `D:\BookRecall\models`，不要放到 C 盘。
+
+PowerShell：
+
+```powershell
+cd D:\BookRecall
+
+$env:HF_HOME="D:\BookRecall\.cache\huggingface"
+$env:SENTENCE_TRANSFORMERS_HOME="D:\BookRecall\.cache\huggingface\sentence-transformers"
+$env:HF_HUB_DISABLE_SYMLINKS_WARNING="1"
+$env:HF_HUB_DISABLE_XET="1"
+```
+
+下载 Embedding：
+
+```powershell
+.\.venv\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Embedding-0.6B', local_dir=r'D:\BookRecall\models\Qwen3-Embedding-0.6B', max_workers=1)"
+```
+
+下载 Reranker：
+
+```powershell
+.\.venv\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Reranker-0.6B', local_dir=r'D:\BookRecall\models\Qwen3-Reranker-0.6B', max_workers=1)"
+```
+
+如果网络中断，重新执行同一个命令即可断点续传。完成后目录应类似：
+
+```text
+D:\BookRecall\models\Qwen3-Embedding-0.6B
+   |- config.json
+   |- model.safetensors
+   |- modules.json
+   |- tokenizer.json
+   `- ...
+
+D:\BookRecall\models\Qwen3-Reranker-0.6B
+   |- config.json
+   |- model.safetensors
+   |- modules.json
+   |- tokenizer.json
+   `- ...
+```
+
+BookRecall 会自动把默认模型名：
+
+```text
+Qwen/Qwen3-Embedding-0.6B
+Qwen/Qwen3-Reranker-0.6B
+```
+
+优先映射到：
+
+```text
+D:\BookRecall\models\Qwen3-Embedding-0.6B
+D:\BookRecall\models\Qwen3-Reranker-0.6B
+```
+
+也可以在 Web 设置里直接填写本地模型路径。
+
+## 启动 Web
+
+推荐使用一键脚本：
+
+```powershell
+cd D:\BookRecall
 .\start_bookrecall.ps1
 ```
 
-默认行为：
-
-- 使用 `.\.venv\Scripts\python.exe`，如果不存在则回退到系统 `python`。
-- 默认启动 `http://127.0.0.1:8000` 并自动打开浏览器。
-- 如果 `frontend/dist` 已存在，直接使用已构建的 Vue 控制台。
-- 如果 `frontend/dist` 不存在但 `frontend/node_modules` 存在，会自动运行 `npm run build`。
-- 不会自动执行 `npm install`、`pip install`，也不会主动安装任何依赖。
-- 默认把 Hugging Face / sentence-transformers 缓存指向项目内 `.bookrecall/model_cache`，避免继续写到 C 盘用户缓存目录。
-
-可选参数：
-
-```powershell
-.\start_bookrecall.ps1 -Port 8010
-.\start_bookrecall.ps1 -NoBrowser
-.\start_bookrecall.ps1 -BuildFrontend
-.\start_bookrecall.ps1 -SkipFrontendBuild
-```
-
-启动本地网页：
-
-```bash
-python bookrecall.py serve --host 127.0.0.1 --port 8000
-```
-
-浏览器打开：
+启动后访问：
 
 ```text
 http://127.0.0.1:8000
 ```
 
-网页端当前支持：
-
-- 选择本地 TXT 文件并创建本地索引
-- 临时粘贴正文试跑
-- TXT 文件导入只显示文件摘要和开头短预览，不会把整本书全文写入页面输入框，避免大文件卡顿。
-- 填写实体词表和主题词表
-- 可选覆盖同名 `book_id` 的已有索引
-- 对当前书重建结构化索引
-- 删除当前书本地数据
-- 为书籍设置分组和标签，并按分组筛选书库
-- 选择书籍
-- 查看书库统计
-- 查看实体索引
-- 查看主题线索
-- 查看事件链
-- 查看关系索引
-- 查看章节概览
-- 点击章节或证据卡片打开原文，并高亮证据片段
-- 设置用户阅读进度
-- 输入会话 ID
-- 提交问答
-- 查看会话历史和本轮工具 trace
-- 查看工具调用路径、命中数、防剧透触发次数和每步参数/观察摘要
-- 浏览、刷新并切换当前书籍下的会话与分支
-- 对比两个会话分支的共同前缀、分歧轮次、独有线索、实体和工具调用
-- 编辑、删除历史对话轮次，回放历史工具轨迹，把历史问题放回输入框重新提问，或从某一轮开始重算/新建会话分支
-- 使用“首次出现 / 轨迹追踪 / 关系回忆 / 主题变化 / 关键事件”快捷提问模板
-- 选择 Agent 执行策略：`auto / rule_based / llm_react / langgraph`
-- 选择检索器：`lexical / embedding / auto`
-- 查看本地模型依赖状态
-- 查看每本书是否已有向量索引
-- 为当前书构建本地向量索引
-- 删除当前书向量索引
-- 直接测试当前召回层，查看 lexical / embedding / auto 命中的证据片段，并打开原文高亮
-- 直接配置外部 OpenAI-compatible API
-- 快速套用 DeepSeek / OpenAI 预设
-- 保存控制台偏好：用户、会话、当前书籍、分组筛选、召回策略、云端开关和模型配置
-- 保存当前书籍与用户维度的长期回答偏好：回答风格、关注重点和自定义说明
-
-说明：
-
-- API Key 不会保存在服务端文件中。
-- 如果勾选“保存”，API Key 只会保存在当前浏览器的 `localStorage`。
-- 控制台偏好使用 `bookrecall.preferences`，旧版 `bookrecall.apiSettings` 会自动兼容读取。
-- `langgraph` 是可选依赖；当前本地 `.venv` 已安装时，Web 会显示 `LangGraph ReAct` 可用。未安装时会显示缺依赖，选择它提问会返回明确提示。
-- `faiss` 是可选向量后端；当前本地 `.venv` 已安装时，Web 会显示 `faiss` 可用，并可构建 FAISS 索引。未安装时选择 Auto/Numpy 仍可构建和检索向量索引。
-- `llama-cpp-python` 是可选本地 LLM 后端；缺失时仍可使用本地 OpenAI-compatible endpoint，或继续使用规则索引。
-- 网页端“导入书籍并建索引”不会自动下载 embedding 模型；它只构建 SQLite 本地结构化索引。
-- 如果要使用本地 embedding 检索，可以在网页端点击“构建当前书向量索引”，也可以继续用 CLI 的 `embed-build`。
-- 构建向量索引会加载本地 embedding 模型；如果本地缓存不存在，`sentence-transformers` 可能联网下载模型。
-- 网页端“启用 Qwen3 智能结构化索引”不会自动下载 Qwen3 模型；需要你先准备 GGUF 文件或启动本地模型服务。
-
-### Web 前端结构
-
-当前 Web 端已经从 `web.py` 内部的大字符串拆分为静态资源：
-
-- `src/bookrecall/web_assets/index.html`
-- `src/bookrecall/web_assets/app.css`
-- `src/bookrecall/web_assets/app.js`
-
-服务端仍然使用 Python 标准库 `http.server` 提供页面、静态资源和 JSON API，所以不需要 Node.js、Vite 或 npm 构建步骤。
-
-暂时没有引入前端框架，原因是：
-
-- 当前项目的核心优势是本地零依赖启动，直接 `python bookrecall.py serve` 就能运行。
-- 现有交互还可以由原生 HTML/CSS/JS 稳定承担。
-- 如果后续出现多页面路由、复杂组件复用、拖拽式图谱或大型状态管理，再迁移到 Vite + React/Svelte 会更合适。
-
-### Web API 快速参考
-
-常用接口：
-
-- `GET /api/books`
-- `POST /api/books/build`
-- `POST /api/books/{book_id}/rebuild`
-- `POST /api/books/{book_id}/delete`
-- `POST /api/books/{book_id}/metadata`
-- `GET /api/books/{book_id}/stats`
-- `GET /api/books/{book_id}/entities`
-- `GET /api/books/{book_id}/themes`
-- `GET /api/books/{book_id}/events`
-- `GET /api/books/{book_id}/relations`
-- `GET /api/books/{book_id}/chapters/{chapter_number}`
-- `GET /api/books/{book_id}/preferences`
-- `POST /api/books/{book_id}/preferences`
-- `POST /api/books/{book_id}/vectors`
-- `POST /api/books/{book_id}/vectors/delete`
-- `POST /api/books/{book_id}/search`
-- `GET /api/books/{book_id}/sessions`
-- `GET /api/books/{book_id}/sessions/compare`
-- `POST /api/books/{book_id}/session/turns/{turn_id}`
-- `POST /api/ask`
-- `POST /api/progress`
-
-`POST /api/books/build` 请求体示例：
-
-```json
-{
-  "book_id": "sample",
-  "title": "示例书",
-  "text": "第1章 起点\n\n正文...",
-  "entities": "黑衣人|黑袍人\n星辰之匙|钥匙",
-  "themes": "自由意志|选择",
-  "overwrite": false
-}
-```
-
-`POST /api/books/{book_id}/vectors` 请求体示例：
-
-```json
-{
-  "model": "BAAI/bge-small-zh-v1.5",
-  "backend": "auto",
-  "limit_chunks": null
-}
-```
-
-`POST /api/books/{book_id}/metadata` 请求体示例：
-
-```json
-{
-  "book_group": "小说",
-  "tags": ["二刷", "重点", "长篇"]
-}
-```
-
-## 本地 embedding 用法
-
-### 查看模型状态
-
-```bash
-python bookrecall.py models
-```
-
-### 构建向量索引
-
-```bash
-python bookrecall.py embed-build \
-  --book-id sample \
-  --model BAAI/bge-small-zh-v1.5
-```
-
-说明：
-
-- 如果当前环境可用 `faiss`，索引会优先构建为 `faiss` 后端。
-- 如果没有 `faiss`，会自动回退为 `numpy` 后端，不影响使用。
-- `python bookrecall.py models` 和 `embed-build` 输出里会显示实际使用的 backend。
-
-可选参数：
-
-- `--batch-size`
-- `--vector-dir`
-- `--limit-chunks`
-
-### 直接做 embedding 检索
-
-```bash
-python bookrecall.py embed-search \
-  --book-id sample \
-  --query "黑袍人后来还出现过吗？" \
-  --progress 3
-```
-
-### 在问答里启用 embedding 检索
-
-```bash
-python bookrecall.py ask \
-  --book-id sample \
-  --retriever embedding \
-  --question "这本书前面关于自由意志的观点是什么？"
-```
-
-也可以用自动模式：
-
-```bash
-python bookrecall.py ask \
-  --book-id sample \
-  --retriever auto \
-  --question "这本书前面关于自由意志的观点是什么？"
-```
-
-自动模式的行为是：
-
-- 如果该书已有向量索引且本地依赖可用，则使用 embedding 检索。
-- 否则自动回退到倒排检索。
-
-## 外部 API 用法
-
-BookRecall 支持 OpenAI-compatible Chat Completions 接口。
-
-默认读取这些环境变量：
-
-```bash
-BOOKRECALL_API_KEY
-BOOKRECALL_API_ENDPOINT
-BOOKRECALL_MODEL
-```
-
-例如：
-
-```bash
-export BOOKRECALL_API_KEY="sk-xxx"
-export BOOKRECALL_API_ENDPOINT="https://api.deepseek.com/v1/chat/completions"
-export BOOKRECALL_MODEL="deepseek-chat"
-```
-
-或者在网页端直接填写：
-
-- Endpoint
-- Model
-- API Key
-- 启用外部大模型 ReAct 规划
-
-当前云端模型主要用于：
-
-- 复杂问题的多步规划
-- 对多个证据片段做综合
-- 给出更自然的最终总结
-
-它不会替代本地索引层，也不会绕过防剧透限制。
-
-## CLI 命令总览
-
-### 索引与书库
-
-- `build`
-  - 为一本书建立 SQLite 索引
-- `list-books`
-  - 查看当前书库
-- `stats`
-  - 查看索引规模
-- `chapters`
-  - 查看章节标题
-- `clear`
-  - 删除某本书的索引，需要 `--yes`
-
-### 阅读状态
-
-- `set-progress`
-  - 保存阅读进度
-- `show-progress`
-  - 查看阅读进度
-
-### 问答与检索
-
-- `ask`
-  - 提问并输出记忆卡片
-- `list-entities`
-  - 查看实体索引
-- `list-themes`
-  - 查看主题线索索引
-- `models`
-  - 查看本地模型状态
-- `embed-build`
-  - 构建向量索引
-- `embed-search`
-  - 直接做向量检索
-
-### Web
-
-- `serve`
-  - 启动本地 Web 控制台
-
-## 实体词表格式
-
-支持手工实体词表，每行一个实体。
-
-格式：
+正常日志会显示：
 
 ```text
-标准名|别名1,别名2
+[BookRecall] Project root: D:\BookRecall
+[BookRecall] Python: D:\BookRecall\.venv\Scripts\python.exe
+[BookRecall] Local models: D:\BookRecall\models
+[BookRecall] Model cache: D:\BookRecall\.cache\huggingface\sentence-transformers
+[BookRecall] Using existing Vue frontend build.
+[BookRecall] Starting BookRecall Web. Press Ctrl+C to stop.
 ```
 
-例如：
+也可以直接启动：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py serve --host 127.0.0.1 --port 8000
+```
+
+## Web 使用流程
+
+### 1. 导入书籍
+
+进入“导入与重建”页：
+
+- 选择本地 TXT 文件。
+- 填写 `book_id` 和书名。
+- 如需重新导入同一本书，勾选覆盖。
+- 默认可开启“自动构建向量索引”。
+
+导入时页面不会预览全文，只保留文件内容用于发送到本地服务，避免大 TXT 卡住页面。
+
+### 2. 构建向量索引
+
+如果导入时没有自动构建，可以在“书库 / 模型与召回”中手动构建。
+
+默认模型：
 
 ```text
-星辰之匙|钥匙,星匙
-黑衣人|黑袍人,黑衣客
-自由意志
+Qwen/Qwen3-Embedding-0.6B
 ```
 
-如果不传 `--entities`，系统会尝试自动发现实体。
+如果你本地已经下载到 `D:\BookRecall\models\Qwen3-Embedding-0.6B`，保持默认模型名即可，后端会优先使用本地目录。
 
-## 主题词表格式
-
-主题词表格式与实体词表一致：
+构建时页面会显示真实 batch 进度：
 
 ```text
-自由意志|自主选择,自由选择
-命运
-权力
+正在编码 embedding chunk：1024 / 2347
 ```
 
-如果不传 `--themes`，系统会用内置常见主题词做轻量自动发现，例如“自由意志、命运、选择、权力、信仰、人性”等。
+### 3. 设置重排
 
-## 输出结构
-
-BookRecall 的核心输出是一个结构化记忆卡片，包含：
-
-- `question`
-- `intent`
-- `answer`
-- `progress_chapter`
-- `spoiler_blocked`
-- `entity_name`
-- `summary`
-- `evidence`
-- `suggestions`
-
-这使它既适合 CLI，也适合 Web 或未来接前端应用。
-
-## 测试
-
-运行全部测试：
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-当前测试覆盖：
-
-- 章节解析
-- 倒排检索
-- embedding 索引构建与检索
-- Agent 核心问答
-- Agent 工具层
-- 人物关系索引、阶段摘要与 `lookup_relations`
-- 主题线索索引、阶段摘要与 `search_theme`
-- LLM ReAct 文本解析
-- Web API
-
-当前代码状态下测试数量为：
+默认启用：
 
 ```text
-83 tests
+Qwen/Qwen3-Reranker-0.6B
 ```
 
-## 项目结构
+默认重排候选数是 `20`。如果机器较慢，可以调成 `10` 或临时关闭 Reranker。如果追求更高精度，可以调到 `50`，但响应会明显变慢。
+
+### 4. 提问
+
+进入“对话”页：
+
+- 选择书籍。
+- 设置阅读进度。
+- 输入问题。
+- 同一会话会连续追问，只有点击“新会话”才会开启新会话。
+- 用户问题会立即显示，Agent 回复前会显示思考和工具调用状态。
+- 回答会包含定位、证据、工具轨迹和防剧透信息。
+
+## CLI 使用
+
+查看帮助：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py --help
+```
+
+构建基础索引：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py build `
+  --book-id gu `
+  --title 蛊真人 `
+  --input D:\Books\gu.txt
+```
+
+查看书库：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py list-books
+```
+
+设置阅读进度：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py set-progress `
+  --book-id gu `
+  --user default `
+  --chapter 100
+```
+
+提问：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py ask `
+  --book-id gu `
+  --question "成为尊者条件是什么" `
+  --progress 2200 `
+  --retriever auto
+```
+
+构建向量索引：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py embed-build `
+  --book-id gu `
+  --model Qwen/Qwen3-Embedding-0.6B
+```
+
+测试向量召回：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py embed-search `
+  --book-id gu `
+  --query "成为尊者条件是什么"
+```
+
+查看本地模型和索引状态：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py models
+```
+
+## CLI 命令列表
+
+当前主要命令：
+
+| 命令 | 用途 |
+| --- | --- |
+| `build` | 为 TXT 书籍建立本地结构化索引 |
+| `ask` | 针对书籍提问 |
+| `set-progress` | 保存阅读进度 |
+| `show-progress` | 查看阅读进度 |
+| `list-books` | 列出书库 |
+| `list-entities` | 列出实体索引 |
+| `list-themes` | 列出主题索引 |
+| `chapters` | 查看章节解析结果 |
+| `stats` | 查看索引规模 |
+| `clear` | 删除某本书的索引数据 |
+| `serve` | 启动 Web |
+| `models` | 探测依赖、模型和向量索引状态 |
+| `embed-build` | 构建本地 embedding 向量索引 |
+| `embed-search` | 直接测试向量召回 |
+
+## 本地 Qwen / LM Studio 接入
+
+Web 设置页支持配置本地 Qwen：
+
+- Endpoint：推荐填 LM Studio 或 llama.cpp server 的 OpenAI-compatible 地址。
+- Model：例如 `qwen3.5-4b`。
+- GGUF 路径：只有在使用进程内 `llama-cpp-python` 加载时需要。
+
+如果填写了 endpoint，BookRecall 会优先调用 endpoint，不会再尝试加载 GGUF 路径。
+
+常见 endpoint 示例：
 
 ```text
-bookrecall.py
-src/bookrecall/
-  agent/
-    core.py
-    state.py
-    tools.py
-    render.py
-    policies/
-  parser.py
-  chunking.py
-  entity_index.py
-  retrieval.py
-  embeddings.py
-  storage.py
-  cloud.py
-  web.py
-  cli.py
-tests/
-examples/
+http://127.0.0.1:1234/v1
+http://127.0.0.1:8080/v1
 ```
 
-## 适用场景
+本地 LLM 当前主要用于：
 
-适合：
+- 问题理解。
+- Agent Planner。
+- 按需动态结构化索引。
+- 对候选证据做更高层次总结。
 
-- 长篇小说回忆
-- 网文追更回顾
-- 学术著作章节线索定位
-- 需要强顺序和防剧透控制的阅读助手
+## Two-Phase Indexing
 
-不适合：
+BookRecall 当前采用 Two-Phase Indexing：
 
-- 直接替代通用聊天机器人
-- 不建索引就即时读整本大书
-- 需要完整知识图谱和复杂编辑工作流的场景
+### Phase 1：导入时快速预索引
 
-## 当前限制
+导入 TXT 后，系统会：
 
-这个项目已经能用，但还不是最终形态。
+- 解析章节。
+- 切分 parent / child chunk。
+- 建立 SQLite 基础索引。
+- 可选构建 embedding 向量索引。
 
-当前仍然存在这些限制：
+这一步尽量不让本地 LLM 全书逐章分析，因为那会非常慢。
 
-- LangGraph 已作为可选策略接入，但还不是完整 checkpoint / 中断恢复 / human-in-the-loop 图工作流
-- 虽然已经接入原生 tool calling 优先链路，但还没有做更完整的多供应商兼容验证
-- 人物关系第一版已接入，能做阶段摘要，但还不是事件级高质量关系图谱
-- 主题线索第一版已接入，能做阶段摘要，但还不是完整深层主题演化分析
-- 跨会话 Agent 记忆和用户长期偏好已有第一版，但会话摘要压缩还没完成
-- FAISS 是可选后端，真实大规模性能还没有系统压测
-- Web 仍然是单页零依赖控制台，不是完整产品前端
+### Phase 2：问答时按需理解
 
-更详细的现状和路线见 [AGENT_STATUS.md](/D:/BookRecall/AGENT_STATUS.md)。
+用户提问后，系统会：
+
+- 用倒排检索和 embedding 找到候选片段。
+- 用 reranker 对候选证据精排。
+- 只把少量相关片段交给本地 Qwen 或云端 LLM。
+- 将按需分析出的结构化结果写回动态索引。
+
+这样比“导入时让 Qwen 全书扫一遍”快得多，也更适合 3060 级别本地硬件。
+
+## 常见问题
+
+### 为什么明明下载了模型，网页还在下载？
+
+通常是 Web 进程还没重启，或模型没有放在默认目录。
+
+推荐目录：
+
+```text
+D:\BookRecall\models\Qwen3-Embedding-0.6B
+D:\BookRecall\models\Qwen3-Reranker-0.6B
+```
+
+重启：
+
+```powershell
+cd D:\BookRecall
+.\start_bookrecall.ps1
+```
+
+日志应显示：
+
+```text
+Local models: D:\BookRecall\models
+Model cache: D:\BookRecall\.cache\huggingface\sentence-transformers
+```
+
+### 为什么向量索引很慢？
+
+首次加载 Qwen3-Embedding-0.6B 需要加载约 1.15GB 权重。之后还要编码全部 child chunk。几千个 chunk 花几分钟是正常的。
+
+如果想快速试跑，可以设置 `limit_chunks`，或 CLI 使用：
+
+```powershell
+.\.venv\Scripts\python.exe bookrecall.py embed-build `
+  --book-id gu `
+  --limit-chunks 500
+```
+
+### 为什么 Reranker 让问答变慢？
+
+Reranker 是 cross-encoder，会对“问题 + 候选片段”逐对打分。它比 embedding 召回更准，但也更慢。
+
+建议：
+
+- 3060 笔记本默认候选数使用 `10-20`。
+- 需要更快时关闭 Reranker。
+- 需要更准时再调到 `50`。
+
+### 旧 BGE 索引还能用吗？
+
+能用，但不是当前推荐链路。切到 Qwen3-Embedding 后，旧索引需要删除并重建。
+
+Web 中可以删除当前书向量索引，再重新构建。CLI 也可以重新运行 `embed-build`。
+
+### FAISS 缺失怎么办？
+
+安装：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[faiss]"
+```
+
+如果没有 FAISS，系统会回退到 numpy 后端，但大书检索会慢一些。
+
+### LM Studio 返回空 JSON 或 Thinking 内容怎么办？
+
+部分 Qwen thinking 模型会把内容放到 `reasoning_content`，导致 JSON 解析失败。
+
+解决办法：
+
+- 在 LM Studio 关闭 Thinking。
+- 确认服务支持 `enable_thinking=false`。
+- 提高最大输出 token。
+- 优先使用非 thinking 的 instruct 模式或 endpoint。
+
+## 开发与测试
+
+运行后端测试：
+
+```powershell
+cd D:\BookRecall
+.\.venv\Scripts\python.exe -m unittest discover tests
+```
+
+当前验证状态：
+
+```text
+129 tests OK
+```
+
+构建前端：
+
+```powershell
+cd D:\BookRecall\frontend
+npm run build
+```
+
+当前验证状态：
+
+```text
+vue-tsc --noEmit && vite build 通过
+```
+
+## 项目边界
+
+BookRecall 目前仍是 MVP，不是完整商业产品。当前重点是：
+
+- 长篇文本的本地索引和召回质量。
+- 阅读进度保护。
+- Agent 工具规划和证据链回答。
+- 本地模型可控接入。
+
+尚未完全完成：
+
+- 完整 LangGraph checkpoint / interrupt / human-in-the-loop。
+- 多用户权限系统。
+- 多格式电子书解析，例如 EPUB / PDF / DOCX。
+- 大规模多书知识库的统一跨书检索。
+- 自动化模型安装器。
+- 完整桌面应用打包。
 
 ## License
 
-Apache-2.0
+本项目使用 [LICENSE](LICENSE) 中声明的许可证。

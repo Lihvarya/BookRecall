@@ -1,526 +1,591 @@
 # BookRecall Agent 状态说明
 
-本文档面向继续开发 BookRecall 的人。
+更新时间：`2026-07-06`
 
-它不讲愿景，不讲宣传，只回答三个问题：
-
-1. 这个 Agent 现在已经实现了什么
-2. 它离“完整 Agent 产品”还差什么
-3. 接下来最值得优先补哪一部分
-
-更新时间：`2026-07-05`
+本文档面向继续开发 BookRecall 的人，说明当前 Agent 已经实现了什么、离完整产品还有哪些差距、下一步应该优先推进什么。
 
 ## 一句话判断
 
-BookRecall 现在已经不是“一个纯脚本 demo”，而是一个可运行、可测试、可扩展的本地阅读记忆 Agent MVP。
+BookRecall 现在已经不是纯脚本 demo，而是一个可运行、可测试、可扩展的本地阅读记忆 Agent MVP。
 
-但它还不是一个完整的 Agent 产品。它目前更准确的定位是：
+它当前更准确的定位是：
 
-- 一个以本地索引为核心的阅读回忆引擎
-- 一个带 ReAct 状态机的可控问答层
-- 一个已经开始支持本地 embedding 和外部 LLM 的 Agent 控制台
+- 一个本地长文本索引引擎。
+- 一个带工具调用和状态管理的阅读回忆 Agent。
+- 一个支持本地 embedding、reranker、本地 LLM 和云端 API 的混合检索问答系统。
+- 一个已经具备 Vue Web 控制台的个人阅读记忆工具。
 
-## 当前已实现
+它还不是完整产品，主要差距在模型链路稳定性、索引质量自动评估、复杂 Agent 工作流、跨书管理、多格式导入和长期记忆产品化。
+
+## 当前推荐架构
+
+```text
+导入阶段
+   TXT
+   -> 章节解析
+   -> Parent / Child 切块
+   -> SQLite 结构化基础索引
+   -> Qwen3-Embedding-0.6B 向量索引
+
+问答阶段
+   用户问题
+   -> 本地 Qwen / 规则策略做意图判断
+   -> 工具规划
+   -> 倒排检索 + embedding 粗召回
+   -> Qwen3-Reranker-0.6B 精排
+   -> 可选本地 Qwen 按需理解候选片段
+   -> MemoryCard 输出
+```
+
+这是 Two-Phase Indexing：
+
+- Phase 1 在导入时做快而稳定的基础索引。
+- Phase 2 在问答时只分析少量相关片段，避免导入阶段让本地 LLM 扫完整本书。
+
+## 已实现能力
 
 ## 1. 数据与索引层
 
 已完成：
 
-- 章节解析
-  - 支持中文网文常见章节格式
-  - 支持“第一卷 卷名 / 第一节：小节名”这类分卷目录，小节会作为真正内容章节
-  - 支持无章节标题时回退到整本单章
-- 分层切块
-  - parent chunk
-  - child chunk
-- 结构化实体索引
-  - 实体名
-  - 别名
-  - 首次出现章节
-  - 全部出现章节
-  - 出现摘录
-- 结构化关系索引第一版
-  - 同章共现实体对
-  - 关系首次出现章节
-  - 关系证据摘录
-  - 基于关键词的粗分类：冲突、同伴/协作、师徒/传承、亲缘/家族、共现/关联
-  - `lookup_relations` 可返回关系起点、互动推进、近期状态和总体变化提示
-- 结构化主题索引第一版
-  - 自动发现常见主题词
-  - 支持 `--themes` 手工主题词表
-  - 主题首次出现章节
-  - 主题线索证据摘录
-  - `search_theme` 可返回最多三段阶段摘要与总体演化提示
-- 结构化事件链索引第一版
-  - 基于实体共现和事件关键词抽取事件节点
-  - 事件类型粗分类：获得/失去、冲突/危机、揭示/真相、选择/决定、协作/同行
-  - 记录事件章节、摘要、原文摘录和关联实体
-  - `search_events` 可按实体或问题检索已读范围内的关键事件链
-- SQLite 存储
-  - `books`
-  - `chapters`
-  - `parent_chunks`
-  - `child_chunks`
-  - `entities`
-  - `entity_mentions`
-  - `entity_aliases`
-  - `relations`
-  - `relation_mentions`
-  - `themes`
-  - `theme_aliases`
-  - `theme_mentions`
-  - `events`
-  - `event_entities`
-  - `chapter_summaries`
-  - `reader_state`
-  - `agent_memory`
+- 中文 TXT 章节解析。
+- 常见章节标题识别。
+- “第一卷 / 第一节 / 第 N 章”等分卷、小节结构识别。
+- 无章节标题时回退为整本单章。
+- Parent chunk 和 child chunk 分层切块。
+- SQLite 持久化。
+- 结构化实体索引。
+- 结构化关系索引第一版。
+- 结构化主题索引第一版。
+- 结构化事件链索引第一版。
+- 章节摘要表。
+- 阅读进度表。
+- Agent 会话记忆表。
+- 用户偏好表。
 
-这部分已经足够支撑“第一次出现”“后来还有没有出现”“当前读到哪了”这种核心阅读回忆问题。
+SQLite 已覆盖的核心表：
 
-## 2. 检索层
-
-已完成：
-
-- 默认倒排检索器 `LocalRetriever`
-- 可选本地 embedding 检索器 `EmbeddingRetriever`
-- 向量索引持久化到 `.bookrecall/vectors/`
-- embedding 索引支持双后端
-  - `numpy` 精确相似度
-  - `faiss` 内积索引（环境可用时启用）
-- `ask --retriever lexical|embedding|auto`
-- `models / embed-build / embed-search`
+| 表 | 用途 |
+| --- | --- |
+| `books` | 书籍元信息 |
+| `chapters` | 章节原文 |
+| `parent_chunks` | 章节级上下文 chunk |
+| `child_chunks` | 细粒度检索 chunk |
+| `entities` | 实体 |
+| `entity_aliases` | 实体别名 |
+| `entity_mentions` | 实体出现记录 |
+| `relations` | 实体关系 |
+| `relation_mentions` | 关系证据 |
+| `themes` | 主题线索 |
+| `theme_aliases` | 主题别名 |
+| `theme_mentions` | 主题证据 |
+| `events` | 事件 |
+| `event_entities` | 事件关联实体 |
+| `chapter_summaries` | 章节摘要 |
+| `reader_state` | 阅读进度 |
+| `agent_memory` | 会话轮次记忆 |
 
 现状判断：
 
-- 倒排检索已经能稳定服务核心问题
-- embedding 检索已经真正接通，不是占位接口
-- 当前已经支持 `faiss` 可选后端
-- 当前本地 `.venv` 已安装并验证 `faiss` 可用
-- 如果环境没有 `faiss`，会自动回退到 `numpy`
-- 下一步重点不再是“是否接入 FAISS”，而是更大规模检索优化、rerank 和 query rewrite
+- 基础索引已经足够支撑“第一次出现”“后来有没有出现”“某章线索后来如何发展”等核心问题。
+- 关系、事件、主题的规则抽取仍偏粗糙，已经不适合作为最终高质量结构化知识图谱。
+- 后续应更多依赖“embedding 召回 + reranker 精排 + 本地 LLM 按需结构化”的动态索引，而不是导入阶段一次性全书智能抽取。
+
+## 2. 检索与召回层
+
+已完成：
+
+- `LocalRetriever` 倒排检索。
+- 中文长问题倒排检索从强交集改为候选 OR + scorer，避免召回为空。
+- `EmbeddingRetriever` 本地向量召回。
+- Qwen3-Embedding-0.6B 默认模型。
+- Qwen3-Reranker-0.6B 精排模型。
+- `RerankingRetriever` 粗召回后精排。
+- FAISS / numpy 双后端。
+- `models / embed-build / embed-search` CLI。
+- Web 端模型与召回配置。
+- Web 端向量索引构建、删除和状态展示。
+- 向量索引构建真实 batch 进度。
+- 默认 rerank candidates 从 50 调整为 20，更适合 RTX 3060 Laptop。
+- 默认 Qwen 模型名自动映射到 `D:\BookRecall\models` 本地目录。
+- `.cache`、`.bookrecall`、`models` 均被 Git 忽略。
+
+当前默认模型：
+
+| 模块 | 默认值 |
+| --- | --- |
+| Embedding | `Qwen/Qwen3-Embedding-0.6B` |
+| Reranker | `Qwen/Qwen3-Reranker-0.6B` |
+| Rerank candidates | `20` |
+| 向量目录 | `.bookrecall/vectors` |
+| 模型目录 | `D:\BookRecall\models` |
+| 缓存目录 | `D:\BookRecall\.cache\huggingface\sentence-transformers` |
+
+现状判断：
+
+- 召回质量已经从旧 BGE 路线升级到 Qwen3 Embedding + Reranker 路线。
+- 首次构建 Qwen3 embedding 向量索引会明显比 BGE 慢，这是正常的。
+- Reranker 对 50 个长片段精排会慢，默认 20 是当前较合理的平衡。
+- 旧 BGE 向量索引仍可读取，但不再是推荐链路，需要用户重建。
 
 ## 3. Agent 层
 
 已完成：
 
-- 手写 ReAct 状态机
-- `AgentState`
-- 工具注册表 `ToolRegistry`
-- 9 个工具：
-  - `lookup_first_appearance`
-  - `lookup_timeline`
-  - `lookup_relations`
-  - `search_theme`
-  - `search_events`
-  - `search_evidence`
-  - `lookup_entity_aliases`
-  - `get_chapter_summary`
-  - `list_entities`
-- 两种策略：
-  - `RuleBasedPolicy`
-  - `LLMReActPolicy`
-- `LLMReActPolicy` 已升级为原生 tool calling 优先，文本协议回退
-- 会话级记忆已接入
-  - `ask` / `ask_card` 支持 `session_id`
-  - 同一会话下可复用最近几轮的主实体线索
-  - 最近轮次会写入 SQLite `agent_memory`
-  - `LLMReActPolicy` 已可读取最近会话摘要作为上下文
-  - Web API 已支持生成会话级记忆摘要，返回轮次数、章节范围、主要实体、工具路径、最近问题和摘要文本
-  - Web API 已支持清空当前会话的 Agent 记忆，不影响书籍索引
-- 用户长期偏好第一版已接入
-  - 按 `book_id + user_id` 保存回答风格、关注重点和自定义说明
-  - Agent 初始化时读取偏好并写入输出契约
-  - `LLMReActPolicy` 会把偏好加入云端规划提示
-- `LangGraphPolicy` 已从占位升级为可选图策略
-  - 未安装 `langgraph` 时保持默认零依赖运行
-  - 安装 `langgraph` 后可用 `StateGraph` 包装现有 ReAct 决策节点
-  - 当前本地 `.venv` 已安装并验证 `langgraph` 可用
+- 手写 ReAct 状态机。
+- `AgentState`。
+- `ToolRegistry`。
+- 规则策略 `RuleBasedPolicy`。
+- 云端策略 `LLMReActPolicy`。
+- 本地 Qwen Planner 策略。
+- 可选 `LangGraphPolicy`。
+- 原生 tool calling 优先，文本协议回退。
+- 会话级连续追问。
+- 工具调用 trace。
+- 工具耗时统计。
+- 防剧透触发统计。
+- 问答输出统一为 `MemoryCard`。
 
-这意味着当前 Agent 已经具备“先解析实体，再查轨迹，再补证据，最后组织答案”的多步能力，而不再只是一个单次函数调用。
+当前工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| `lookup_first_appearance` | 查实体首次出现 |
+| `lookup_timeline` | 查实体出现轨迹 |
+| `lookup_relations` | 查实体关系 |
+| `search_theme` | 查主题线索 |
+| `search_events` | 查事件链 |
+| `search_evidence` | 检索证据片段 |
+| `lookup_entity_aliases` | 查实体别名 |
+| `get_chapter_summary` | 查章节摘要 |
+| `list_entities` | 列出实体 |
+
+近期关键修复：
+
+- “成为尊者条件是什么”这类条件问题已经恢复精准定位。
+- 条件/标准/要求类问题会优先从证据段中抽取“第一、第二、第三、第四”等枚举结构。
+- 无实体条件类问题会绕开本地 LLM Planner 的误规划，优先走规则策略。
+- `search_evidence` 会返回 `parent_text`，便于规则策略从更完整上下文抽取答案。
+
+现状判断：
+
+- Agent 已能执行多步工具调用，不只是单次 RAG。
+- 对强结构问题，规则策略仍然很重要，不能完全交给小模型。
+- 本地 Qwen Planner 可以提高灵活性，但需要策略约束，避免“聪明但跑偏”。
 
 ## 4. 防剧透机制
 
-已完成三重防剧透：
+已完成三重保护：
 
-- 用户阅读进度作为全局上限
-- 工具调用时对 `max_chapter` 二次钳制
-- 结果出栈前再次裁掉越界证据
+- 用户阅读进度作为全局上限。
+- 工具调用时对 `max_chapter` 二次钳制。
+- 结果出栈前裁掉越界证据。
 
-这部分是当前项目最扎实、也最有差异化的能力之一。
+已覆盖：
 
-## 5. 输出契约
+- CLI `--progress`。
+- Web 阅读进度。
+- Agent 工具调用。
+- 最终 evidence 输出。
+- 对话历史中的 progress 记录。
+
+现状判断：
+
+- 防剧透是 BookRecall 当前最重要的差异化能力之一。
+- 后续需要把防剧透策略做成更明确的 UI 提示，例如“已隐藏第 N 章之后的证据”。
+
+## 5. Web 端
 
 已完成：
 
-- `MemoryCard`
-- `EvidenceCard`
-- 文本渲染
-- JSON 渲染
-- 对外结构稳定
+- Vue 3 + Vite + TypeScript + Pinia 前端。
+- Python 标准库 HTTP 服务。
+- 优先读取 `frontend/dist`，缺失时回退 legacy 静态资源。
+- AI 对话助手式布局。
+- 左侧会话列表。
+- 当前会话连续追问。
+- 点击“新会话”才创建新会话。
+- 用户输入后立即显示。
+- Agent 回复前显示思考状态和工具轨迹。
+- 本地 TXT 文件导入。
+- 导入时不预览全文。
+- 书库管理。
+- 书籍分组和标签。
+- 删除书籍。
+- 删除向量索引。
+- 重建结构化索引。
+- 构建向量索引。
+- 向量索引真实进度条。
+- 模型与召回配置。
+- 本地 Qwen endpoint / model / GGUF 路径配置。
+- Cloud OpenAI-compatible 配置。
+- 工具箱调试。
+- 证据检索实验。
+- 原文阅读器和证据高亮。
+- 长会话历史。
+- 历史轮次编辑、删除、重新提问。
+- 系统诊断。
+- 浏览器本地偏好持久化。
 
-这让 CLI、Web、未来前端都能复用同一套问答结果。
+已经移除或弱化：
 
-## 6. 交付层
+- 用户笔记系统。
+- 三栏式拥挤布局。
+- 分支对比与合并功能。
+
+现状判断：
+
+- Web 端已经从调试控制台升级为可用的产品原型。
+- 页面仍需要继续做信息密度优化。
+- 一些模型配置项和索引状态还需要更明确的“当前是否生效”提示。
+
+## 6. 本地模型接入
 
 已完成：
 
-- CLI
-- 本地 Web 控制台
-- Web API
-- 本地 embedding 状态面板
-- 外部 API 设置面板
-- 结构化索引总览面板
-- 网页端 TXT 文件导入与正文试跑建索引
-- 网页端构建本地向量索引
-- 网页端删除书籍数据、删除向量索引、重建结构化索引
-- 网页端召回层证据检索测试
-- 网页端 Agent 工具箱
-  - 可查看 Agent 默认工具清单和参数 schema
-  - 可在当前书籍、阅读进度、用户和检索器上下文下直接执行单个工具
-  - 工具箱执行不会写入会话记忆，适合作为调试与验证入口
-- Web 前端已拆分为 `index.html / app.css / app.js`
-- Web 前端已新增 Vue 3 + Vite + TypeScript + Tailwind + Pinia 工程化版本，源码位于 `frontend/`
-- Python Web 服务会优先读取 `frontend/dist`，未构建时自动回退到 `src/bookrecall/web_assets`
-- Vue 前端已通过 `npm run build` 构建验证，当前后端首页测试已覆盖 Vue dist 优先与 legacy 回退两种模式
-- 多本书分组与标签管理
-- Web 控制台偏好持久化
-- 用户长期回答偏好持久化
-- Web 端 Agent 执行策略选择
-- Vue 控制台已支持轻量 hash 页面化导航：对话、书库、索引、导入、模型、设置可以作为独立控制台视图切换
-- Vue 控制台已从三栏式开发控制台重构为 AI 对话助手式布局：左侧只保留必要导航，页面内容按视图独立呈现
-- 对话页默认持续写入当前会话，只有用户点击“新会话”才生成新的 `session_id`
-- Vue 前端已完成第一轮页面组件化拆分：`NavRail`、`PageHeader`、`ChatPage`、`LibraryPage`、`IndexPage`、`ImportPage`、`ModelPage`、`SettingsPage` 已从 `App.vue` 抽离，`App.vue` 仅保留页面编排
+- Qwen3-Embedding-0.6B 本地目录加载。
+- Qwen3-Reranker-0.6B 本地目录加载。
+- 默认模型名自动映射本地目录。
+- `HF_HOME`、`SENTENCE_TRANSFORMERS_HOME`、`TORCH_HOME`、`BOOKRECALL_MODEL_DIR` 项目内路径管理。
+- `HF_HUB_DISABLE_XET=1`，减少 Windows 下载卡顿。
+- `models/` 加入 `.gitignore`。
+- LM Studio / OpenAI-compatible endpoint 输入入口。
+- Endpoint 优先，填了 endpoint 就不加载 GGUF。
 
-当前网页端已经支持：
+已验证：
 
-- 选择本地 TXT 文件创建书籍索引
-- TXT 文件导入只显示文件摘要和开头短预览，不把整本书全文塞进页面输入框
-- 临时粘贴正文试跑
-- 填写实体词表和主题词表
-- 可选覆盖同名 `book_id`
-- 重建当前书结构化索引
-- 删除当前书本地数据
-- 设置书籍分组和标签，并按分组筛选书库
-- 选择书籍
-- 设置阅读进度
-- 默认沿用当前会话连续追问，并可通过“新会话”显式开启新的记忆线
-- 提问
-- 查看索引规模统计
-- 查看实体索引、主题线索、事件链、关系索引和关系图谱
-- 构建当前书的本地 embedding 向量索引
-- 删除当前书向量索引
-- 直接测试当前召回层，查看 lexical / embedding / auto 命中的证据片段并打开原文高亮
-- 点击章节或证据卡片打开原文，并高亮证据片段
-- 查看长会话历史
-- 浏览、刷新并切换当前书籍下的会话与分支
-- 对比两个会话分支的共同前缀、分歧轮次、独有线索、实体和工具调用
-- 在 Web 对话页查看产品化的左右并排分支对比视图，展开左右独有轮次、摘要、实体与工具路径
-- 查看分支差异洞察第一版，包括实体差异、工具差异、问题差异、左右回答摘录和合并前判断提示
-- 将两个会话分支合并为新的会话，保留共同前缀并顺序追加左右分支独有轮次，且不覆盖原分支
-- 生成当前会话记忆摘要，查看轮次数、章节范围、实体、工具路径和最近问题
-- 清空当前会话 Agent 记忆，重置该会话上下文
-- 编辑、删除历史对话轮次，回放历史工具轨迹，把历史问题放回输入框重新提问，或从某一轮开始重算/新建会话分支
-- 查看本轮工具 trace、工具调用路径、真实耗时、最慢工具、命中数和防剧透触发次数
-- 查看 Agent 工具清单，并直接调试 `lookup_first_appearance / lookup_timeline / search_evidence / lookup_relations / search_theme / search_events` 等工具
-- 使用快捷提问模板覆盖首次出现、轨迹、关系、主题和事件问题
-- 选择 Agent 执行策略：`auto / rule_based / llm_react / langgraph`
-- 切换检索器
-- 查看本地模型依赖
-- 查看向量索引状态
-- 查看系统诊断：数据库是否存在、当前前端模式、向量目录、模型缓存目录、依赖状态和索引规模
-- 保存和清除浏览器本地偏好：用户、会话、当前书籍、分组筛选、召回策略、云端开关和模型配置
-- 保存当前书籍与用户维度的长期回答偏好：回答风格、关注重点和自定义说明
-- 配置 DeepSeek / OpenAI-compatible API
-- 通过独立静态资源维护页面结构、样式和交互逻辑
-- 新版 Vue 控制台已经完成构建验证，并已完成第一轮页面组件化拆分，具备继续路由化深化和页面级产品打磨的基础
+- PyTorch 可识别 `NVIDIA GeForce RTX 3060 Laptop GPU`。
+- Qwen3-Embedding-0.6B 可离线加载并输出 1024 维向量。
+- Qwen3-Embedding-0.6B 与 Qwen3-Reranker-0.6B 本地目录结构完整。
 
-## 7. 测试
+现状判断：
 
-当前测试已覆盖：
+- 模型文件管理已经基本可用。
+- 还缺一个 Web 端“模型自检”按钮，用于直接验证 embedding、reranker、local LLM 是否可加载。
+- 还缺更友好的模型下载向导。
 
-- 章节解析
-- 倒排检索
-- embedding 索引构建与检索
-- Agent 核心问答
-- Agent 工具层
-- 人物关系索引、存储、工具和 Agent 问答链路
-- 人物关系阶段摘要
-- 主题线索索引、存储、工具和 Agent 问答链路
-- 主题线索阶段摘要
-- 事件链索引、存储、工具和 Agent 问答链路
-- LLM ReAct 文本解析
-- Web API
+## 7. CLI
 
-当前状态：
+可用命令：
 
-- `91 unittest tests`
-- 全绿
+| 命令 | 状态 |
+| --- | --- |
+| `build` | 可用 |
+| `ask` | 可用 |
+| `set-progress` | 可用 |
+| `show-progress` | 可用 |
+| `list-books` | 可用 |
+| `list-entities` | 可用 |
+| `list-themes` | 可用 |
+| `chapters` | 可用 |
+| `stats` | 可用 |
+| `clear` | 可用 |
+| `serve` | 可用 |
+| `models` | 可用 |
+| `embed-build` | 可用 |
+| `embed-search` | 可用 |
 
-## 还没完成的关键部分
+现状判断：
 
-下面这些不是“锦上添花”，而是它从 MVP 走向完整 Agent 产品时最关键的缺口。
+- CLI 足够支撑开发和排障。
+- CLI 还没有 reranker 参数和 local planner 参数，主要配置集中在 Web。
+- 后续可以补 `ask --rerank`、`ask --policy local_planner` 等高级参数。
 
-## 1. LangGraph 已接入可选策略，但还不是完整图工作流
+## 8. 测试
 
-现状：
+当前验证：
 
-- `LangGraphPolicy` 已经不再是纯占位
-- 未安装 `langgraph` 时会明确提示缺依赖，默认仍保持零依赖
-- 安装 `langgraph` 后，策略层会编译 `StateGraph` 并用图节点产生 ReAct 决策
-- 当前本地 `.venv` 已安装并验证 `langgraph` 可用，Web 运行状态会同步显示该策略状态
-- Web 端已经可以选择 `auto / rule_based / llm_react / langgraph`
+```text
+python -m unittest discover tests
+129 tests OK
+```
 
-这意味着现在已经完成：
+前端验证：
 
-- 可选 LangGraph 依赖边界
-- 图策略入口
-- Web 策略切换入口
+```text
+npm run build
+vue-tsc --noEmit && vite build 通过
+```
 
-但还没有：
+测试覆盖：
 
-- checkpoint 持久化
-- 中断恢复
-- human-in-the-loop
-- 多节点复杂流程图式控制
+- 章节解析。
+- 倒排检索。
+- embedding 索引构建与检索。
+- Agent 核心问答。
+- Agent 工具层。
+- 关系索引、存储、工具和问答链路。
+- 主题索引、存储、工具和问答链路。
+- 事件索引、存储、工具和问答链路。
+- LLM ReAct 文本解析。
+- 本地 LLM JSON 解析容错。
+- Web API。
+- “成为尊者条件是什么”这类结构化条件回答。
 
-判断：
+现状判断：
 
-- 这不影响当前可用性
-- 但后续复杂 Agent 能力仍需要继续从“策略图”升级到“完整执行图”
+- 后端测试已经能防止核心回归。
+- 前端缺少自动化 UI 测试。
+- 本地模型加载和性能目前主要靠手动验证。
 
-## 2. 原生 function-calling 已接入，但还没完全做深
+## 仍未完成的关键差距
 
-现状：
+## 1. 结构化索引质量仍不够好
 
-- `LLMReActPolicy` 现在优先走原生 OpenAI-compatible tool calling
-- 如果供应商不返回 `tool_calls`，会自动回退到原有文本协议解析
-- 当前已经有本地测试覆盖优先链路和回退链路
+问题：
 
-结果是：
+- 规则实体抽取容易抽出泛词。
+- 关系索引仍偏共现。
+- 事件链仍偏关键词。
+- 全书 LLM 智能索引太慢，不适合导入阶段默认启用。
 
-- 稳定性比之前好一层
-- 但还缺少真实多供应商回归验证
-- Web 调试界面已展示工具路径、命中数、防剧透触发和每步参数/观察摘要
+当前方向：
 
-所以这项工作从“未实现”进入了“已接入，并具备基础可观测性，但还需真实供应商回归验证”阶段。
+- 不再追求导入时一次性全书智能结构化。
+- 保留基础结构化索引作为低成本骨架。
+- 用 embedding + reranker 在问答期找相关片段。
+- 用本地 Qwen 对少量片段做按需结构化。
+- 将高置信结果动态写回索引。
 
-## 3. 跨会话记忆已完成第一版，下一步是把它产品化
+下一步：
 
-现状：
+- 给动态索引结果加入置信度和来源片段。
+- 增加“本次回答学到了什么”的可视化。
+- 对实体、事件、关系做去重和人工修正入口。
 
-- 当前的阅读进度会持久化
-- Agent 现在已经会在 `session_id` 维度持久化最近问答
-- 当本轮问题没有显式实体时，可以沿用同会话最近一轮的主实体继续追问
-- Web/API 已支持会话级记忆摘要和整会话清理
+## 2. LangGraph 仍只是可选策略，不是完整工作流
 
-仍然缺失：
+已完成：
 
-- 自动会话摘要压缩与定期清理策略
-- 用户长期偏好仍缺自动学习、偏好冲突检测和周期性整理
-- 更完整的会话分支分析，例如基于 LLM 的语义级分歧原因解释和更细粒度文本 diff 标注
-- 更完整的 trace 可视化，例如更强图形化路径和跨分支 trace 差异分析
-
-这意味着它已经从“单轮问答引擎”进入“基础多轮助手”阶段，但还不是完整的长期协作助手。
-
-## 4. 知识结构层已有关系、主题和事件链第一版，但还不够深
-
-当前实体索引已经很好用，人物关系、主题线索和事件链也已经完成第一版：
-
-- build 阶段会基于同章共现生成 `relations` 和 `relation_mentions`
-- Agent 已有 `relation_lookup` 意图
-- 工具层已有 `lookup_relations`
-- 可以按“关系起点 / 互动推进 / 近期状态”初步回答“谁和谁是什么关系、后来如何变化”
-- build 阶段会生成 `themes` 和 `theme_mentions`
-- Agent 已有 `theme_explore` 意图
-- 工具层已有 `search_theme`
-- 可以按“线索起点 / 发展推进 / 近期变化”初步回答“某个主题/观点前后有什么变化”
-- build 阶段会生成 `events` 和 `event_entities`
-- Agent 已有 `event_chain` 意图
-- 工具层已有 `search_events`
-- 可以按“事件节点 / 章节定位 / 关联实体”初步回答“某条主线涉及哪些关键事件”
-
-但它还不是完整知识图谱，仍然缺：
-
-- 事件级高质量人物关系图
-- 地点关系图
-- 道具关系图
-- 高质量主题线索图
-- 更高质量的因果事件图
-
-所以现在能很好回答：
-
-- “第一次出现在哪一章”
-- “后来还出现过吗”
-- “谁和谁是什么关系”（阶段摘要版）
-- “某个主题前后有什么变化”（阶段摘要版）
-- “某个实体涉及哪些关键事件”（事件节点版）
-
-但还不够擅长回答：
-
-- “谁和谁的关系为什么会发生深层转折”
-- “这个观点在前中后期为什么会深层演化”
-- “这条主线为什么一步步因果推进到当前结果”
-
-## 5. 向量检索已进入“双后端可用”阶段，但还不是最终形态
-
-现状：
-
-- 已有 `sentence-transformers` 接入
-- 已支持本地索引构建与检索
-- 已支持在问答中切换
-- 已支持 `numpy / faiss` 双后端
+- `LangGraphPolicy` 可选接入。
+- 未安装时保持零依赖。
+- Web 可选择策略。
 
 未完成：
 
-- 更大规模向量检索优化
-- query rewrite
-- rerank
-- MMR 去冗余
+- checkpoint 持久化。
+- 中断恢复。
+- human-in-the-loop。
+- 多节点 planner / retriever / validator / writer 工作流。
+- 图状态可视化。
 
-这意味着它现在已经“能用”，但还没到“最强版本”。
+下一步：
 
-## 6. Web 端已进入“工程化多轮控制台”阶段，但还不是完整产品前端
+- 把当前 ReAct 状态机迁移成真正多节点图。
+- 将 query understanding、tool planning、retrieval、rerank、answer validation 拆成独立节点。
 
-现状：
+## 3. 本地 LLM Planner 还需要更强约束
 
-- Web 控制台已经明显强于早期版本
-- 已有书库、Agent、模型、外部 API 三区域
-- 已支持从网页端选择 TXT 文件创建本地结构化索引
-- 已避免大 TXT 全文预览导致 Web 端卡顿
-- 已支持临时粘贴正文试跑
-- 已支持从网页端构建当前书本地向量索引
-- 已支持从网页端直接测试 lexical / embedding / auto 召回效果
-- 已支持删除书籍数据、删除向量索引、重建结构化索引
-- 已支持会话 ID、会话/分支列表、基础分支差异对比、左右并排分支对比视图、结构化差异洞察、分支合并、长会话历史、本轮工具轨迹汇总、真实耗时采集、最慢工具展示、工具路径展示、历史轮次 trace 回放、历史轮次编辑/删除/重新提问，以及从指定轮次删除后续历史并重算或新建分支
-- 已支持索引统计、主题线索、事件链、关系索引浏览和关系图谱第一版
-- 已支持可选 Qwen3-4B-Instruct-2507 4bit GGUF 智能结构化索引：通过本地 GGUF 或 OpenAI-compatible 本地 endpoint 审稿实体、关系和事件，严格校验 JSON、实体名、置信度和原文证据后再落库
-- 关系索引已从“同章共现”收紧为“同句/证据窗口 + 明确关系关键词”规则；弱共现不再写入图谱，关系工具在结构化关系缺失时会走召回层/实体提及位置兜底，并标记为“检索证据/待确认”
-- Web 导入页已新增 Qwen3 智能结构化索引开关、GGUF 模型路径、本地 endpoint 和最大处理章节数配置；该能力不会自动下载模型
-- 已支持常见 Agent 问题快捷模板
-- Web 前端已从 `web.py` 大字符串拆分为 `index.html / app.css / app.js`
-- Web 前端已进一步新增 `frontend/` Vue 3 + Vite 工程，支持未来组件化、路由化和构建产物托管
-- Python 后端已支持 Vue 构建产物优先、旧版静态资源回退
-- Vue 控制台已新增 hash 页面化视图和轻量路由配置层，支持对话页、书库页、索引页、导入页、模型页和设置页之间切换；页面元信息、导航项和组件映射已集中到 `routes.ts`
-- Vue 控制台已去掉原来的三栏常驻控制台布局，改为“导航 + 当前页面主内容”的 AI 助手式界面；会话列表、工具轨迹、导入、模型、设置等只在对应页面出现
-- 对话体验已调整为默认多轮续聊，发送成功后清空输入框；新会话必须由用户主动点击创建
-- Web 对话页已新增左侧独立会话栏，历史会话按用户最近问题前 10 个字作为标题，当前会话也会随最新提问即时更新标题
-- 用户提交问题后会立即在聊天流中显示该轮提问，并插入“正在思考”占位回答，避免后端检索期间页面无反馈导致重复提交
-- Agent 等待后端返回期间会先展示规划、索引检索、答案合成三步占位 trace；真实响应返回后再替换为后端工具轨迹、耗时、命中数和防剧透信息
-- Web 对话页已从三栏式控制台改为 AI 助手式布局，分支对比与合并、工具轨迹和摘要改为按需展开，聊天页不再显示重复的全局页面头
-- Vue 组件化第一轮已完成：导航栏、顶部页面头、对话、书库、索引、导入、模型和设置均已独立成组件/页面文件，`App.vue` 已瘦身为页面编排层
-- Vue 组件化第二轮已开始：关系图谱已从索引页拆分为独立 `RelationGraph` 组件，实体/事件/关系列表已拆为通用 `KnowledgeList` 组件，Agent 工具轨迹已拆为独立 `AgentTracePanel` 组件，索引页和聊天页都进一步瘦身
-- Web 控制台新增系统诊断入口，可查看前端模式、数据库、模型缓存、向量目录、依赖和索引规模
-- Web 控制台新增 Agent 工具箱，可直接查看和执行工具 schema，用于验证 Agent 工具层与防剧透边界
-- Web 控制台新增统一错误横幅、结构化错误状态和恢复建议，API/页面操作失败会显示上下文、时间、可关闭错误提示，以及依赖、API Key、书籍索引、会话分支、向量索引等常见问题的下一步处理建议
-- 已支持原文阅读器和证据片段高亮跳转
-- 已支持多本书分组、标签和分组筛选
-- 已支持控制台偏好持久化，并兼容迁移旧版 `bookrecall.apiSettings`
-- 已支持 Agent 执行策略选择，并在运行时展示 LangGraph 是否可用
+问题：
 
-但仍缺：
+- 小模型有时会错误规划工具。
+- 无实体问题容易召回偏题。
+- JSON 输出仍可能不稳定。
+- Thinking 模型可能把答案放在 `reasoning_content`，导致解析失败。
 
-- 更正式的路由体系与更细粒度组件拆分，例如未来接入 `vue-router`、深链路参数，并继续拆出表单、证据卡、诊断卡和工具箱组件
-- 浏览器端人工验收与更完整的 E2E 回归，例如新助手式对话流、主动新建会话、导入大 TXT、长对话编辑和向量索引构建流程
-- 事件级高质量关系图谱、LLM 语义级分支差异解释和更细粒度的操作级错误恢复流程
+已做修复：
 
-所以它现在已经从“开发者控制台 + 可用的多轮问答前端”推进到“具备工程化前端底座的 Agent 控制台”，但还不是成熟消费级产品。
+- 条件类问题优先走规则策略。
+- JSON 解析加入容错。
+- Web 提示关闭 Thinking。
+- endpoint 优先，避免误加载 GGUF。
 
-## 7. 工程化还有欠账
+下一步：
 
-还没完成的部分包括：
+- 建立工具选择评测集。
+- 对 Planner 输出做 schema 级校验和自动修复。
+- 对高风险规划做规则兜底。
 
-- CI
-- 发布流程
-- 更正式的配置文件体系
-- 增量重建索引（当前支持整本重建）
-- 性能基准
-- 评测集
-- 运行观测
+## 4. 召回质量需要系统评测
 
-这些不会立刻影响 demo，但会影响项目长期维护和协作。
+问题：
 
-## 当前最优先的方向
+- 当前主要靠人工问题验证。
+- 缺少标准问答集。
+- 缺少 MRR / Recall@K / rerank hit rate 指标。
+- 不同模型、候选数、chunk 大小之间缺少对比。
 
-如果按“投入产出比”排序，我建议下一步优先顺序是：
+下一步：
 
-1. FAISS / 更强的 embedding 检索后端
-2. 事件链、主题线索层和人物关系质量提升
-3. 会话摘要压缩与长期偏好记忆
-4. tool calling 的真实供应商回归验证
-5. 产品级 Web 前端工程化
-6. LangGraph checkpoint / 中断恢复 / human-in-the-loop
+- 建立 `eval/` 目录。
+- 收集 30-100 个真实问题。
+- 记录正确章节、正确证据。
+- 自动比较 lexical、embedding、embedding+rerank。
+- 输出召回指标和慢查询报告。
 
-原因很简单：
+## 5. 性能仍需优化
 
-- 会话记忆能直接把它从“单轮工具”推进成“持续协作助手”
-- FAISS 和结构层能提升复杂问题质量
-- Web 多轮与 trace 能显著提升产品完成度
-- tool calling 现在已经接入，下一步重点是把它放到真实供应商上验证边界
-- LangGraph 已有可选入口，下一步更适合补 checkpoint 和人工介入，而不是只做名义接入
+当前瓶颈：
 
-## 适合当前版本解决的问题
+- Qwen3-Embedding 首次加载慢。
+- 向量索引构建需要编码全部 child chunk。
+- Reranker 对长片段和较多候选打分慢。
+- 本地 Qwen 生成结构化 JSON 慢。
 
-当前版本已经比较适合：
+已做优化：
 
-- 回忆小说人物首次出现
-- 查询某实体在已读范围内的出现轨迹
-- 找某个事件、道具、概念的相关证据片段
-- 在防剧透前提下回顾前文
-- 用本地 embedding 改善语义召回
-- 用外部大模型做复杂总结
+- Two-Phase Indexing。
+- 导入时不默认全书智能 LLM 索引。
+- 向量构建真实进度。
+- 默认 rerank candidates 降到 20。
 
-## 暂时不适合的问题
+下一步：
 
-当前版本还不太适合：
+- 模型常驻进程或懒加载缓存。
+- Reranker 批处理和文本截断策略调优。
+- 增加“快速模式 / 精准模式”切换。
+- 支持后台任务取消。
+- 支持索引构建断点续建。
 
-- 极复杂的人物关系推理
-- 很强的章节间因果链自动抽取
-- 长期对话式读书陪伴
-- 直接替代通用聊天系统
-- 无索引情况下即时读完整本超大长文
+## 6. Web 产品化还不完整
 
-## 可以如何理解这个项目的阶段
+问题：
 
-如果把项目分成四个阶段：
+- 一些面板信息仍偏工程化。
+- 模型配置生效状态不够直观。
+- 后台任务不能取消。
+- 长任务失败后的恢复指引还不够清楚。
+- 缺少模型自检页面。
 
-1. 索引原型
-2. 可用 Agent MVP
-3. 完整阅读 Agent
-4. 产品化平台
+下一步：
 
-那么 BookRecall 当前处于：
+- 增加模型自检卡片。
+- 增加索引任务取消按钮。
+- 增加“当前回答使用了哪些模型”的透明提示。
+- 对召回结果增加可展开的评分和重排说明。
 
-`2 -> 3` 之间
+## 7. 多格式导入尚未实现
 
-它已经跨过了“能不能跑”的阶段，正在进入“能不能更聪明、更稳定、更像真正 Agent 产品”的阶段。
+当前只重点支持 TXT。
 
-## 建议的下一批具体任务
+未完成：
 
-如果继续开发，可以直接从这一批开始：
+- EPUB。
+- PDF。
+- DOCX。
+- Markdown 目录结构。
+- 多文件批量导入。
 
-- 增加会话级 `agent_memory` 持久化
-- 为 Web 端增加对话历史和调试 trace 面板
-- 在 embedding 通道后面接 FAISS
-- 提升 `lookup_relations` 的质量：从阶段摘要升级到事件级关系抽取、转折识别和关系图谱
-- 提升 `search_theme` 的质量：从阶段摘要升级到多主题对比、观点转折识别和 LLM 深层总结
+下一步：
 
-## 总结
+- 优先支持 EPUB。
+- 再支持 Markdown。
+- PDF 需要单独做版面清洗，不建议优先。
 
-BookRecall 现在已经实现了：
+## 8. 多书知识库还不完整
 
-- 本地阅读索引
-- 可控 ReAct Agent
-- 防剧透机制
-- CLI 与 Web 双入口
-- 本地 embedding 接入
-- 外部 OpenAI-compatible API 接入
+已完成：
 
-还没有完成的核心是：
+- 多本书管理。
+- 分组和标签。
+- 当前书内问答。
 
-- 跨会话记忆
-- LangGraph checkpoint / 中断恢复 / human-in-the-loop
-- 高质量关系图谱与主题层
-- 更强向量检索后端
-- 更完整产品级前端
+未完成：
 
-所以它已经是一个“可用的阅读回忆 Agent MVP”，但还不是“完整的阅读 Agent 产品”。
+- 跨书检索。
+- 系列作品统一索引。
+- 同名实体跨书区分。
+- 多书主题对比。
+
+下一步：
+
+- 先支持同一分组内跨书搜索。
+- 再支持系列人物和地点归并。
+
+## 近期建议路线图
+
+## Phase 1：稳定本地 Qwen 召回链路
+
+目标：
+
+- Qwen3 Embedding / Reranker 在 Web 中默认可用。
+- 旧 BGE 索引重建后不再影响召回。
+- 用户能清楚知道当前使用的是哪个模型。
+
+任务：
+
+- 增加模型自检 API。
+- Web 显示 embedding / reranker 是否本地路径命中。
+- 增加旧索引提醒和一键重建。
+- 对 rerank candidates 提供速度提示。
+
+## Phase 2：建立召回评测集
+
+目标：
+
+- 不再靠感觉判断“变聪明/变笨”。
+- 每次重构都能知道召回是否退化。
+
+任务：
+
+- 建立真实问题集。
+- 标注正确章节和证据。
+- 输出 Recall@K、MRR、Top1 命中率。
+- 对比 lexical、embedding、rerank、hybrid。
+
+## Phase 3：动态索引写回
+
+目标：
+
+- 本地 Qwen 不在导入时全书慢扫。
+- 问答时只分析相关片段。
+- 高价值结构化结果逐步沉淀。
+
+任务：
+
+- 设计 dynamic_entities / dynamic_events / dynamic_relations 表。
+- 写回来源证据、置信度、生成模型和时间。
+- Web 显示“本次问答新增索引”。
+- 支持用户确认/删除动态索引。
+
+## Phase 4：完整 Agent 图工作流
+
+目标：
+
+- 从策略包装升级为真正 LangGraph 工作流。
+
+任务：
+
+- query_understanding 节点。
+- retrieval 节点。
+- rerank 节点。
+- tool execution 节点。
+- answer validation 节点。
+- memory writeback 节点。
+- checkpoint 和恢复。
+
+## 当前最重要的工程事实
+
+- 当前测试数量：`129`。
+- 后端测试：通过。
+- 前端构建：通过。
+- 默认 embedding：`Qwen/Qwen3-Embedding-0.6B`。
+- 默认 reranker：`Qwen/Qwen3-Reranker-0.6B`。
+- 默认 rerank candidates：`20`。
+- 本地模型目录：`D:\BookRecall\models`。
+- 模型缓存目录：`D:\BookRecall\.cache\huggingface\sentence-transformers`。
+- 向量索引目录：`D:\BookRecall\.bookrecall\vectors`。
+- 数据库路径：`D:\BookRecall\.bookrecall\bookrecall.db`。
+- 旧 BGE 模型缓存已清理。
+- 旧 BGE 向量索引可能仍存在，需按书重建。
+
+## 当前工作区注意事项
+
+- 工作区存在大量未提交改动。
+- 不要随意回退用户已有改动。
+- 不要提交 `models/`、`.cache/`、`.bookrecall/`。
+- 不要把 API key、token、`.env`、证书加入仓库。
+- 修改后建议运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover tests
+```
+
+以及：
+
+```powershell
+cd frontend
+npm run build
+```
+
+最后建议运行 `/diff` 查看变更。
