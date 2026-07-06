@@ -4,26 +4,32 @@ import json
 import mimetypes
 import os
 import threading
+import uuid
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import perf_counter
 from urllib.parse import parse_qs, urlparse
+from typing import Callable
 
 from .agent import BookRecallAgent
 from .agent.policies.base import DecisionPolicy
 from .agent.policies.langgraph import LangGraphPolicy, LangGraphUnavailableError, is_langgraph_available
 from .agent.policies.llm_react import LLMReActPolicy
+from .agent.policies.local_planner import LocalPlannerPolicy
 from .agent.policies.rule_based import RuleBasedPolicy
 from .agent.state import AgentState
 from .agent.tools import build_default_registry
+from .chapter_summary import build_chapter_summaries_with_llm
 from .chunking import build_chunk_hierarchy
 from .cloud import OpenAICompatibleReasoner
-from .config import DEFAULT_CHUNK_SETTINGS, DEFAULT_EMBEDDING_SETTINGS, DEFAULT_SEARCH_SETTINGS
+from .config import DEFAULT_CHUNK_SETTINGS, DEFAULT_EMBEDDING_SETTINGS, DEFAULT_RERANK_SETTINGS, DEFAULT_SEARCH_SETTINGS, SearchSettings
 from .embeddings import (
+    CrossEncoderReranker,
     EmbeddingRetriever,
     LocalModelError,
+    RerankingRetriever,
     SentenceTransformerEmbedder,
     build_embedding_index,
     configure_local_model_cache,
@@ -77,11 +83,13 @@ def _make_smart_index_client(config: dict[str, object] | None) -> LocalChatClien
     if not config or not bool(config.get("enabled")):
         return None
     model_path = str(config.get("model_path", "") or "").strip()
+    model = str(config.get("model", "") or "").strip()
     endpoint = str(config.get("endpoint", "") or "").strip()
     if not model_path and not endpoint:
         raise ValueError("已开启智能索引，但没有填写 Qwen3 GGUF 模型路径或本地服务 endpoint。")
     return LocalChatClient(
         LocalLLMSettings(
+            model=model,
             model_path=model_path,
             endpoint=endpoint,
             n_ctx=int(config.get("n_ctx") or 4096),
@@ -90,9 +98,108 @@ def _make_smart_index_client(config: dict[str, object] | None) -> LocalChatClien
     )
 
 
+def _smart_index_profile(config: dict[str, object] | None) -> dict[str, object]:
+    raw_profile = str((config or {}).get("profile") or "balanced").strip().lower()
+    if raw_profile not in {"fast", "balanced", "deep"}:
+        raw_profile = "balanced"
+    defaults = {
+        "fast": {"batch_chapters": 6, "summary_stride": 0, "relation_stride": 4, "label": "快速"},
+        "balanced": {"batch_chapters": 4, "summary_stride": 4, "relation_stride": 2, "label": "均衡"},
+        "deep": {"batch_chapters": 2, "summary_stride": 1, "relation_stride": 1, "label": "深度"},
+    }[raw_profile]
+    batch_chapters = int((config or {}).get("batch_chapters") or defaults["batch_chapters"])
+    summary_stride = int((config or {}).get("summary_stride") or defaults["summary_stride"])
+    relation_stride = int((config or {}).get("relation_stride") or defaults["relation_stride"])
+    return {
+        "profile": raw_profile,
+        "label": defaults["label"],
+        "batch_chapters": max(1, min(6, batch_chapters)),
+        "summary_stride": max(0, summary_stride),
+        "relation_stride": max(1, relation_stride),
+    }
+
+
+def _search_settings_for_rerank(config: dict[str, object] | None) -> SearchSettings:
+    candidate_count = int((config or {}).get("candidates") or DEFAULT_RERANK_SETTINGS.candidate_count)
+    candidate_count = max(DEFAULT_SEARCH_SETTINGS.top_k_parents, min(100, candidate_count))
+    return SearchSettings(
+        top_k_children=DEFAULT_SEARCH_SETTINGS.top_k_children,
+        top_k_parents=candidate_count,
+    )
+
+
+class IndexJobManager:
+    def __init__(self, service: "BookRecallWebService") -> None:
+        self.service = service
+        self._lock = threading.Lock()
+        self._jobs: dict[str, dict[str, object]] = {}
+
+    def start(self, label: str, worker: Callable[[Callable[[dict[str, object]], None]], dict[str, object]]) -> dict[str, object]:
+        job_id = uuid.uuid4().hex
+        now = datetime.now().isoformat(timespec="seconds")
+        job = {
+            "job_id": job_id,
+            "label": label,
+            "status": "running",
+            "stage": "排队中",
+            "message": "任务已创建，等待后台线程启动。",
+            "percent": 0,
+            "current": 0,
+            "total": 0,
+            "result": None,
+            "error": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._lock:
+            self._jobs[job_id] = job
+
+        thread = threading.Thread(target=self._run, args=(job_id, worker), daemon=True)
+        thread.start()
+        return self.get(job_id)
+
+    def get(self, job_id: str) -> dict[str, object]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise ValueError(f"没有找到任务：{job_id}")
+            return dict(job)
+
+    def _run(self, job_id: str, worker: Callable[[Callable[[dict[str, object]], None]], dict[str, object]]) -> None:
+        def update(patch: dict[str, object]) -> None:
+            with self._lock:
+                job = self._jobs[job_id]
+                job.update(patch)
+                job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+        try:
+            update({"stage": "启动", "message": "后台索引任务已开始。", "percent": 1})
+            result = worker(update)
+            update(
+                {
+                    "status": "succeeded",
+                    "stage": "完成",
+                    "message": "索引构建完成。",
+                    "percent": 100,
+                    "result": result,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - background job must report any failure
+            update(
+                {
+                    "status": "failed",
+                    "stage": "失败",
+                    "message": str(exc),
+                    "error": str(exc),
+                    "percent": 100,
+                }
+            )
+
+
 class BookRecallWebService:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        self.jobs = IndexJobManager(self)
 
     def _open_store(self) -> BookRecallStore:
         store = BookRecallStore(self.db_path)
@@ -126,8 +233,10 @@ class BookRecallWebService:
         entity_lexicon: str = "",
         theme_lexicon: str = "",
         smart_index: dict[str, object] | None = None,
+        vector_index: dict[str, object] | None = None,
         overwrite: bool = False,
         source_path: str = "web://imported-text",
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> dict[str, object]:
         if not book_id:
             raise ValueError("book_id 不能为空。")
@@ -140,6 +249,16 @@ class BookRecallWebService:
                 raise ValueError("book_id 已存在。若要重建，请勾选覆盖已有索引。")
 
             chapters = parse_chapters(text)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "章节解析",
+                        "message": f"已解析 {len(chapters)} 个章节。",
+                        "percent": 5,
+                        "current": len(chapters),
+                        "total": len(chapters),
+                    }
+                )
             index_payload = self._build_index_payload(
                 book_id=book_id,
                 chapters=chapters,
@@ -147,7 +266,10 @@ class BookRecallWebService:
                 entity_lexicon=entity_lexicon,
                 theme_lexicon=theme_lexicon,
                 smart_index=smart_index,
+                progress_callback=progress_callback,
             )
+            if progress_callback:
+                progress_callback({"stage": "写入数据库", "message": "正在替换本地 SQLite 索引。", "percent": 94})
             store.replace_book(
                 book_id=book_id,
                 title=title or book_id,
@@ -159,7 +281,26 @@ class BookRecallWebService:
                 relation_records=index_payload["relation_records"],
                 theme_records=index_payload["theme_records"],
                 event_records=index_payload["event_records"],
+                chapter_summaries=index_payload["chapter_summaries"],
             )
+            vector_result: dict[str, object] | None = None
+            if isinstance(vector_index, dict) and bool(vector_index.get("enabled")):
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "stage": "向量索引",
+                            "message": "正在加载本地 embedding 模型并构建 Two-Phase 召回索引。",
+                            "percent": 96,
+                            "current": 0,
+                            "total": len(index_payload["child_chunks"]),
+                        }
+                    )
+                vector_result = self._try_build_vector_index_with_store(
+                    store,
+                    book_id,
+                    vector_index,
+                    progress_callback=progress_callback,
+                )
             return {
                 "book_id": book_id,
                 "title": title or book_id,
@@ -171,6 +312,7 @@ class BookRecallWebService:
                 "themes": len(index_payload["theme_records"]),
                 "events": len(index_payload["event_records"]),
                 "overwritten": overwrite,
+                "vector_index": vector_result,
             }
         finally:
             store.close()
@@ -182,6 +324,7 @@ class BookRecallWebService:
         entity_lexicon: str = "",
         theme_lexicon: str = "",
         smart_index: dict[str, object] | None = None,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> dict[str, object]:
         store = self._open_store()
         try:
@@ -191,6 +334,16 @@ class BookRecallWebService:
             chapters = store.list_chapter_records(book_id)
             if not chapters:
                 raise ValueError("这本书没有可重建的章节正文。")
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "读取章节",
+                        "message": f"已载入 {len(chapters)} 个章节正文。",
+                        "percent": 5,
+                        "current": len(chapters),
+                        "total": len(chapters),
+                    }
+                )
             text = "\n\n".join(chapter.content for chapter in chapters)
             index_payload = self._build_index_payload(
                 book_id=book_id,
@@ -199,7 +352,10 @@ class BookRecallWebService:
                 entity_lexicon=entity_lexicon,
                 theme_lexicon=theme_lexicon,
                 smart_index=smart_index,
+                progress_callback=progress_callback,
             )
+            if progress_callback:
+                progress_callback({"stage": "写入数据库", "message": "正在替换本地 SQLite 索引。", "percent": 94})
             store.replace_book(
                 book_id=book_id,
                 title=info.title,
@@ -211,6 +367,7 @@ class BookRecallWebService:
                 relation_records=index_payload["relation_records"],
                 theme_records=index_payload["theme_records"],
                 event_records=index_payload["event_records"],
+                chapter_summaries=index_payload["chapter_summaries"],
             )
             return {
                 "book_id": book_id,
@@ -225,6 +382,15 @@ class BookRecallWebService:
             }
         finally:
             store.close()
+
+    def start_build_book_job(self, **kwargs) -> dict[str, object]:
+        return self.jobs.start("导入并构建索引", lambda progress: self.build_book(progress_callback=progress, **kwargs))
+
+    def start_rebuild_book_job(self, **kwargs) -> dict[str, object]:
+        return self.jobs.start("重建结构化索引", lambda progress: self.rebuild_book_index(progress_callback=progress, **kwargs))
+
+    def get_index_job(self, job_id: str) -> dict[str, object]:
+        return self.jobs.get(job_id)
 
     def delete_book(self, book_id: str) -> dict[str, object]:
         store = self._open_store()
@@ -244,6 +410,59 @@ class BookRecallWebService:
     def delete_vector_index(self, book_id: str) -> dict[str, object]:
         return delete_vector_index(default_vector_dir(self.db_path), book_id)
 
+    def _try_build_vector_index_with_store(
+        self,
+        store: BookRecallStore,
+        book_id: str,
+        config: dict[str, object],
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> dict[str, object]:
+        try:
+            configure_local_model_cache(default_cache_root(self.db_path))
+            model_name = str(config.get("model") or DEFAULT_EMBEDDING_SETTINGS.model_name)
+            backend = str(config.get("backend") or "auto")
+            limit_raw = config.get("limit_chunks")
+            limit_chunks = int(limit_raw) if limit_raw not in (None, "") else None
+
+            def vector_progress(current: int, total: int) -> None:
+                if progress_callback is None:
+                    return
+                percent = 96 + int((min(current, total) / max(total, 1)) * 3)
+                progress_callback(
+                    {
+                        "stage": "向量索引",
+                        "message": f"正在编码 embedding chunk：{current} / {total}",
+                        "percent": min(99, percent),
+                        "current": current,
+                        "total": total,
+                    }
+                )
+
+            embedder = SentenceTransformerEmbedder(
+                model_name,
+                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
+            )
+            info = build_embedding_index(
+                store=store,
+                book_id=book_id,
+                index_dir=default_vector_dir(self.db_path),
+                embedder=embedder,
+                batch_size=DEFAULT_EMBEDDING_SETTINGS.batch_size,
+                limit_chunks=limit_chunks,
+                prefer_backend=backend,
+                progress_callback=vector_progress,
+            )
+            return {
+                "ok": True,
+                "model_name": info.model_name,
+                "backend": info.backend,
+                "chunk_count": info.chunk_count,
+                "dimension": info.dimension,
+                "path": info.path,
+            }
+        except Exception as exc:  # noqa: BLE001 - vector pre-index should not break import
+            return {"ok": False, "error": str(exc)}
+
     def _build_index_payload(
         self,
         *,
@@ -253,36 +472,129 @@ class BookRecallWebService:
         entity_lexicon: str = "",
         theme_lexicon: str = "",
         smart_index: dict[str, object] | None = None,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> dict[str, object]:
+        if progress_callback:
+            progress_callback({"stage": "切分文本", "message": "正在构建 parent/child chunks。", "percent": 8})
         parent_chunks, child_chunks = build_chunk_hierarchy(book_id, chapters, DEFAULT_CHUNK_SETTINGS)
         smart_client = _make_smart_index_client(smart_index)
+        smart_profile = _smart_index_profile(smart_index)
         max_chapters = int((smart_index or {}).get("max_chapters") or 0)
+        batch_chapters = int(smart_profile["batch_chapters"])
+        summary_stride = int(smart_profile["summary_stride"])
+        relation_stride = int(smart_profile["relation_stride"])
+        if progress_callback:
+            progress_callback(
+                {
+                    "stage": "实体候选",
+                    "message": "正在生成本地实体候选。",
+                    "percent": 12,
+                    "current": 0,
+                    "total": len(chapters),
+                }
+            )
         entity_names = _parse_inline_lexicon(entity_lexicon)
         if not entity_names:
             entity_names = auto_discover_entities(text)
         if smart_client is not None:
+            entity_total = min(max_chapters or len(chapters), len(chapters))
+
+            def entity_progress(stage: str, current: int, total: int, chapter) -> None:
+                if progress_callback:
+                    span_total = total or entity_total or 1
+                    percent = 15 + int(35 * (current / span_total))
+                    progress_callback(
+                        {
+                            "stage": stage,
+                            "message": f"{smart_profile['label']}模式 · 第 {chapter.number} 章《{chapter.title}》",
+                            "percent": min(50, percent),
+                            "current": current,
+                            "total": span_total,
+                        }
+                    )
+
             entity_names = discover_entities_with_llm(
                 chapters,
                 smart_client,
                 seed_entities=entity_names,
                 max_chapters=max_chapters,
+                batch_chapters=batch_chapters,
+                progress_callback=entity_progress,
             )
+        if progress_callback:
+            progress_callback({"stage": "实体落库准备", "message": "正在扫描实体出现位置。", "percent": 52})
         entity_records = build_entity_records(chapters, entity_names, DEFAULT_CHUNK_SETTINGS)
+        if progress_callback:
+            progress_callback({"stage": "主题索引", "message": "正在构建主题线索索引。", "percent": 58})
         theme_names = auto_discover_themes(text, extra_terms=_parse_inline_lexicon(theme_lexicon))
         theme_records = build_theme_records(chapters, theme_names, DEFAULT_CHUNK_SETTINGS)
+        chapter_summaries: dict[int, str] = {}
+        if smart_client is not None and summary_stride > 0:
+            summary_total = max(1, (min(max_chapters or len(chapters), len(chapters)) + summary_stride - 1) // summary_stride)
+
+            def summary_progress(stage: str, current: int, total: int, chapter) -> None:
+                if progress_callback:
+                    span_total = total or summary_total or 1
+                    percent = 60 + int(10 * (current / span_total))
+                    progress_callback(
+                        {
+                            "stage": stage,
+                            "message": f"{smart_profile['label']}模式 · 第 {chapter.number} 章《{chapter.title}》",
+                            "percent": min(70, percent),
+                            "current": current,
+                            "total": span_total,
+                        }
+                    )
+
+            chapter_summaries = build_chapter_summaries_with_llm(
+                chapters,
+                smart_client,
+                max_chapters=max_chapters,
+                stage_size=10,
+                chapter_stride=summary_stride,
+                progress_callback=summary_progress,
+            )
+        elif smart_client is not None and progress_callback:
+            progress_callback(
+                {
+                    "stage": "智能章节摘要",
+                    "message": f"{smart_profile['label']}模式已跳过逐章摘要，以优先提升导入速度。",
+                    "percent": 70,
+                }
+            )
         if smart_client is not None:
+            relation_total = max(1, (min(max_chapters or len(chapters), len(chapters)) + relation_stride - 1) // relation_stride)
+
+            def relation_progress(stage: str, current: int, total: int, chapter) -> None:
+                if progress_callback:
+                    span_total = total or relation_total or 1
+                    percent = 72 + int(18 * (current / span_total))
+                    progress_callback(
+                        {
+                            "stage": stage,
+                            "message": f"{smart_profile['label']}模式 · 第 {chapter.number} 章《{chapter.title}》",
+                            "percent": min(90, percent),
+                            "current": current,
+                            "total": span_total,
+                        }
+                    )
+
             relation_records, event_records = build_smart_relation_event_records(
                 chapters,
                 entity_records,
                 DEFAULT_CHUNK_SETTINGS,
                 smart_client,
                 max_chapters=max_chapters,
+                chapter_stride=relation_stride,
+                progress_callback=relation_progress,
             )
             if not relation_records:
                 relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
             if not event_records:
                 event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
         else:
+            if progress_callback:
+                progress_callback({"stage": "关系/事件索引", "message": "正在构建本地规则关系和事件索引。", "percent": 72})
             relation_records = build_relation_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
             event_records = build_event_records(chapters, entity_records, DEFAULT_CHUNK_SETTINGS)
         return {
@@ -292,6 +604,7 @@ class BookRecallWebService:
             "relation_records": relation_records,
             "theme_records": theme_records,
             "event_records": event_records,
+            "chapter_summaries": chapter_summaries,
         }
 
     def runtime_status(self) -> dict[str, object]:
@@ -363,6 +676,7 @@ class BookRecallWebService:
             "agent_policies": [
                 {"id": "auto", "name": "自动选择", "ready": True},
                 {"id": "rule_based", "name": "本地规则 ReAct", "ready": True},
+                {"id": "local_planner", "name": "本地 Qwen Planner", "ready": True},
                 {"id": "llm_react", "name": "云端 LLM ReAct", "ready": True},
                 {"id": "langgraph", "name": "LangGraph ReAct", "ready": is_langgraph_available()},
             ],
@@ -987,6 +1301,7 @@ class BookRecallWebService:
         book_id: str,
         query: str,
         retriever_mode: str = "auto",
+        rerank_config: dict[str, object] | None = None,
         progress_chapter: int | None = None,
         limit: int = 8,
     ) -> dict[str, object]:
@@ -996,7 +1311,7 @@ class BookRecallWebService:
         try:
             if store.get_book(book_id) is None:
                 raise ValueError(f"没有找到 book_id={book_id}。")
-            retriever = self._make_retriever(store, book_id, retriever_mode)
+            retriever = self._make_retriever(store, book_id, retriever_mode, rerank_config=rerank_config)
             hits = retriever.search(book_id, query, max_chapter=progress_chapter)[:limit]
             return {
                 "book_id": book_id,
@@ -1051,6 +1366,8 @@ class BookRecallWebService:
         retriever_mode: str = "lexical",
         agent_policy: str = "auto",
         cloud_config: dict[str, object] | None = None,
+        local_llm_config: dict[str, object] | None = None,
+        rerank_config: dict[str, object] | None = None,
     ) -> dict[str, object]:
         store = self._open_store()
         try:
@@ -1079,6 +1396,8 @@ class BookRecallWebService:
             retriever_mode=retriever_mode,
             agent_policy=agent_policy,
             cloud_config=cloud_config,
+            local_llm_config=local_llm_config,
+            rerank_config=rerank_config,
         )
         answer["rerun"] = {
             "from_turn_id": turn_id,
@@ -1101,6 +1420,8 @@ class BookRecallWebService:
         retriever_mode: str = "lexical",
         agent_policy: str = "auto",
         cloud_config: dict[str, object] | None = None,
+        local_llm_config: dict[str, object] | None = None,
+        rerank_config: dict[str, object] | None = None,
     ) -> dict[str, object]:
         store = self._open_store()
         try:
@@ -1136,6 +1457,8 @@ class BookRecallWebService:
             retriever_mode=retriever_mode,
             agent_policy=agent_policy,
             cloud_config=cloud_config,
+            local_llm_config=local_llm_config,
+            rerank_config=rerank_config,
         )
         answer["branch"] = {
             "source_session_id": session_id,
@@ -1158,13 +1481,22 @@ class BookRecallWebService:
         retriever_mode: str = "lexical",
         agent_policy: str = "auto",
         cloud_config: dict[str, object] | None = None,
+        local_llm_config: dict[str, object] | None = None,
+        rerank_config: dict[str, object] | None = None,
     ) -> dict[str, object]:
         store = self._open_store()
         try:
-            retriever = self._make_retriever(store, book_id, retriever_mode)
+            retriever = self._make_retriever(store, book_id, retriever_mode, rerank_config=rerank_config)
             reasoner = self._make_reasoner(cloud_config)
-            policy = self._make_policy(agent_policy, reasoner)
-            agent = BookRecallAgent(store, policy=policy, retriever=retriever, reasoner=reasoner)
+            query_understanding_client = _make_smart_index_client(local_llm_config)
+            policy = self._make_policy(agent_policy, reasoner, query_understanding_client)
+            agent = BookRecallAgent(
+                store,
+                policy=policy,
+                retriever=retriever,
+                reasoner=reasoner,
+                query_understanding_client=query_understanding_client,
+            )
             card = agent.ask_card(
                 book_id=book_id,
                 question=question,
@@ -1177,9 +1509,10 @@ class BookRecallWebService:
             payload["runtime"] = {
                 "retriever": retriever_mode,
                 "agent_policy": agent_policy,
-                "effective_policy": self._effective_policy_name(agent_policy, reasoner),
+                "effective_policy": self._effective_policy_name(agent_policy, reasoner, query_understanding_client),
                 "cloud_reasoner_enabled": reasoner.enabled,
                 "cloud_model": reasoner.model if reasoner.enabled else None,
+                "local_query_understanding_enabled": query_understanding_client is not None,
             }
             if session_id:
                 session_data = {
@@ -1197,17 +1530,28 @@ class BookRecallWebService:
         finally:
             store.close()
 
-    def _make_retriever(self, store: BookRecallStore, book_id: str, mode: str) -> Retriever:
+    def _make_retriever(
+        self,
+        store: BookRecallStore,
+        book_id: str,
+        mode: str,
+        *,
+        rerank_config: dict[str, object] | None = None,
+    ) -> Retriever:
         if mode not in {"lexical", "embedding", "auto"}:
             raise LocalModelError("未知检索器，请选择 lexical、embedding 或 auto。")
+        rerank_enabled = bool((rerank_config or {}).get("enabled"))
+        search_settings = _search_settings_for_rerank(rerank_config) if rerank_enabled else DEFAULT_SEARCH_SETTINGS
         if mode == "lexical":
-            return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+            base: Retriever = LocalRetriever(store, search_settings)
+            return self._wrap_reranker(base, rerank_config)
 
         vector_dir = default_vector_dir(self.db_path)
         info = get_vector_index_info(vector_dir, book_id)
         if info is None:
             if mode == "auto":
-                return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+                base = LocalRetriever(store, search_settings)
+                return self._wrap_reranker(base, rerank_config)
             raise LocalModelError("这本书还没有向量索引，请先运行 embed-build，或在网页端选择倒排检索。")
 
         try:
@@ -1216,19 +1560,40 @@ class BookRecallWebService:
                 info.model_name,
                 cache_dir=default_sentence_transformers_cache_dir(self.db_path),
             )
-            return EmbeddingRetriever(store, DEFAULT_SEARCH_SETTINGS, index_dir=vector_dir, embedder=embedder)
+            base = EmbeddingRetriever(store, search_settings, index_dir=vector_dir, embedder=embedder)
+            return self._wrap_reranker(base, rerank_config)
         except LocalModelError:
             if mode == "auto":
-                return LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
+                base = LocalRetriever(store, search_settings)
+                return self._wrap_reranker(base, rerank_config)
             raise
+
+    def _wrap_reranker(self, base: Retriever, config: dict[str, object] | None) -> Retriever:
+        if not config or not bool(config.get("enabled")):
+            return base
+        try:
+            configure_local_model_cache(default_cache_root(self.db_path))
+            reranker = CrossEncoderReranker(
+                str(config.get("model") or DEFAULT_RERANK_SETTINGS.model_name),
+                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
+                batch_size=int(config.get("batch_size") or DEFAULT_RERANK_SETTINGS.batch_size),
+            )
+            return RerankingRetriever(base, reranker, DEFAULT_SEARCH_SETTINGS)
+        except Exception as exc:  # noqa: BLE001 - reranker is an optional precision layer
+            if bool(config.get("required")):
+                raise LocalModelError(f"本地 reranker 加载失败：{exc}") from exc
+            return base
 
     def _make_policy(
         self,
         mode: str,
         reasoner: OpenAICompatibleReasoner | _DisabledReasoner,
+        local_client: object | None = None,
     ) -> DecisionPolicy | None:
         normalized = (mode or "auto").strip().lower()
         if normalized == "auto":
+            if local_client is not None:
+                return LocalPlannerPolicy(local_client)
             return None
         if normalized == "rule_based":
             return RuleBasedPolicy(reasoner=None)
@@ -1236,6 +1601,10 @@ class BookRecallWebService:
             if not reasoner.enabled:
                 raise LocalModelError("LLM ReAct 策略需要先启用云端大模型配置。")
             return LLMReActPolicy(reasoner)
+        if normalized == "local_planner":
+            if local_client is None:
+                raise LocalModelError("本地 Qwen Planner 需要先启用本地 Qwen 配置。")
+            return LocalPlannerPolicy(local_client)
         if normalized == "langgraph":
             delegate: DecisionPolicy
             if reasoner.enabled:
@@ -1246,16 +1615,21 @@ class BookRecallWebService:
                 return LangGraphPolicy(delegate=delegate)
             except LangGraphUnavailableError as exc:
                 raise LocalModelError(str(exc)) from exc
-        raise LocalModelError("未知 Agent 执行策略，请选择 auto、rule_based、llm_react 或 langgraph。")
+        raise LocalModelError("未知 Agent 执行策略，请选择 auto、rule_based、local_planner、llm_react 或 langgraph。")
 
     @staticmethod
     def _effective_policy_name(
         mode: str,
         reasoner: OpenAICompatibleReasoner | _DisabledReasoner,
+        local_client: object | None = None,
     ) -> str:
         normalized = (mode or "auto").strip().lower()
         if normalized == "auto":
+            if local_client is not None:
+                return "local_planner"
             return "llm_react" if reasoner.enabled else "rule_based"
+        if normalized == "local_planner":
+            return "local_planner"
         if normalized == "langgraph":
             return "langgraph(llm_react)" if reasoner.enabled else "langgraph(rule_based)"
         return normalized
@@ -1299,6 +1673,14 @@ class BookRecallHandler(BaseHTTPRequestHandler):
 
         if path == "/api/diagnostics":
             self._send_json(self.service.diagnostics())
+            return
+
+        if path.startswith("/api/jobs/"):
+            job_id = path[len("/api/jobs/") :].strip("/")
+            try:
+                self._send_json({"job": self.service.get_index_job(job_id)})
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.NOT_FOUND, str(exc))
             return
 
         if path == "/api/agent/tools":
@@ -1476,6 +1858,44 @@ class BookRecallHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/books/build-job":
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = str(payload.get("book_id", "")).strip()
+                title = str(payload.get("title", "")).strip()
+                text = str(payload.get("text", ""))
+                entity_lexicon = str(payload.get("entities", ""))
+                theme_lexicon = str(payload.get("themes", ""))
+                overwrite = bool(payload.get("overwrite"))
+                source_name = str(payload.get("source_name", "")).strip()
+                smart_index = payload.get("smart_index")
+                if not isinstance(smart_index, dict):
+                    smart_index = None
+                vector_index = payload.get("vector_index")
+                if not isinstance(vector_index, dict):
+                    vector_index = None
+                if not book_id or not text.strip():
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和书籍正文不能为空。")
+                    return
+                self._send_json(
+                    {
+                        "job": self.service.start_build_book_job(
+                            book_id=book_id,
+                            title=title,
+                            text=text,
+                            entity_lexicon=entity_lexicon,
+                            theme_lexicon=theme_lexicon,
+                            smart_index=smart_index,
+                            vector_index=vector_index,
+                            overwrite=overwrite,
+                            source_path=f"web://file/{source_name}" if source_name else "web://imported-text",
+                        )
+                    },
+                    status=HTTPStatus.ACCEPTED,
+                )
+                return
+
             if parsed.path == "/api/books/build":
                 payload = self._read_json_body()
                 if payload is None:
@@ -1490,6 +1910,9 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 smart_index = payload.get("smart_index")
                 if not isinstance(smart_index, dict):
                     smart_index = None
+                vector_index = payload.get("vector_index")
+                if not isinstance(vector_index, dict):
+                    vector_index = None
                 if not book_id or not text.strip():
                     self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和书籍正文不能为空。")
                     return
@@ -1502,10 +1925,32 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                             entity_lexicon=entity_lexicon,
                             theme_lexicon=theme_lexicon,
                             smart_index=smart_index,
+                            vector_index=vector_index,
                             overwrite=overwrite,
                             source_path=f"web://file/{source_name}" if source_name else "web://imported-text",
                         )
                     }
+                )
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/rebuild-job"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/rebuild-job")].strip("/")
+                smart_index = payload.get("smart_index")
+                if not isinstance(smart_index, dict):
+                    smart_index = None
+                self._send_json(
+                    {
+                        "job": self.service.start_rebuild_book_job(
+                            book_id=book_id,
+                            entity_lexicon=str(payload.get("entities", "")),
+                            theme_lexicon=str(payload.get("themes", "")),
+                            smart_index=smart_index,
+                        )
+                    },
+                    status=HTTPStatus.ACCEPTED,
                 )
                 return
 
@@ -1576,12 +2021,16 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 limit_raw = payload.get("limit")
                 progress_chapter = int(progress_raw) if progress_raw not in (None, "") else None
                 limit = max(1, min(20, int(limit_raw))) if limit_raw not in (None, "") else 8
+                rerank_config = payload.get("rerank_config")
+                if not isinstance(rerank_config, dict):
+                    rerank_config = None
                 self._send_json(
                     {
                         "search": self.service.search_evidence(
                             book_id=book_id,
                             query=str(payload.get("query", "")).strip(),
                             retriever_mode=str(payload.get("retriever", "auto")).strip() or "auto",
+                            rerank_config=rerank_config,
                             progress_chapter=progress_chapter,
                             limit=limit,
                         )
@@ -1723,6 +2172,12 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                     cloud_config = payload.get("cloud_config")
                     if not isinstance(cloud_config, dict):
                         cloud_config = None
+                    local_llm_config = payload.get("local_llm_config")
+                    if not isinstance(local_llm_config, dict):
+                        local_llm_config = None
+                    rerank_config = payload.get("rerank_config")
+                    if not isinstance(rerank_config, dict):
+                        rerank_config = None
                     self._send_json(
                         self.service.rerun_session_from_turn(
                             book_id=book_id,
@@ -1734,6 +2189,8 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                             retriever_mode=str(payload.get("retriever", "lexical")).strip() or "lexical",
                             agent_policy=str(payload.get("agent_policy", "auto")).strip() or "auto",
                             cloud_config=cloud_config,
+                            local_llm_config=local_llm_config,
+                            rerank_config=rerank_config,
                         )
                     )
                     return
@@ -1743,6 +2200,12 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                     cloud_config = payload.get("cloud_config")
                     if not isinstance(cloud_config, dict):
                         cloud_config = None
+                    local_llm_config = payload.get("local_llm_config")
+                    if not isinstance(local_llm_config, dict):
+                        local_llm_config = None
+                    rerank_config = payload.get("rerank_config")
+                    if not isinstance(rerank_config, dict):
+                        rerank_config = None
                     target_session_id = str(payload.get("target_session_id", "")).strip() or None
                     self._send_json(
                         self.service.branch_session_from_turn(
@@ -1756,6 +2219,8 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                             retriever_mode=str(payload.get("retriever", "lexical")).strip() or "lexical",
                             agent_policy=str(payload.get("agent_policy", "auto")).strip() or "auto",
                             cloud_config=cloud_config,
+                            local_llm_config=local_llm_config,
+                            rerank_config=rerank_config,
                         )
                     )
                     return
@@ -1796,6 +2261,12 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 cloud_config = payload.get("cloud_config")
                 if not isinstance(cloud_config, dict):
                     cloud_config = None
+                local_llm_config = payload.get("local_llm_config")
+                if not isinstance(local_llm_config, dict):
+                    local_llm_config = None
+                rerank_config = payload.get("rerank_config")
+                if not isinstance(rerank_config, dict):
+                    rerank_config = None
                 if not book_id or not question:
                     self._send_error_json(HTTPStatus.BAD_REQUEST, "book_id 和 question 不能为空。")
                     return
@@ -1809,6 +2280,8 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                         retriever_mode=retriever_mode,
                         agent_policy=agent_policy,
                         cloud_config=cloud_config,
+                        local_llm_config=local_llm_config,
+                        rerank_config=rerank_config,
                     )
                 )
                 return

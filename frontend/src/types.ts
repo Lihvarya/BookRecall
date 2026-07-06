@@ -87,6 +87,29 @@ export interface VectorIndexSummary {
   path?: string;
 }
 
+export interface IndexJob {
+  job_id: string;
+  label?: string;
+  status: "running" | "succeeded" | "failed" | string;
+  stage?: string;
+  message?: string;
+  percent?: number;
+  current?: number;
+  total?: number;
+  result?: {
+    book_id?: string;
+    title?: string;
+    chapter_count?: number;
+    entities?: number;
+    relations?: number;
+    themes?: number;
+    events?: number;
+  } | null;
+  error?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface EntitySummary {
   name: string;
   aliases?: string[];
@@ -125,6 +148,7 @@ export interface EvidenceItem {
   excerpt?: string;
   reason?: string;
   child_text?: string;
+  parent_text?: string;
   score?: number;
 }
 
@@ -254,6 +278,8 @@ export interface AnswerCard {
   suggestions?: string[];
   trace?: TraceItem[];
   user_preferences?: UserPreferences;
+  query_understanding?: Record<string, unknown>;
+  answer_validation?: Record<string, unknown>;
   runtime?: Record<string, unknown>;
   session?: {
     session_id?: string;

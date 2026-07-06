@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .config import ChunkSettings
 from .models import Chapter, EntityRecord, EventRecord, RelationMention, RelationRecord
@@ -28,6 +28,7 @@ RELATION_TYPES = {
     "隶属/组织",
     "交易/利用",
     "因果/线索",
+    "关系变化",
     "共现/关联",
 }
 
@@ -39,6 +40,10 @@ EVENT_TYPES = {
     "协作/同行",
     "身份/关系变化",
     "转折/后果",
+    "因果链",
+    "道具流转",
+    "伏笔/回收",
+    "关系变化",
     "事件",
 }
 
@@ -59,7 +64,9 @@ def discover_entities_with_llm(
     *,
     seed_entities: dict[str, list[str]] | None = None,
     max_chapters: int = 0,
+    batch_chapters: int = 1,
     min_confidence: float = 0.62,
+    progress_callback: Callable[[str, int, int, Chapter], None] | None = None,
 ) -> dict[str, list[str]]:
     """Use a local LLM as an entity reviewer and expander.
 
@@ -71,8 +78,21 @@ def discover_entities_with_llm(
         for name, aliases in (seed_entities or {}).items()
         if _valid_entity_name(name)
     }
-    for chapter in _limited_chapters(chapters, max_chapters):
-        payload = client.complete_json(_entity_prompt(chapter))
+    selected_chapters = _limited_chapters(chapters, max_chapters)
+    total = len(selected_chapters)
+    batch_size = max(1, min(6, batch_chapters))
+    for offset, batch in enumerate(_batched_chapters(selected_chapters, batch_size), start=0):
+        chapter = batch[0]
+        current = min(total, offset * batch_size + len(batch))
+        if progress_callback:
+            progress_callback("智能实体抽取", current, total, chapter)
+        prompt = _entity_prompt(chapter) if len(batch) == 1 else _entity_batch_prompt(batch)
+        try:
+            payload = client.complete_json(prompt)
+        except Exception:
+            # Smart indexing is an enhancer.  A malformed batch should not make
+            # the whole book import fail; seed/rule indexes remain available.
+            continue
         for item in _as_list(payload.get("entities")):
             if not isinstance(item, dict):
                 continue
@@ -102,7 +122,9 @@ def build_smart_relation_event_records(
     client: JsonCompleter,
     *,
     max_chapters: int = 0,
+    chapter_stride: int = 1,
     min_confidence: float = 0.58,
+    progress_callback: Callable[[str, int, int, Chapter], None] | None = None,
 ) -> tuple[list[RelationRecord], list[EventRecord]]:
     entity_names = [record.name for record in entity_records]
     entity_lookup = {name: name for name in entity_names}
@@ -110,14 +132,21 @@ def build_smart_relation_event_records(
     event_records: list[EventRecord] = []
     seen_events: set[tuple[int, str]] = set()
 
-    for chapter in _limited_chapters(chapters, max_chapters):
+    selected_chapters = _stride_chapters(_limited_chapters(chapters, max_chapters), chapter_stride)
+    total = len(selected_chapters)
+    for index, chapter in enumerate(selected_chapters, start=1):
+        if progress_callback:
+            progress_callback("智能关系/事件抽取", index, total, chapter)
         present = [name for name in entity_names if name in chapter.content]
         if not present:
             continue
         context = _chapter_context(chapter.content, present, settings.max_excerpt_chars * 8)
         if not context:
             continue
-        payload = client.complete_json(_relation_event_prompt(chapter, context, present))
+        try:
+            payload = client.complete_json(_relation_event_prompt(chapter, context, present))
+        except Exception:
+            continue
 
         for item in _as_list(payload.get("relations")):
             parsed = _parse_relation_item(item, entity_lookup, min_confidence)
@@ -155,7 +184,7 @@ def build_smart_relation_event_records(
                     chapter_number=chapter.number,
                     chapter_title=chapter.title,
                     event_type=event_type,
-                    summary=_trim(summary or evidence, 72),
+                    summary=_trim(summary or evidence, 120),
                     excerpt=evidence,
                     entities=entities,
                 )
@@ -197,28 +226,57 @@ def _entity_prompt(chapter: Chapter) -> str:
 """.strip()
 
 
+def _entity_batch_prompt(chapters: list[Chapter]) -> str:
+    blocks: list[str] = []
+    for chapter in chapters:
+        content = _trim(" ".join(chapter.content.split()), 2200)
+        blocks.append(f"章节：第 {chapter.number} 章《{chapter.title}》\n正文：\n{content}")
+    joined_blocks = "\n\n---\n\n".join(blocks)
+    return f"""
+请从下面多个章节中识别真正有索引价值的专名实体。
+
+只抽取：人物、组织/门派、地点、重要物品、功法/能力、种族、核心概念。
+不要抽取：代词、时间词、普通动词/形容词/副词、泛称、量词、口头禅，例如“就是、没有、他的、时间、之前、心中”。
+不要抽取：作者名、作品名、校对版本、章节前言里提到的其他小说，除非它们是正文剧情中的实体。
+这是合批处理，请综合所有章节，最多输出 36 个最有价值的实体；如果没有可靠实体，输出空数组。
+不要写思考过程，不要解释，不要 markdown。
+
+输出严格 JSON：
+{{"entities":[{{"name":"实体名","type":"人物|组织|地点|物品|功法|概念|种族|其他","aliases":["别名"],"evidence":"原文短句","confidence":0.0}}]}}
+
+{joined_blocks}
+""".strip()
+
+
 def _relation_event_prompt(chapter: Chapter, context: str, entities: list[str]) -> str:
     return f"""
-请基于候选实体和原文证据，抽取有效关系与关键事件。
+请基于候选实体和原文证据，抽取有效关系、关键事件与阅读记忆链路。
 
 规则：
 1. 关系必须有明确互动或叙事意义，不要因为同章出现就建立关系。
 2. 事件必须推动情节、揭示信息、造成选择/冲突/获得/失去/身份变化。
-3. source、target、entities 必须来自候选实体列表。
-4. evidence 必须尽量复制原文短句。
-5. 不确定就不要输出。
-6. 最多输出 12 条关系和 12 条事件。
-7. 不要写思考过程，不要解释，不要 markdown。
+3. 优先抽取四类更有阅读记忆价值的链路：人物关系变化、事件因果链、道具流转链、伏笔/回收链。
+4. source、target、entities 必须来自候选实体列表。
+5. evidence 必须尽量复制原文短句。
+6. 不确定就不要输出。
+7. 最多输出 12 条关系和 12 条事件。
+8. 不要写思考过程，不要解释，不要 markdown。
 
 关系类型只能选：
-冲突、同伴/协作、师徒/传承、亲缘/家族、隶属/组织、交易/利用、因果/线索、共现/关联
+冲突、同伴/协作、师徒/传承、亲缘/家族、隶属/组织、交易/利用、因果/线索、关系变化、共现/关联
 
 事件类型只能选：
-获得/失去、冲突/危机、揭示/真相、选择/决定、协作/同行、身份/关系变化、转折/后果、事件
+获得/失去、冲突/危机、揭示/真相、选择/决定、协作/同行、身份/关系变化、转折/后果、因果链、道具流转、伏笔/回收、关系变化、事件
+
+事件可额外输出这些字段，能确定才填：
+- cause/effect：用于因果链
+- item/from/to：用于道具流转
+- foreshadowing/payoff：用于伏笔与回收
+- relation_change：用于人物关系或身份状态变化
 
 输出严格 JSON：
 {{"relations":[{{"source":"实体A","target":"实体B","type":"冲突","evidence":"原文短句","confidence":0.0}}],
-"events":[{{"type":"选择/决定","summary":"不超过40字摘要","evidence":"原文短句","entities":["实体A"],"confidence":0.0}}]}}
+"events":[{{"type":"因果链","summary":"不超过60字摘要","cause":"原因","effect":"结果","item":"物品","from":"来源实体","to":"去向实体","foreshadowing":"伏笔","payoff":"回收","relation_change":"关系/状态变化","evidence":"原文短句","entities":["实体A"],"confidence":0.0}}]}}
 
 章节：第 {chapter.number} 章《{chapter.title}》
 候选实体：{"、".join(entities[:80])}
@@ -231,6 +289,20 @@ def _limited_chapters(chapters: list[Chapter], max_chapters: int) -> list[Chapte
     if max_chapters and max_chapters > 0:
         return chapters[:max_chapters]
     return chapters
+
+
+def _stride_chapters(chapters: list[Chapter], stride: int) -> list[Chapter]:
+    step = max(1, int(stride or 1))
+    if step <= 1 or len(chapters) <= 2:
+        return chapters
+    selected = chapters[::step]
+    if chapters[-1] not in selected:
+        selected.append(chapters[-1])
+    return selected
+
+
+def _batched_chapters(chapters: list[Chapter], batch_size: int) -> list[list[Chapter]]:
+    return [chapters[index : index + batch_size] for index in range(0, len(chapters), batch_size)]
 
 
 def _chapter_context(content: str, entities: list[str], max_chars: int) -> str:
@@ -257,6 +329,7 @@ def _looks_eventful(sentence: str) -> bool:
         "得到", "获得", "拿到", "失去", "夺走", "交出", "打开", "发现", "揭开", "真相",
         "决定", "选择", "拒绝", "承认", "相信", "背叛", "追杀", "对峙", "袭击", "帮助",
         "救", "同行", "合作", "意识到", "明白", "告诉",
+        "因为", "导致", "因此", "所以", "线索", "伏笔", "回收", "归还", "交给", "转交", "流转", "变化",
     )
     return any(keyword in sentence for keyword in keywords)
 
@@ -290,6 +363,7 @@ def _parse_event_item(
     if _float(item.get("confidence"), 0.0) < min_confidence:
         return None
     event_type = str(item.get("type", "事件")).strip()
+    event_type = _infer_event_type(event_type, item)
     if event_type not in EVENT_TYPES:
         event_type = "事件"
     entities: list[str] = []
@@ -297,14 +371,69 @@ def _parse_event_item(
         name = entity_lookup.get(str(raw).strip())
         if name and name not in entities:
             entities.append(name)
+    for raw in (
+        item.get("item"),
+        item.get("from"),
+        item.get("to"),
+        item.get("source"),
+        item.get("target"),
+    ):
+        name = entity_lookup.get(str(raw or "").strip())
+        if name and name not in entities:
+            entities.append(name)
     if not entities:
         return None
+    summary = _compose_event_summary(event_type, item)
     return (
         event_type,
-        str(item.get("summary", "")).strip(),
+        summary,
         str(item.get("evidence", "")).strip(),
         entities,
     )
+
+
+def _infer_event_type(event_type: str, item: dict) -> str:
+    if event_type in EVENT_TYPES:
+        return event_type
+    if item.get("foreshadowing") or item.get("payoff"):
+        return "伏笔/回收"
+    if item.get("item") or item.get("from") or item.get("to"):
+        return "道具流转"
+    if item.get("cause") or item.get("effect"):
+        return "因果链"
+    if item.get("relation_change"):
+        return "关系变化"
+    return event_type
+
+
+def _compose_event_summary(event_type: str, item: dict) -> str:
+    summary = str(item.get("summary", "")).strip()
+    cause = str(item.get("cause", "")).strip()
+    effect = str(item.get("effect", "")).strip()
+    item_name = str(item.get("item", "")).strip()
+    from_entity = str(item.get("from", "")).strip()
+    to_entity = str(item.get("to", "")).strip()
+    foreshadowing = str(item.get("foreshadowing", "")).strip()
+    payoff = str(item.get("payoff", "")).strip()
+    relation_change = str(item.get("relation_change", "")).strip()
+    parts: list[str] = []
+    if event_type == "因果链" and (cause or effect):
+        parts.append(f"因果：{cause or '未明'} -> {effect or '未明'}")
+    if event_type == "道具流转" and (item_name or from_entity or to_entity):
+        flow = item_name or "重要物品"
+        if from_entity or to_entity:
+            flow += f"：{from_entity or '未知'} -> {to_entity or '未知'}"
+        parts.append(f"流转：{flow}")
+    if event_type == "伏笔/回收" and (foreshadowing or payoff):
+        if foreshadowing and payoff:
+            parts.append(f"伏笔回收：{foreshadowing} -> {payoff}")
+        else:
+            parts.append(f"伏笔：{foreshadowing or payoff}")
+    if event_type == "关系变化" and relation_change:
+        parts.append(f"关系变化：{relation_change}")
+    if summary:
+        parts.insert(0, summary)
+    return "；".join(parts)
 
 
 def _safe_evidence(content: str, evidence: str, entities: list[str], max_chars: int) -> str:

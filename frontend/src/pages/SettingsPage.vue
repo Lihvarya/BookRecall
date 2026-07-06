@@ -36,16 +36,62 @@ function onToolSelect(event: Event) {
       <section class="control-card">
         <h2>Agent 策略</h2>
         <select v-model="state.form.policy" class="field">
-          <option value="auto">Auto：规则优先，云端开启时 ReAct</option>
+          <option value="auto">Auto：本地 Qwen 可用时 Planner，否则规则/云端回退</option>
           <option value="rule_based">RuleBased：本地确定性 ReAct</option>
+          <option value="local_planner">Local Planner：本地 Qwen 规划工具</option>
           <option value="llm_react">LLM ReAct：云端模型规划</option>
           <option value="langgraph">LangGraph：图编排策略</option>
         </select>
         <select v-model="state.form.retriever" class="field mt-3">
           <option value="lexical">Lexical：倒排检索</option>
-          <option value="embedding">Embedding：语义召回</option>
-          <option value="auto">Auto：有向量库即优先</option>
+          <option value="embedding">Embedding：Qwen 向量召回 + Qwen 重排</option>
+          <option value="auto">Auto：优先 Qwen embedding，缺索引时 lexical + Qwen 重排</option>
         </select>
+        <p class="mt-2 text-xs leading-6 text-muted">
+          本地 Qwen 的 endpoint、模型名和 GGUF 路径在下方“本地 Qwen 模型”卡片配置；Auto 策略会在本地模型可用时优先使用 Local Planner。
+        </p>
+      </section>
+
+      <section class="control-card local-model-card wide-card">
+        <div class="local-model-head">
+          <div>
+            <span class="eyebrow">Local Reasoner</span>
+            <h2>本地 Qwen 模型</h2>
+            <p>这里控制问答期的 Local Planner 和按需结构化索引；推荐优先接 LM Studio。</p>
+          </div>
+          <label class="switch-line">
+            <input v-model="state.form.localQwenEnabled" type="checkbox" />
+            <span>启用</span>
+          </label>
+        </div>
+        <div class="form-grid mt-4">
+          <label>
+            LM Studio / llama.cpp endpoint
+            <input
+              v-model="state.form.smartIndexEndpoint"
+              class="field"
+              placeholder="推荐：http://127.0.0.1:1234"
+            />
+          </label>
+          <label>
+            本地服务模型名
+            <input v-model="state.form.localQwenModelName" class="field" placeholder="例如 qwen3.5-4b" />
+          </label>
+          <label class="md:col-span-2">
+            GGUF 模型路径（不填 endpoint 时才直接加载）
+            <input
+              v-model="state.form.smartIndexModelPath"
+              class="field"
+              placeholder="例如 D:\BookRecall\models\llm\qwen3-4b-instruct-2507-q4_k_m.gguf"
+            />
+          </label>
+        </div>
+        <div class="local-model-tips">
+          <span>Endpoint 优先：填了 endpoint 就调用本地服务，不会在 BookRecall 进程里直接加载 GGUF。</span>
+          <span>导入期智能索引由“书库”页的 Qwen 智能索引开关控制；问答期默认走这里的本地 Qwen。</span>
+          <span>如果使用 LM Studio，请保持服务已启动，并确认模型名与 LM Studio 中加载的模型 ID 一致。</span>
+        </div>
+        <button class="secondary-button mt-4" type="button" @click="store.saveLocalPreferences()">保存本地模型配置</button>
       </section>
 
       <section class="control-card">

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from ..state import AgentState
 from ..tools import ToolRegistry
 from .base import Decision, DecisionPolicy, ToolCall
@@ -24,7 +26,7 @@ def classify_intent(
         return "event_chain"
     if matched_entities and any(keyword in question for keyword in ("第一次", "首次", "最早", "初次")):
         return "first_appearance"
-    if matched_entities and any(keyword in question for keyword in ("还有出现", "后来", "再次", "轨迹", "出现过吗")):
+    if matched_entities and any(keyword in question for keyword in ("还有出现", "后来", "后面", "后续", "再次", "轨迹", "出现过吗")):
         return "entity_timeline"
     if any(keyword in question for keyword in ("变化", "对比", "前后")):
         return "compare"
@@ -68,11 +70,18 @@ class RuleBasedPolicy(DecisionPolicy):
 
     def next_action(self, state: AgentState, registry: ToolRegistry) -> Decision:
         if state.step == 0:
+            understood_intent = str((state.query_understanding or {}).get("intent") or "")
+            if understood_intent and understood_intent != "semantic_search":
+                state.intent = understood_intent
             if not state.matched_entities and not state.matched_themes:
-                state.intent = classify_intent(state.question, [], [])
+                if state.intent not in {"event_chain", "compare", "causal"}:
+                    state.intent = classify_intent(state.question, [], [])
+                    return self._call("search_evidence", {"query": state.question}, thought="无实体命中，直接语义检索")
+                # event/compare/causal can still be useful without a resolved entity.
+            if not state.matched_entities and not state.matched_themes and state.intent == "semantic_search":
                 return self._call("search_evidence", {"query": state.question}, thought="无实体命中，直接语义检索")
             if not state.matched_entities and state.matched_themes:
-                state.intent = classify_intent(state.question, [], state.matched_themes)
+                state.intent = understood_intent or classify_intent(state.question, [], state.matched_themes)
             if state.matched_entities and "lookup_entity_aliases" not in state.called_tools:
                 return self._call(
                     "lookup_entity_aliases",
@@ -368,6 +377,9 @@ class RuleBasedPolicy(DecisionPolicy):
                 summary="可以换一个更具体的实体或章节线索继续问。",
                 suggestions=["把问题改成更明确的实体或章节线索。", "补充实体词表后重新 build。"],
             )
+        structured = _structured_list_answer(state, intent)
+        if structured is not None:
+            return structured
         if self.reasoner and self.reasoner.enabled and not state.answer:
             ans = self.reasoner.answer(_semantic_prompt(state, intent))
             if ans:
@@ -401,6 +413,53 @@ def _semantic_prompt(state: AgentState, intent: str) -> str:
 
 def _semantic_suggestions(question: str) -> list[str]:
     return [f"换个问法继续问：{question}", "把问题指向具体实体，会更容易得到精准回忆。"]
+
+
+def _structured_list_answer(state: AgentState, intent: str) -> Decision | None:
+    if not _wants_structured_list(state.question):
+        return None
+    best: tuple[dict, list[str]] | None = None
+    for hit in state.raw_hits[:4]:
+        text = str(hit.get("parent_text") or hit.get("child_text") or "")
+        items = _extract_numbered_items(text)
+        if len(items) < 2:
+            continue
+        if best is None or len(items) > len(best[1]):
+            best = (hit, items)
+    if best is None:
+        return None
+    hit, items = best
+    chapter_number = int(hit.get("chapter_number", 0) or 0)
+    chapter_title = str(hit.get("chapter_title") or f"第 {chapter_number} 章")
+    lines = "\n".join(f"{index}. {item}" for index, item in enumerate(items[:6], start=1))
+    return Decision(
+        is_terminal=True,
+        intent_override=intent,
+        answer=f"根据第 {chapter_number} 章《{chapter_title}》，可以定位到这些条件：\n{lines}",
+        summary=f"从同一证据段中抽取到 {len(items)} 条枚举条件。",
+        suggestions=_semantic_suggestions(state.question),
+    )
+
+
+def _wants_structured_list(question: str) -> bool:
+    return any(keyword in question for keyword in ("条件", "标准", "要求", "步骤", "有哪些", "是什么"))
+
+
+def _extract_numbered_items(text: str) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"[“\"']?(第[一二三四五六七八九十]+)[，,、：:]\s*([^”\"'\n]+)")
+    for match in pattern.finditer(text):
+        body = match.group(2).strip()
+        body = re.split(r"[。！？!?][”\"']?", body, maxsplit=1)[0].strip()
+        body = body.strip(" “”\"'。；;，,")
+        if not body:
+            continue
+        item = f"{match.group(1)}，{body}。"
+        if item not in seen:
+            items.append(item)
+            seen.add(item)
+    return items
 
 
 def _entity_followups(entity_name: str) -> list[str]:

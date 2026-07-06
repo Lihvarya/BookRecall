@@ -7,9 +7,9 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
-from .config import DEFAULT_EMBEDDING_SETTINGS, SearchSettings
+from .config import DEFAULT_EMBEDDING_SETTINGS, DEFAULT_RERANK_SETTINGS, SearchSettings
 from .models import SearchHit
 from .storage import BookRecallStore
 
@@ -44,6 +44,7 @@ def dependency_report() -> dict[str, object]:
         "langgraph": importlib.util.find_spec("langgraph.graph") is not None,
         "llama_cpp": importlib.util.find_spec("llama_cpp") is not None,
         "recommended_embedding_model": DEFAULT_EMBEDDING_SETTINGS.model_name,
+        "recommended_reranker_model": DEFAULT_RERANK_SETTINGS.model_name,
         "recommended_index_llm": "Qwen3-4B-Instruct-2507 4bit GGUF",
     }
 
@@ -64,24 +65,61 @@ def default_sentence_transformers_cache_dir(db_path: str | Path) -> Path:
     return default_cache_root(db_path) / "huggingface" / "sentence-transformers"
 
 
+def default_local_models_dir() -> Path:
+    return Path(os.getenv("BOOKRECALL_MODEL_DIR") or Path(__file__).resolve().parents[2] / "models")
+
+
+def resolve_local_model_path(model_name: str) -> str:
+    """Prefer explicitly downloaded HF model folders under BookRecall/models."""
+    normalized = str(model_name or "").strip()
+    if not normalized:
+        return normalized
+
+    direct_path = Path(normalized)
+    if direct_path.exists():
+        return str(direct_path)
+
+    local_names = {
+        "Qwen/Qwen3-Embedding-0.6B": "Qwen3-Embedding-0.6B",
+        "Qwen/Qwen3-Reranker-0.6B": "Qwen3-Reranker-0.6B",
+    }
+    local_name = local_names.get(normalized)
+    if local_name is None:
+        return normalized
+
+    candidate = default_local_models_dir() / local_name
+    if _looks_like_hf_model_dir(candidate):
+        return str(candidate)
+    return normalized
+
+
+def _looks_like_hf_model_dir(path: Path) -> bool:
+    return path.exists() and path.is_dir() and (path / "config.json").exists()
+
+
 def configure_local_model_cache(cache_root: str | Path) -> dict[str, str]:
     root = Path(cache_root)
     hf_home = root / "huggingface"
     st_home = hf_home / "sentence-transformers"
     torch_home = root / "torch"
+    models_dir = root.parent / "models"
 
     st_home.mkdir(parents=True, exist_ok=True)
     torch_home.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
 
     os.environ.setdefault("HF_HOME", str(hf_home))
     os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(st_home))
     os.environ.setdefault("TORCH_HOME", str(torch_home))
+    os.environ.setdefault("BOOKRECALL_MODEL_DIR", str(models_dir))
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
     return {
         "HF_HOME": os.environ["HF_HOME"],
         "SENTENCE_TRANSFORMERS_HOME": os.environ["SENTENCE_TRANSFORMERS_HOME"],
         "TORCH_HOME": os.environ["TORCH_HOME"],
+        "BOOKRECALL_MODEL_DIR": os.environ["BOOKRECALL_MODEL_DIR"],
     }
 
 
@@ -138,12 +176,12 @@ class SentenceTransformerEmbedder:
             )
         from sentence_transformers import SentenceTransformer
 
-        self.model_name = model_name
+        self.model_name = resolve_local_model_path(model_name)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._model = SentenceTransformer(
-            model_name,
+            self.model_name,
             cache_folder=str(self.cache_dir) if self.cache_dir is not None else None,
         )
 
@@ -155,6 +193,99 @@ class SentenceTransformerEmbedder:
             show_progress_bar=False,
         )
         return vectors.tolist()
+
+
+class CrossEncoderReranker:
+    def __init__(
+        self,
+        model_name: str = DEFAULT_RERANK_SETTINGS.model_name,
+        *,
+        cache_dir: str | Path | None = None,
+        batch_size: int = DEFAULT_RERANK_SETTINGS.batch_size,
+    ) -> None:
+        if importlib.util.find_spec("sentence_transformers") is None:
+            raise LocalModelError(
+                "缺少 sentence-transformers，无法加载本地 reranker 模型。"
+                "请先按项目文档安装可选依赖后再启用重排。"
+            )
+        from sentence_transformers import CrossEncoder
+
+        self.model_name = resolve_local_model_path(model_name)
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.batch_size = batch_size
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._model = CrossEncoder(
+                self.model_name,
+                cache_folder=str(self.cache_dir) if self.cache_dir is not None else None,
+                trust_remote_code=True,
+            )
+        except TypeError:
+            self._model = CrossEncoder(
+                self.model_name,
+                cache_folder=str(self.cache_dir) if self.cache_dir is not None else None,
+            )
+
+    def score(self, query: str, documents: list[str]) -> list[float]:
+        if not documents:
+            return []
+        pairs = [(query, _clip_rerank_text(document)) for document in documents]
+        scores = self._model.predict(pairs, batch_size=self.batch_size)
+        return [_score_to_float(item) for item in scores]
+
+
+class RerankingRetriever:
+    def __init__(
+        self,
+        base,
+        reranker: CrossEncoderReranker,
+        settings: SearchSettings,
+    ) -> None:
+        self.base = base
+        self.reranker = reranker
+        self.settings = settings
+
+    def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+        candidates = self.base.search(book_id, query, max_chapter=max_chapter)
+        if len(candidates) <= 1:
+            return candidates[: self.settings.top_k_parents]
+        documents = [hit.parent_text or hit.child_text for hit in candidates]
+        scores = self.reranker.score(query, documents)
+        reranked: list[SearchHit] = []
+        for hit, score in zip(candidates, scores):
+            reranked.append(
+                SearchHit(
+                    score=float(score),
+                    chapter_number=hit.chapter_number,
+                    chapter_title=hit.chapter_title,
+                    parent_id=hit.parent_id,
+                    child_text=hit.child_text,
+                    parent_text=hit.parent_text,
+                )
+            )
+        reranked.sort(key=lambda item: (-item.score, item.chapter_number))
+        return reranked[: self.settings.top_k_parents]
+
+
+def _clip_rerank_text(text: str, limit: int = 1400) -> str:
+    normalized = str(text or "").strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit]
+
+
+def _score_to_float(value: object) -> float:
+    try:
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return 0.0
+            return float(max(value))
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _require_numpy():
@@ -192,6 +323,7 @@ def build_embedding_index(
     limit_chunks: int | None = None,
     prefer_backend: str = "auto",
     faiss_module: Any | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> VectorIndexInfo:
     np = _require_numpy()
     rows = store.iter_search_rows(book_id, max_chapter=None)
@@ -204,9 +336,12 @@ def build_embedding_index(
     texts = [str(row["text"]) for row in rows]
 
     vectors: list[list[float]] = []
+    total = len(texts)
     for start in range(0, len(texts), batch_size):
         batch = texts[start : start + batch_size]
         vectors.extend(embedder.encode(batch, batch_size=batch_size))
+        if progress_callback is not None:
+            progress_callback(min(start + len(batch), total), total)
     matrix = _normalize_rows(vectors)
 
     backend = _resolve_backend(prefer_backend, faiss_module)

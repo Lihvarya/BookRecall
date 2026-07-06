@@ -1,12 +1,10 @@
 import type { Component } from "vue";
 import ChatPage from "@/pages/ChatPage.vue";
-import ImportPage from "@/pages/ImportPage.vue";
 import IndexPage from "@/pages/IndexPage.vue";
 import LibraryPage from "@/pages/LibraryPage.vue";
-import ModelPage from "@/pages/ModelPage.vue";
 import SettingsPage from "@/pages/SettingsPage.vue";
 
-export type RouteId = "chat" | "library" | "index" | "import" | "model" | "settings";
+export type RouteId = "chat" | "library" | "index" | "settings";
 
 export interface AppRoute {
   id: RouteId;
@@ -41,9 +39,9 @@ export const appRoutes: AppRoute[] = [
     component: LibraryPage,
     showHeader: true,
     meta: {
-      eyebrow: "Library",
-      heading: "书库",
-      summary: "管理书籍、分组和标签，选择当前阅读对象。"
+      eyebrow: "Library Lab",
+      heading: "书库工作台",
+      summary: "集中管理书籍、导入重建、向量索引和召回测试。"
     }
   },
   {
@@ -56,30 +54,6 @@ export const appRoutes: AppRoute[] = [
       eyebrow: "Knowledge Index",
       heading: "索引与原文",
       summary: "查看实体、主题、事件、关系和章节证据。"
-    }
-  },
-  {
-    id: "import",
-    icon: "入",
-    title: "导入",
-    component: ImportPage,
-    showHeader: true,
-    meta: {
-      eyebrow: "Import",
-      heading: "导入与重建",
-      summary: "导入本地 TXT，构建或重建结构化索引。"
-    }
-  },
-  {
-    id: "model",
-    icon: "模",
-    title: "模型",
-    component: ModelPage,
-    showHeader: true,
-    meta: {
-      eyebrow: "Retrieval Lab",
-      heading: "模型与召回",
-      summary: "构建向量索引，测试 lexical / embedding / auto 召回效果。"
     }
   },
   {
@@ -99,6 +73,7 @@ export const appRoutes: AppRoute[] = [
 export const defaultRouteId: RouteId = "chat";
 
 export function normalizeRouteId(raw: string): RouteId {
-  const routeId = raw.replace(/^#\/?/, "") as RouteId;
+  const normalized = raw.replace(/^#\/?/, "");
+  const routeId = (normalized === "import" || normalized === "model" ? "library" : normalized) as RouteId;
   return appRoutes.some((route) => route.id === routeId) ? routeId : defaultRouteId;
 }

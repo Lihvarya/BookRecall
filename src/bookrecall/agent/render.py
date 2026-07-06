@@ -51,6 +51,8 @@ def to_payload(card: MemoryCard) -> dict[str, object]:
         ],
         "suggestions": card.suggestions,
         "user_preferences": card.user_preferences,
+        "query_understanding": card.query_understanding,
+        "answer_validation": card.answer_validation,
     }
 
 

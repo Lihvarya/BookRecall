@@ -18,6 +18,22 @@ def _tokenize(text: str) -> set[str]:
     return {token for token in tokens if token.strip()}
 
 
+def _is_single_cjk(token: str) -> bool:
+    return len(token) == 1 and "一" <= token <= "鿿"
+
+
+def _candidate_tokens(tokens: set[str]) -> set[str]:
+    """Use precise tokens for candidate lookup, then score with the full token set.
+
+    Chinese questions often contain generic single characters such as “是/什/么”.
+    Requiring every token to match makes recall brittle, while using every single
+    character as an OR candidate makes the candidate pool noisy.  Bigrams keep
+    the lookup broad enough without drowning the scorer in unrelated rows.
+    """
+    longer = {token for token in tokens if not _is_single_cjk(token)}
+    return longer or tokens
+
+
 def lexical_score(query: str, document: str) -> float:
     query_tokens = _tokenize(query)
     doc_tokens = _tokenize(document)
@@ -89,16 +105,16 @@ class LocalRetriever:
         query_tokens = _tokenize(query)
         inverted = self._index[book_id]
 
-        candidate_ids: set[str] | None = None
-        for token in query_tokens:
+        candidate_ids: set[str] = set()
+        for token in _candidate_tokens(query_tokens):
             posting = inverted.get(token)
             if not posting:
                 continue
-            candidate_ids = posting if candidate_ids is None else candidate_ids & posting
+            candidate_ids.update(posting)
 
         # 无任何 token 命中（query 全是文档里没有的字）→ 退回全库扫描兜底，
         # 与旧行为一致，避免漏掉 phrase_bonus 这类不依赖 token 命中的得分。
-        use_all = candidate_ids is None
+        use_all = not candidate_ids
         if use_all:
             candidate_ids = {row[0] for row in rows}
 

@@ -10,11 +10,12 @@ defineProps<{
   title: string;
   items: KnowledgeListItem[];
   emptyText?: string;
+  compact?: boolean;
 }>();
 </script>
 
 <template>
-  <section class="control-card">
+  <section class="control-card knowledge-list-card" :class="{ 'knowledge-list-compact': compact }">
     <div class="knowledge-list-head">
       <h2>{{ title }}</h2>
       <span class="pill">{{ items.length }} 条</span>

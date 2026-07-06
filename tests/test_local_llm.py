@@ -119,6 +119,21 @@ class LocalLLMClientTest(unittest.TestCase):
 
         self.assertEqual(payload["entities"][0]["name"], "方源")
 
+    def test_extract_json_recovers_chapter_summary_when_one_array_is_malformed(self) -> None:
+        payload = extract_json_object(
+            '{"summary":"木婉清误认刀白风为仇人。",'
+            '"key_entities":["段正淳","木婉清","段誉"],'
+            '"key_events":["木婉清射毒箭伤刀白风与段誉"],'
+            '"foreshadowing":[["段正淳对木婉清身世隐瞒的深层原因"],'
+            '"state_changes":["木婉清从敌视转为震惊与悲伤"],'
+            '"confidence":0.95}'
+        )
+
+        self.assertEqual(payload["summary"], "木婉清误认刀白风为仇人。")
+        self.assertEqual(payload["key_entities"], ["段正淳", "木婉清", "段誉"])
+        self.assertEqual(payload["state_changes"], ["木婉清从敌视转为震惊与悲伤"])
+        self.assertEqual(payload["confidence"], 0.95)
+
 
 if __name__ == "__main__":
     unittest.main()

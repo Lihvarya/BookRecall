@@ -30,18 +30,35 @@ $FrontendDir = Join-Path $Root "frontend"
 $FrontendDist = Join-Path $FrontendDir "dist\index.html"
 $NodeModules = Join-Path $FrontendDir "node_modules"
 
-# Keep Hugging Face and sentence-transformers caches inside the project when possible.
-$ProjectCache = Join-Path $Root ".bookrecall\model_cache"
+# Keep model files and Hugging Face caches inside the project when possible.
+$ProjectCache = Join-Path $Root ".cache"
+$HuggingFaceCache = Join-Path $ProjectCache "huggingface"
+$SentenceTransformersCache = Join-Path $HuggingFaceCache "sentence-transformers"
+$TorchCache = Join-Path $ProjectCache "torch"
+$LocalModelDir = Join-Path $Root "models"
 if (-not $env:HF_HOME) {
-    $env:HF_HOME = $ProjectCache
+    $env:HF_HOME = $HuggingFaceCache
 }
 if (-not $env:SENTENCE_TRANSFORMERS_HOME) {
-    $env:SENTENCE_TRANSFORMERS_HOME = $ProjectCache
+    $env:SENTENCE_TRANSFORMERS_HOME = $SentenceTransformersCache
+}
+if (-not $env:TORCH_HOME) {
+    $env:TORCH_HOME = $TorchCache
+}
+if (-not $env:BOOKRECALL_MODEL_DIR) {
+    $env:BOOKRECALL_MODEL_DIR = $LocalModelDir
+}
+if (-not $env:HF_HUB_DISABLE_SYMLINKS_WARNING) {
+    $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
+}
+if (-not $env:HF_HUB_DISABLE_XET) {
+    $env:HF_HUB_DISABLE_XET = "1"
 }
 
 Write-Step "Project root: $Root"
 Write-Step "Python: $Python"
-Write-Step "Model cache: $ProjectCache"
+Write-Step "Local models: $LocalModelDir"
+Write-Step "Model cache: $SentenceTransformersCache"
 
 $ShouldBuildFrontend = $false
 if ($BuildFrontend) {

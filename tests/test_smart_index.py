@@ -45,6 +45,79 @@ class FakeSmartClient:
         }
 
 
+class CountingSmartClient(FakeSmartClient):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete_json(self, prompt: str) -> dict:
+        self.calls += 1
+        return super().complete_json(prompt)
+
+
+class FailingSmartClient:
+    def complete_json(self, prompt: str) -> dict:
+        raise ValueError("响应中的 JSON object 解析失败。")
+
+
+class CountingRelationClient(FakeSmartClient):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete_json(self, prompt: str) -> dict:
+        self.calls += 1
+        return {"relations": [], "events": []}
+
+
+class NarrativeSmartClient:
+    def complete_json(self, prompt: str) -> dict:
+        return {
+            "relations": [
+                {
+                    "source": "林澈",
+                    "target": "黑衣人",
+                    "type": "关系变化",
+                    "evidence": "黑衣人把星辰之匙交给林澈，林澈意识到黑衣人并非敌人。",
+                    "confidence": 0.9,
+                }
+            ],
+            "events": [
+                {
+                    "type": "道具流转",
+                    "summary": "星辰之匙转交给林澈",
+                    "item": "星辰之匙",
+                    "from": "黑衣人",
+                    "to": "林澈",
+                    "evidence": "黑衣人把星辰之匙交给林澈",
+                    "entities": ["星辰之匙", "黑衣人", "林澈"],
+                    "confidence": 0.9,
+                },
+                {
+                    "type": "因果链",
+                    "cause": "林澈发现星辰之匙的刻痕",
+                    "effect": "他决定打开石门",
+                    "evidence": "因为星辰之匙的刻痕与石门吻合，林澈决定打开石门。",
+                    "entities": ["林澈", "星辰之匙"],
+                    "confidence": 0.9,
+                },
+                {
+                    "type": "伏笔/回收",
+                    "foreshadowing": "旧书提到星辰之匙能开门",
+                    "payoff": "星辰之匙打开石门",
+                    "evidence": "旧书里的线索终于回收，星辰之匙打开石门。",
+                    "entities": ["星辰之匙"],
+                    "confidence": 0.9,
+                },
+                {
+                    "type": "关系变化",
+                    "relation_change": "林澈意识到黑衣人并非敌人",
+                    "evidence": "林澈意识到黑衣人并非敌人。",
+                    "entities": ["林澈", "黑衣人"],
+                    "confidence": 0.9,
+                },
+            ],
+        }
+
+
 class SmartIndexTest(unittest.TestCase):
     def test_llm_entity_reviewer_filters_function_words(self) -> None:
         chapters = parse_chapters("第1章 阴影\n\n黑衣人在雨里出现，林澈与黑衣人对峙。")
@@ -54,6 +127,25 @@ class SmartIndexTest(unittest.TestCase):
         self.assertIn("林澈", entities)
         self.assertIn("黑衣人", entities)
         self.assertNotIn("就是", entities)
+
+    def test_llm_entity_reviewer_can_batch_chapters(self) -> None:
+        chapters = parse_chapters(
+            "第1章 阴影\n\n黑衣人在雨里出现。\n\n"
+            "第2章 星钥\n\n林澈听见星辰之匙的名字。\n\n"
+            "第3章 回声\n\n黑衣人再次出现。"
+        )
+        client = CountingSmartClient()
+
+        discover_entities_with_llm(chapters, client, batch_chapters=2)
+
+        self.assertEqual(client.calls, 2)
+
+    def test_llm_entity_reviewer_keeps_seed_entities_when_model_batch_fails(self) -> None:
+        chapters = parse_chapters("第1章 阴影\n\n黑衣人在雨里出现。")
+
+        entities = discover_entities_with_llm(chapters, FailingSmartClient(), seed_entities={"黑衣人": []})
+
+        self.assertEqual(entities, {"黑衣人": []})
 
     def test_build_smart_relation_event_records(self) -> None:
         chapters = parse_chapters("第1章 阴影\n\n黑衣人在雨里出现，林澈与黑衣人对峙。")
@@ -74,6 +166,65 @@ class SmartIndexTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_type, "冲突/危机")
         self.assertIn("林澈", events[0].entities)
+
+    def test_build_smart_relation_event_records_skips_failed_chapter(self) -> None:
+        chapters = parse_chapters("第1章 阴影\n\n黑衣人在雨里出现，林澈与黑衣人对峙。")
+        entity_records = build_entity_records(chapters, {"林澈": [], "黑衣人": []}, DEFAULT_CHUNK_SETTINGS)
+
+        relations, events = build_smart_relation_event_records(
+            chapters,
+            entity_records,
+            DEFAULT_CHUNK_SETTINGS,
+            FailingSmartClient(),
+        )
+
+        self.assertEqual(relations, [])
+        self.assertEqual(events, [])
+
+    def test_build_smart_relation_event_records_can_stride_chapters_for_fast_indexing(self) -> None:
+        chapters = parse_chapters(
+            "第1章 一\n\n黑衣人在雨里出现，林澈与黑衣人对峙。\n\n"
+            "第2章 二\n\n黑衣人在雨里出现，林澈与黑衣人对峙。\n\n"
+            "第3章 三\n\n黑衣人在雨里出现，林澈与黑衣人对峙."
+        )
+        entity_records = build_entity_records(chapters, {"林澈": [], "黑衣人": []}, DEFAULT_CHUNK_SETTINGS)
+        client = CountingRelationClient()
+
+        build_smart_relation_event_records(
+            chapters,
+            entity_records,
+            DEFAULT_CHUNK_SETTINGS,
+            client,
+            chapter_stride=2,
+        )
+
+        self.assertEqual(client.calls, 2)
+
+    def test_build_smart_relation_event_records_extracts_narrative_chains(self) -> None:
+        chapters = parse_chapters(
+            "第1章 石门\n\n"
+            "黑衣人把星辰之匙交给林澈。因为星辰之匙的刻痕与石门吻合，林澈决定打开石门。"
+            "旧书里的线索终于回收，星辰之匙打开石门。林澈意识到黑衣人并非敌人。"
+        )
+        entity_records = build_entity_records(chapters, {"林澈": [], "黑衣人": [], "星辰之匙": []}, DEFAULT_CHUNK_SETTINGS)
+
+        relations, events = build_smart_relation_event_records(
+            chapters,
+            entity_records,
+            DEFAULT_CHUNK_SETTINGS,
+            NarrativeSmartClient(),
+        )
+
+        self.assertEqual(relations[0].relation_type, "关系变化")
+        event_types = {event.event_type for event in events}
+        self.assertIn("道具流转", event_types)
+        self.assertIn("因果链", event_types)
+        self.assertIn("伏笔/回收", event_types)
+        self.assertIn("关系变化", event_types)
+        summaries = " ".join(event.summary for event in events)
+        self.assertIn("流转：星辰之匙：黑衣人 -> 林澈", summaries)
+        self.assertIn("因果：林澈发现星辰之匙的刻痕 -> 他决定打开石门", summaries)
+        self.assertIn("伏笔回收：旧书提到星辰之匙能开门 -> 星辰之匙打开石门", summaries)
 
     def test_rule_relation_fallback_uses_sentence_window_not_whole_chapter(self) -> None:
         chapters = parse_chapters(

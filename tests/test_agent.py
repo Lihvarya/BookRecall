@@ -12,7 +12,7 @@ from bookrecall.agent import BookRecallAgent
 from bookrecall.chunking import build_chunk_hierarchy
 from bookrecall.config import DEFAULT_CHUNK_SETTINGS
 from bookrecall.entity_index import build_entity_records
-from bookrecall.models import MemoryCard
+from bookrecall.models import MemoryCard, SearchHit
 from bookrecall.parser import parse_chapters
 from bookrecall.storage import BookRecallStore
 
@@ -126,6 +126,221 @@ class BookRecallAgentTest(unittest.TestCase):
         self.assertIn("第 3 章", second.answer)
         self.assertEqual(len(turns), 2)
         self.assertEqual(turns[-1]["entity_name"], "黑衣人")
+
+    def test_local_query_understanding_can_override_rule_intent(self) -> None:
+        class FakeQueryClient:
+            def complete_json(self, prompt: str) -> dict:
+                return {
+                    "intent": "entity_timeline",
+                    "entities": ["黑衣人"],
+                    "themes": [],
+                    "time_range": {"start_chapter": None, "end_chapter": None, "relative": "after"},
+                    "spoiler_sensitive": True,
+                    "tools": ["lookup_entity_aliases", "lookup_timeline"],
+                    "confidence": 0.9,
+                }
+
+        agent = BookRecallAgent(self.store, query_understanding_client=FakeQueryClient())
+
+        card = agent.ask_card(
+            book_id="sample",
+            question="黑衣人呢？",
+            progress_chapter=3,
+        )
+
+        self.assertEqual(card.query_understanding["source"], "local_llm")
+        self.assertEqual(card.query_understanding["intent"], "entity_timeline")
+        self.assertEqual(card.entity_name, "黑衣人")
+        self.assertIn("第 2 章", card.answer)
+        self.assertIn("第 3 章", card.answer)
+
+    def test_local_rerank_reorders_search_evidence(self) -> None:
+        class FakeRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                return [
+                    SearchHit(
+                        score=2.0,
+                        chapter_number=1,
+                        chapter_title="起点",
+                        parent_id="p1",
+                        child_text="旧书安静地放在桌上。",
+                        parent_text="旧书安静地放在桌上。",
+                    ),
+                    SearchHit(
+                        score=0.4,
+                        chapter_number=3,
+                        chapter_title="回声",
+                        parent_id="p3",
+                        child_text="黑衣人再次提到【星辰之匙】。",
+                        parent_text="黑衣人再次提到【星辰之匙】。",
+                    ),
+                ]
+
+        class FakeLocalClient:
+            def complete_json(self, prompt: str) -> dict:
+                if "证据重排器" in prompt:
+                    return {"ranked_hits": [{"index": 2, "relevance": 0.97, "reason": "直接命中星辰之匙"}]}
+                return {
+                    "intent": "semantic_search",
+                    "entities": [],
+                    "themes": [],
+                    "time_range": {"start_chapter": None, "end_chapter": None, "relative": ""},
+                    "spoiler_sensitive": True,
+                    "tools": ["search_evidence"],
+                    "confidence": 0.7,
+                }
+
+        agent = BookRecallAgent(
+            self.store,
+            retriever=FakeRetriever(),
+            query_understanding_client=FakeLocalClient(),
+        )
+
+        card = agent.ask_card(
+            book_id="sample",
+            question="那把钥匙有什么线索？",
+            progress_chapter=3,
+        )
+
+        self.assertEqual(card.evidence[0].chapter_number, 3)
+        self.assertIn("星辰之匙", card.evidence[0].excerpt)
+
+    def test_local_answer_validation_adds_guardrail_note(self) -> None:
+        class FakeLocalClient:
+            def complete_json(self, prompt: str) -> dict:
+                if "答案校验器" in prompt:
+                    return {
+                        "supported": False,
+                        "spoiler_safe": True,
+                        "speculation_risk": "high",
+                        "issues": ["答案超过证据能证明的范围"],
+                        "suggested_note": "这条回答的证据支撑偏弱，请以下方原文为准。",
+                        "confidence": 0.9,
+                    }
+                return {
+                    "intent": "first_appearance",
+                    "entities": ["星辰之匙"],
+                    "themes": [],
+                    "time_range": {"start_chapter": None, "end_chapter": None, "relative": "before"},
+                    "spoiler_sensitive": True,
+                    "tools": ["lookup_entity_aliases", "lookup_first_appearance"],
+                    "confidence": 0.8,
+                }
+
+        agent = BookRecallAgent(self.store, query_understanding_client=FakeLocalClient())
+
+        card = agent.ask_card(
+            book_id="sample",
+            question="星辰之匙第一次出现在哪一章？",
+            progress_chapter=3,
+        )
+
+        self.assertFalse(card.answer_validation["supported"])
+        self.assertEqual(card.answer_validation["speculation_risk"], "high")
+        self.assertIn("证据支撑偏弱", card.suggestions[-1])
+
+    def test_two_phase_dynamic_index_writes_back_retrieved_events(self) -> None:
+        class FakeRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                return [
+                    SearchHit(
+                        score=1.0,
+                        chapter_number=3,
+                        chapter_title="回声",
+                        parent_id="p3",
+                        child_text="李四被王五刺中后倒在雨里，林澈目睹了这一切。",
+                        parent_text="李四被王五刺中后倒在雨里，林澈目睹了这一切。",
+                    )
+                ]
+
+        class FakeLocalClient:
+            def complete_json(self, prompt: str) -> dict:
+                if "按需结构化索引器" in prompt:
+                    return {
+                        "entities": [
+                            {"name": "李四", "aliases": [], "evidence": "李四被王五刺中后倒在雨里", "confidence": 0.9},
+                            {"name": "王五", "aliases": [], "evidence": "李四被王五刺中后倒在雨里", "confidence": 0.9},
+                        ],
+                        "relations": [
+                            {
+                                "source": "王五",
+                                "target": "李四",
+                                "type": "冲突",
+                                "evidence": "李四被王五刺中后倒在雨里",
+                                "confidence": 0.9,
+                            }
+                        ],
+                        "events": [
+                            {
+                                "type": "冲突/危机",
+                                "summary": "王五刺伤李四",
+                                "evidence": "李四被王五刺中后倒在雨里",
+                                "entities": ["王五", "李四"],
+                                "confidence": 0.9,
+                            }
+                        ],
+                    }
+                if "答案校验器" in prompt:
+                    return {
+                        "supported": True,
+                        "spoiler_safe": True,
+                        "speculation_risk": "low",
+                        "issues": [],
+                        "suggested_note": "",
+                        "confidence": 0.9,
+                    }
+                return {
+                    "intent": "semantic_search",
+                    "entities": ["李四"],
+                    "themes": [],
+                    "time_range": {"start_chapter": None, "end_chapter": None, "relative": ""},
+                    "spoiler_sensitive": True,
+                    "tools": ["search_evidence"],
+                    "confidence": 0.9,
+                }
+
+        agent = BookRecallAgent(
+            self.store,
+            retriever=FakeRetriever(),
+            query_understanding_client=FakeLocalClient(),
+        )
+
+        agent.ask_card(book_id="sample", question="李四是怎么死的？", progress_chapter=3)
+        events = self.store.search_events("sample", query_text="王五刺伤李四", entity_name="李四", max_chapter=3)
+        relations = self.store.get_relation_mentions("sample", "王五", "李四", max_chapter=3)
+
+        self.assertIn("李四", self.store.list_entities("sample"))
+        self.assertTrue(events)
+        self.assertTrue(relations)
+
+    def test_structured_condition_answer_uses_parent_text(self) -> None:
+        class FakeRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                parent = (
+                    "陆畏因道：“要成就尊者，须得满足四个条件。”\n"
+                    "“第一，蛊仙的仙窍本源产出白荔仙元。”\n"
+                    "“第二，蛊仙主修流派的道痕，至少有三十万规模。”\n"
+                    "“第三，蛊仙的主修流派的境界，必须是无上大宗师。”\n"
+                    "“第四，蛊仙拥有前三项条件后，须得突破天道封锁。”"
+                )
+                return [
+                    SearchHit(
+                        score=1.0,
+                        chapter_number=2099,
+                        chapter_title="成尊的四个条件",
+                        parent_id="p2099",
+                        child_text="“第一，蛊仙的仙窍本源产出白荔仙元。”",
+                        parent_text=parent,
+                    )
+                ]
+
+        agent = BookRecallAgent(self.store, retriever=FakeRetriever())
+        card = agent.ask_card(book_id="sample", question="成为尊者条件是什么", progress_chapter=3000)
+
+        self.assertIn("白荔仙元", card.answer)
+        self.assertIn("三十万规模", card.answer)
+        self.assertIn("无上大宗师", card.answer)
+        self.assertIn("天道封锁", card.answer)
 
 
 if __name__ == "__main__":

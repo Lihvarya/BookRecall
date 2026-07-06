@@ -22,6 +22,7 @@ class LocalLLMError(RuntimeError):
 
 @dataclass(slots=True)
 class LocalLLMSettings:
+    model: str = ""
     model_path: str = ""
     endpoint: str = ""
     api_key: str = ""
@@ -64,7 +65,7 @@ class LocalChatClient:
         if not self.settings.enable_thinking:
             user_prompt = f"/no_think\n{prompt}\n/no_think"
         body = {
-            "model": Path(self.settings.model_path).stem or "local-qwen3",
+            "model": self.settings.model.strip() or Path(self.settings.model_path).stem or "local-qwen3",
             "messages": [
                 {
                     "role": "system",
@@ -215,7 +216,25 @@ def _recover_known_index_payload(text: str) -> dict[str, Any] | None:
         value = _extract_named_json_array(text, key)
         if value is not None:
             recovered[key] = value
+    for key in ("summary", "key_entities", "key_events", "foreshadowing", "state_changes", "confidence"):
+        value = _extract_named_json_value(text, key)
+        if value is not None:
+            recovered[key] = value
     return recovered or None
+
+
+def _extract_named_json_value(text: str, key: str) -> Any | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:', text)
+    if not match:
+        return None
+    start = match.end()
+    while start < len(text) and text[start].isspace():
+        start += 1
+    try:
+        value, _end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return value
 
 
 def _extract_named_json_array(text: str, key: str) -> list[Any] | None:

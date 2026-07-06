@@ -39,6 +39,8 @@ class AgentState:
     matched_entities: list[str] = field(default_factory=list)
     matched_themes: list[str] = field(default_factory=list)
     primary_entity: str | None = None
+    query_understanding: dict[str, object] = field(default_factory=dict)
+    query_understanding_error: str = ""
     recent_turns: list[dict[str, object]] = field(default_factory=list)
     user_preferences: dict[str, object] = field(default_factory=dict)
     evidence: list[EvidenceCard] = field(default_factory=list)

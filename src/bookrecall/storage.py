@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -7,6 +8,10 @@ from .models import BookInfo, Chapter, ChildChunk, EntityRecord, EventRecord, Pa
 
 def _normalize_entity_name(name: str) -> str:
     return "".join(name.lower().split())
+
+
+def _stable_suffix(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
 
 
 class BookRecallStore:
@@ -225,10 +230,12 @@ class BookRecallStore:
         relation_records: list[RelationRecord] | None = None,
         theme_records: list[ThemeRecord] | None = None,
         event_records: list[EventRecord] | None = None,
+        chapter_summaries: dict[int, str] | None = None,
     ) -> None:
         relation_records = relation_records or []
         theme_records = theme_records or []
         event_records = event_records or []
+        chapter_summaries = chapter_summaries or {}
         cursor = self.connection.cursor()
         metadata = cursor.execute(
             "SELECT book_group, tags_json FROM books WHERE book_id = ?",
@@ -322,7 +329,7 @@ class BookRecallStore:
                     book_id,
                     chapter.number,
                     chapter.title,
-                    _chapter_summary(chapter.content),
+                    chapter_summaries.get(chapter.number) or _chapter_summary(chapter.content),
                 )
                 for chapter in chapters
             ],
@@ -535,6 +542,153 @@ class BookRecallStore:
             )
             for row in rows
         ]
+
+    def upsert_dynamic_index_records(
+        self,
+        *,
+        book_id: str,
+        entity_records: list[EntityRecord] | None = None,
+        relation_records: list[RelationRecord] | None = None,
+        event_records: list[EventRecord] | None = None,
+    ) -> dict[str, int]:
+        entity_records = entity_records or []
+        relation_records = relation_records or []
+        event_records = event_records or []
+        inserted = {"entities": 0, "entity_mentions": 0, "relations": 0, "relation_mentions": 0, "events": 0}
+        cursor = self.connection.cursor()
+
+        for record in entity_records:
+            if not record.name:
+                continue
+            entity_id = f"{book_id}:entity:{_normalize_entity_name(record.name)}"
+            before = cursor.execute("SELECT 1 FROM entities WHERE entity_id = ?", (entity_id,)).fetchone()
+            cursor.execute(
+                """
+                INSERT INTO entities(entity_id, book_id, name, normalized_name, first_chapter_number, mention_count)
+                VALUES (?, ?, ?, ?, ?, 0)
+                ON CONFLICT(entity_id) DO UPDATE SET
+                    first_chapter_number = MIN(first_chapter_number, excluded.first_chapter_number)
+                """,
+                (entity_id, book_id, record.name, _normalize_entity_name(record.name), record.first_chapter_number),
+            )
+            if before is None:
+                inserted["entities"] += 1
+            for alias in record.aliases:
+                alias_id = f"{entity_id}:alias:{_stable_suffix(alias)}"
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO entity_aliases(alias_id, entity_id, book_id, alias, normalized_alias)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (alias_id, entity_id, book_id, alias, _normalize_entity_name(alias)),
+                )
+            for mention in record.mentions:
+                mention_id = f"{entity_id}:dynamic:{_stable_suffix(str(mention.chapter_number) + mention.excerpt)}"
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO entity_mentions(mention_id, entity_id, book_id, chapter_number, excerpt, position_in_chapter)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        mention_id,
+                        entity_id,
+                        book_id,
+                        mention.chapter_number,
+                        mention.excerpt,
+                        mention.position_in_chapter,
+                    ),
+                )
+                inserted["entity_mentions"] += cursor.rowcount
+            cursor.execute(
+                "UPDATE entities SET mention_count = (SELECT COUNT(*) FROM entity_mentions WHERE entity_id = ?) WHERE entity_id = ?",
+                (entity_id, entity_id),
+            )
+
+        for record in relation_records:
+            source = record.source_entity
+            target = record.target_entity
+            if not source or not target:
+                continue
+            relation_id = (
+                f"{book_id}:relation:{_normalize_entity_name(source)}:"
+                f"{_normalize_entity_name(target)}:{record.relation_type}"
+            )
+            before = cursor.execute("SELECT 1 FROM relations WHERE relation_id = ?", (relation_id,)).fetchone()
+            cursor.execute(
+                """
+                INSERT INTO relations(
+                    relation_id, book_id, source_entity, target_entity, normalized_source,
+                    normalized_target, relation_type, first_chapter_number, mention_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(relation_id) DO UPDATE SET
+                    first_chapter_number = MIN(first_chapter_number, excluded.first_chapter_number)
+                """,
+                (
+                    relation_id,
+                    book_id,
+                    source,
+                    target,
+                    _normalize_entity_name(source),
+                    _normalize_entity_name(target),
+                    record.relation_type,
+                    record.first_chapter_number,
+                ),
+            )
+            if before is None:
+                inserted["relations"] += 1
+            for mention in record.mentions:
+                mention_id = f"{relation_id}:dynamic:{_stable_suffix(str(mention.chapter_number) + mention.excerpt)}"
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO relation_mentions(mention_id, relation_id, book_id, chapter_number, excerpt)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (mention_id, relation_id, book_id, mention.chapter_number, mention.excerpt),
+                )
+                inserted["relation_mentions"] += cursor.rowcount
+            cursor.execute(
+                "UPDATE relations SET mention_count = (SELECT COUNT(*) FROM relation_mentions WHERE relation_id = ?) WHERE relation_id = ?",
+                (relation_id, relation_id),
+            )
+
+        for record in event_records:
+            event_id = (
+                f"{book_id}:event:dynamic:{record.chapter_number}:"
+                f"{_stable_suffix(record.event_type + record.summary + record.excerpt)}"
+            )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO events(event_id, book_id, chapter_number, chapter_title, event_type, summary, excerpt)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    book_id,
+                    record.chapter_number,
+                    record.chapter_title,
+                    record.event_type,
+                    record.summary,
+                    record.excerpt,
+                ),
+            )
+            inserted["events"] += cursor.rowcount
+            for entity_name in record.entities:
+                event_entity_id = f"{event_id}:entity:{_stable_suffix(entity_name)}"
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO event_entities(event_entity_id, event_id, book_id, entity_name, normalized_name)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (event_entity_id, event_id, book_id, entity_name, _normalize_entity_name(entity_name)),
+                )
+
+        cursor.execute(
+            "UPDATE books SET entity_count = (SELECT COUNT(*) FROM entities WHERE book_id = ?) WHERE book_id = ?",
+            (book_id, book_id),
+        )
+        self.connection.commit()
+        return inserted
 
     def get_book(self, book_id: str) -> BookInfo | None:
         row = self.connection.execute(

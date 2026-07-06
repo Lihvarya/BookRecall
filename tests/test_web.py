@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -110,6 +111,122 @@ class BookRecallWebTest(unittest.TestCase):
         with urllib.request.urlopen(request) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def _wait_job(self, job_id: str, timeout: float = 5.0) -> dict[str, object]:
+        deadline = time.time() + timeout
+        last_job: dict[str, object] = {}
+        while time.time() < deadline:
+            data = self._get_json(f"/api/jobs/{quote(job_id)}")
+            last_job = data["job"]
+            if last_job["status"] in {"succeeded", "failed"}:
+                return last_job
+            time.sleep(0.05)
+        self.fail(f"Timed out waiting for index job {job_id}: {last_job}")
+
+    def test_build_book_job_endpoint_reports_progress(self) -> None:
+        data = self._post_json(
+            "/api/books/build-job",
+            {
+                "book_id": "web-built-job",
+                "title": "Web Built Job",
+                "text": SAMPLE_TEXT,
+                "entities": "",
+                "themes": "",
+                "overwrite": False,
+                "source_name": "sample.txt",
+                "smart_index": {"enabled": False},
+            },
+        )
+        job = data["job"]
+        self.assertEqual(job["status"], "running")
+        self.assertIn("job_id", job)
+
+        finished = self._wait_job(job["job_id"])
+        self.assertEqual(finished["status"], "succeeded")
+        self.assertEqual(finished["percent"], 100)
+        self.assertEqual(finished["result"]["book_id"], "web-built-job")
+        self.assertGreaterEqual(finished["result"]["chapter_count"], 1)
+
+        books = self._get_json("/api/books")
+        self.assertTrue(any(item["book_id"] == "web-built-job" for item in books["books"]))
+
+    def test_rebuild_book_job_endpoint_reports_progress(self) -> None:
+        data = self._post_json(
+            "/api/books/sample/rebuild-job",
+            {
+                "entities": "",
+                "themes": "",
+                "smart_index": {"enabled": False},
+            },
+        )
+        job = data["job"]
+        self.assertEqual(job["status"], "running")
+        self.assertIn("job_id", job)
+
+        finished = self._wait_job(job["job_id"])
+        self.assertEqual(finished["status"], "succeeded")
+        self.assertEqual(finished["percent"], 100)
+        self.assertEqual(finished["result"]["book_id"], "sample")
+        self.assertGreaterEqual(finished["result"]["chapter_count"], 1)
+
+    def test_build_book_with_smart_index_writes_chapter_summaries(self) -> None:
+        class FakeLocalClient:
+            def __init__(self, _settings) -> None:
+                pass
+
+            def complete_json(self, prompt: str) -> dict:
+                if "章节摘要器" in prompt:
+                    return {
+                        "summary": "林澈发现星辰之匙线索。",
+                        "key_entities": ["林澈", "星辰之匙"],
+                        "key_events": ["林澈发现星辰之匙"],
+                        "foreshadowing": ["星辰之匙用途未明"],
+                        "state_changes": ["林澈获得新目标"],
+                        "confidence": 0.9,
+                    }
+                if "阶段回顾助手" in prompt:
+                    return {"stage_summary": "星辰之匙线索出现并推动林澈追查。", "confidence": 0.8}
+                if "识别真正有索引价值的专名实体" in prompt:
+                    return {"entities": [{"name": "星辰之匙", "type": "物品", "aliases": [], "confidence": 0.9}]}
+                if "抽取有效关系与关键事件" in prompt:
+                    return {"relations": [], "events": []}
+                return {}
+
+        with patch("bookrecall.web.LocalChatClient", FakeLocalClient):
+            data = self._post_json(
+                "/api/books/build",
+                {
+                    "book_id": "smart-summary",
+                    "title": "Smart Summary",
+                    "text": SAMPLE_TEXT,
+                    "overwrite": False,
+                    "smart_index": {"enabled": True, "endpoint": "http://local.test", "max_chapters": 1},
+                },
+            )
+
+        self.assertEqual(data["book"]["book_id"], "smart-summary")
+        chapters = self._get_json("/api/books/smart-summary/chapters")
+        self.assertIn("关键人物/实体：林澈、星辰之匙", chapters["chapters"][0]["summary"])
+        self.assertIn("星辰之匙用途未明", chapters["chapters"][0]["summary"])
+
+    def test_build_book_can_prebuild_vector_index_for_two_phase(self) -> None:
+        with patch("bookrecall.web.SentenceTransformerEmbedder", TinyWebEmbedder):
+            data = self._post_json(
+                "/api/books/build",
+                {
+                    "book_id": "two-phase-vector",
+                    "title": "Two Phase Vector",
+                    "text": SAMPLE_TEXT,
+                    "overwrite": False,
+                    "smart_index": {"enabled": False},
+                    "vector_index": {"enabled": True, "model": "tiny", "backend": "numpy"},
+                },
+            )
+
+        vector = data["book"]["vector_index"]
+        self.assertTrue(vector["ok"])
+        self.assertEqual(vector["backend"], "numpy")
+        self.assertGreater(vector["chunk_count"], 0)
+
     def test_books_endpoint(self) -> None:
         data = self._get_json("/api/books")
         self.assertEqual(data["books"][0]["book_id"], "sample")
@@ -155,9 +272,115 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertEqual(data["retrievers"][0]["id"], "lexical")
         policy_ids = [item["id"] for item in data["agent_policies"]]
         self.assertIn("rule_based", policy_ids)
+        self.assertIn("local_planner", policy_ids)
         self.assertIn("langgraph", policy_ids)
         langgraph_policy = next(item for item in data["agent_policies"] if item["id"] == "langgraph")
         self.assertEqual(langgraph_policy["ready"], data["dependencies"]["langgraph"])
+
+    def test_ask_endpoint_with_local_planner_policy(self) -> None:
+        class FakeLocalClient:
+            def __init__(self, _settings) -> None:
+                pass
+
+            def complete_json(self, prompt: str) -> dict:
+                if "本地 Agent Planner" in prompt:
+                    return {
+                        "tool_calls": [
+                            {
+                                "tool": "lookup_timeline",
+                                "arguments": {"entity": "$primary_entity"},
+                                "thought": "本地 Qwen 先查实体轨迹",
+                            }
+                        ]
+                    }
+                if "答案校验器" in prompt:
+                    return {
+                        "supported": True,
+                        "spoiler_safe": True,
+                        "speculation_risk": "low",
+                        "issues": [],
+                        "suggested_note": "",
+                        "confidence": 0.9,
+                    }
+                return {
+                    "intent": "entity_timeline",
+                    "entities": ["黑衣人"],
+                    "themes": [],
+                    "time_range": {"start_chapter": None, "end_chapter": None, "relative": "after"},
+                    "spoiler_sensitive": True,
+                    "tools": ["lookup_timeline"],
+                    "confidence": 0.9,
+                }
+
+        with patch("bookrecall.web.LocalChatClient", FakeLocalClient):
+            answer = self._post_json(
+                "/api/ask",
+                {
+                    "book_id": "sample",
+                    "user_id": "alice",
+                    "session_id": "local-planner",
+                    "question": "黑衣人后来还出现过吗？",
+                    "progress_chapter": 3,
+                    "agent_policy": "local_planner",
+                    "local_llm_config": {"enabled": True, "endpoint": "http://local.test"},
+                },
+            )
+
+        self.assertEqual(answer["runtime"]["effective_policy"], "local_planner")
+        self.assertTrue(answer["runtime"]["local_query_understanding_enabled"])
+        self.assertTrue(any(item["tool_name"] == "lookup_timeline" for item in answer["trace"]))
+
+    def test_ask_endpoint_auto_policy_prefers_local_planner_when_qwen_is_enabled(self) -> None:
+        class FakeLocalClient:
+            def __init__(self, _settings) -> None:
+                pass
+
+            def complete_json(self, prompt: str) -> dict:
+                if "本地 Agent Planner" in prompt:
+                    return {
+                        "tool_calls": [
+                            {
+                                "tool": "search_evidence",
+                                "arguments": {"query": "$question"},
+                                "thought": "本地 Qwen 先召回证据",
+                            }
+                        ]
+                    }
+                if "答案校验器" in prompt:
+                    return {
+                        "supported": True,
+                        "spoiler_safe": True,
+                        "speculation_risk": "low",
+                        "issues": [],
+                        "suggested_note": "",
+                        "confidence": 0.9,
+                    }
+                return {
+                    "intent": "semantic_search",
+                    "entities": [],
+                    "themes": [],
+                    "time_range": {"start_chapter": None, "end_chapter": None, "relative": ""},
+                    "spoiler_sensitive": True,
+                    "tools": ["search_evidence"],
+                    "confidence": 0.9,
+                }
+
+        with patch("bookrecall.web.LocalChatClient", FakeLocalClient):
+            answer = self._post_json(
+                "/api/ask",
+                {
+                    "book_id": "sample",
+                    "user_id": "alice",
+                    "session_id": "auto-local-planner",
+                    "question": "星辰之匙有什么线索？",
+                    "progress_chapter": 3,
+                    "agent_policy": "auto",
+                    "local_llm_config": {"enabled": True, "endpoint": "http://local.test"},
+                },
+            )
+
+        self.assertEqual(answer["runtime"]["effective_policy"], "local_planner")
+        self.assertTrue(any(item["tool_name"] == "search_evidence" for item in answer["trace"]))
 
     def test_diagnostics_endpoint(self) -> None:
         data = self._get_json("/api/diagnostics")

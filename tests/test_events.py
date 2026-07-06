@@ -14,6 +14,7 @@ from bookrecall.agent.tools import build_default_registry
 from bookrecall.chunking import build_chunk_hierarchy
 from bookrecall.config import DEFAULT_CHUNK_SETTINGS, DEFAULT_SEARCH_SETTINGS
 from bookrecall.entity_index import build_entity_records, build_event_records
+from bookrecall.models import EventRecord
 from bookrecall.parser import parse_chapters
 from bookrecall.retrieval import LocalRetriever
 from bookrecall.storage import BookRecallStore
@@ -90,6 +91,47 @@ class EventLayerTest(unittest.TestCase):
         self.assertTrue(result["found"])
         self.assertGreaterEqual(result["count"], 2)
         self.assertIn("chain_summary", result)
+
+    def test_search_events_tool_summarizes_narrative_chain_types(self) -> None:
+        chapters = parse_chapters("第1章 星钥\n\n黑衣人把星辰之匙交给林澈。")
+        parents, children = build_chunk_hierarchy("chain-book", chapters, DEFAULT_CHUNK_SETTINGS)
+        entity_records = build_entity_records(chapters, {"林澈": [], "黑衣人": [], "星辰之匙": []}, DEFAULT_CHUNK_SETTINGS)
+        self.store.replace_book(
+            book_id="chain-book",
+            title="链路测试书",
+            source_path="memory",
+            chapters=chapters,
+            parent_chunks=parents,
+            child_chunks=children,
+            entity_records=entity_records,
+            event_records=[
+                EventRecord(
+                    chapter_number=1,
+                    chapter_title="星钥",
+                    event_type="道具流转",
+                    summary="流转：星辰之匙：黑衣人 -> 林澈",
+                    excerpt="黑衣人把星辰之匙交给林澈。",
+                    entities=["林澈", "黑衣人", "星辰之匙"],
+                )
+            ],
+        )
+        registry = build_default_registry(self.store, LocalRetriever(self.store, DEFAULT_SEARCH_SETTINGS))
+        tool = registry.get("search_events")
+        self.assertIsNotNone(tool)
+
+        result = tool.run(
+            AgentState(
+                book_id="chain-book",
+                question="星辰之匙怎么流转？",
+                progress_chapter=1,
+                matched_entities=["星辰之匙"],
+                primary_entity="星辰之匙",
+            ),
+            {"query": "星辰之匙 流转", "entity": "星辰之匙"},
+        )
+
+        self.assertTrue(result["found"])
+        self.assertIn("道具流转", result["chain_summary"])
 
     def test_agent_answers_event_chain_question(self) -> None:
         card = self.agent.ask_card(

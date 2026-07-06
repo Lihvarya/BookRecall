@@ -11,6 +11,7 @@ import type {
   DiagnosticsStatus,
   EntitySummary,
   EventSummary,
+  IndexJob,
   RelationSummary,
   RuntimeStatus,
   SearchResult,
@@ -44,12 +45,20 @@ interface FormState {
   buildThemes: string;
   buildOverwrite: boolean;
   smartIndexEnabled: boolean;
+  localQwenEnabled: boolean;
+  localQwenModelName: string;
   smartIndexModelPath: string;
   smartIndexEndpoint: string;
+  smartIndexProfile: string;
   smartIndexMaxChapters: string | number;
+  smartIndexBatchChapters: string | number;
+  autoBuildVectorIndex: boolean;
   vectorModel: string;
   vectorBackend: string;
   vectorLimit: string | number;
+  rerankEnabled: boolean;
+  rerankModel: string;
+  rerankCandidates: string | number;
   searchQuery: string;
   searchLimit: string | number;
   policy: string;
@@ -94,6 +103,8 @@ interface BookRecallState {
   importedBookSourceName: string;
   status: string;
   isAsking: boolean;
+  isIndexing: boolean;
+  indexJob: IndexJob | null;
   lastError: {
     message: string;
     context?: string;
@@ -113,6 +124,22 @@ interface BookRecallState {
 
 interface ToolParameterMeta {
   required?: boolean;
+}
+
+interface BuildBookResult {
+  book_id?: string;
+  title?: string;
+  chapter_count?: number;
+  entities?: number;
+  relations?: number;
+  themes?: number;
+  events?: number;
+  vector_index?: {
+    ok?: boolean;
+    backend?: string;
+    chunk_count?: number;
+    error?: string;
+  };
 }
 
 export const useBookRecallStore = defineStore("bookrecall", () => {
@@ -142,9 +169,11 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     importedBookSourceName: "",
     status: "系统准备就绪。",
     isAsking: false,
+    isIndexing: false,
+    indexJob: null,
     lastError: null,
     buildResult: "推荐选择本地 TXT 文件导入；页面只显示文件摘要，不预览全文。",
-    vectorResult: "FAISS 是可选后端；缺失时可使用 Auto/Numpy。",
+    vectorResult: "默认架构：Qwen3-Embedding-0.6B 粗召回 + Qwen3-Reranker-0.6B 精排；旧索引需重建后才会切到 Qwen embedding。",
     searchResult: null as SearchResult | null,
     sessionComparison: null as SessionComparison | null,
     sessionMerge: null as SessionMerge | null,
@@ -172,16 +201,24 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       buildThemes: "",
       buildOverwrite: false,
       smartIndexEnabled: false,
+      localQwenEnabled: true,
+      localQwenModelName: "qwen3.5-4b",
       smartIndexModelPath: "D:\\BookRecall\\models\\llm\\qwen3-4b-instruct-2507-q4_k_m.gguf",
       smartIndexEndpoint: "",
+      smartIndexProfile: "fast",
       smartIndexMaxChapters: "",
-      vectorModel: "BAAI/bge-small-zh-v1.5",
+      smartIndexBatchChapters: 6,
+      autoBuildVectorIndex: true,
+      vectorModel: "Qwen/Qwen3-Embedding-0.6B",
       vectorBackend: "auto",
       vectorLimit: "",
+      rerankEnabled: true,
+      rerankModel: "Qwen/Qwen3-Reranker-0.6B",
+      rerankCandidates: 20,
       searchQuery: "",
       searchLimit: 6,
       policy: "auto",
-      retriever: "lexical",
+      retriever: "auto",
       provider: "deepseek",
       apiEndpoint: "",
       apiModel: "",
@@ -303,10 +340,20 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     state.form.apiKey = String(saved.apiKey || "");
     state.form.cloudEnabled = Boolean(saved.cloud_enabled);
     state.form.rememberApi = Boolean(saved.remember_api);
+    state.form.localQwenEnabled = saved.local_qwen_enabled === undefined ? state.form.localQwenEnabled : Boolean(saved.local_qwen_enabled);
+    state.form.localQwenModelName = String(saved.local_qwen_model || state.form.localQwenModelName);
     state.form.smartIndexEnabled = Boolean(saved.smart_index_enabled);
     state.form.smartIndexModelPath = String(saved.smart_index_model_path || state.form.smartIndexModelPath);
     state.form.smartIndexEndpoint = String(saved.smart_index_endpoint || state.form.smartIndexEndpoint);
+    state.form.smartIndexProfile = String(saved.smart_index_profile || state.form.smartIndexProfile);
     state.form.smartIndexMaxChapters = String(saved.smart_index_max_chapters || state.form.smartIndexMaxChapters);
+    state.form.smartIndexBatchChapters = String(saved.smart_index_batch_chapters || state.form.smartIndexBatchChapters);
+    state.form.autoBuildVectorIndex = saved.auto_build_vector_index === undefined ? state.form.autoBuildVectorIndex : Boolean(saved.auto_build_vector_index);
+    state.form.vectorModel = String(saved.vector_model || state.form.vectorModel);
+    state.form.vectorBackend = String(saved.vector_backend || state.form.vectorBackend);
+    state.form.rerankEnabled = saved.rerank_enabled === undefined ? state.form.rerankEnabled : Boolean(saved.rerank_enabled);
+    state.form.rerankModel = String(saved.rerank_model || state.form.rerankModel);
+    state.form.rerankCandidates = String(saved.rerank_candidates || state.form.rerankCandidates);
   }
 
   function saveLocalPreferences() {
@@ -325,10 +372,20 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
         apiKey: state.form.rememberApi ? state.form.apiKey : "",
         cloud_enabled: state.form.cloudEnabled,
         remember_api: state.form.rememberApi,
+        local_qwen_enabled: state.form.localQwenEnabled,
+        local_qwen_model: state.form.localQwenModelName,
         smart_index_enabled: state.form.smartIndexEnabled,
         smart_index_model_path: state.form.smartIndexModelPath,
         smart_index_endpoint: state.form.smartIndexEndpoint,
-        smart_index_max_chapters: state.form.smartIndexMaxChapters
+        smart_index_profile: state.form.smartIndexProfile,
+        smart_index_max_chapters: state.form.smartIndexMaxChapters,
+        smart_index_batch_chapters: state.form.smartIndexBatchChapters,
+        auto_build_vector_index: state.form.autoBuildVectorIndex,
+        vector_model: state.form.vectorModel,
+        vector_backend: state.form.vectorBackend,
+        rerank_enabled: state.form.rerankEnabled,
+        rerank_model: state.form.rerankModel,
+        rerank_candidates: state.form.rerankCandidates
       })
     );
     localStorage.removeItem(LEGACY_KEY);
@@ -634,7 +691,9 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
           endpoint: state.form.apiEndpoint.trim(),
           model: state.form.apiModel.trim(),
           api_key: state.form.apiKey.trim()
-        }
+        },
+        local_llm_config: localQwenPayload(),
+        rerank_config: rerankPayload()
       });
       state.answerCard = card;
       state.currentTrace = card.trace || [];
@@ -735,7 +794,9 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
             endpoint: state.form.apiEndpoint.trim(),
             model: state.form.apiModel.trim(),
             api_key: state.form.apiKey.trim()
-          }
+          },
+          local_llm_config: localQwenPayload(),
+          rerank_config: rerankPayload()
         }
       );
       if (action === "branch" && payload.branch?.target_session_id) {
@@ -806,10 +867,11 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
   }
 
   async function buildBookFromPanel() {
-    setStatus("正在构建书籍索引...");
-    const data = await postJson<{ book: { book_id: string; chapter_count: number; entities: number; themes: number } }>(
-      "/api/books/build",
-      {
+    setStatus("正在启动后台索引任务...");
+    state.isIndexing = true;
+    state.indexJob = null;
+    try {
+      const data = await postJson<{ job: IndexJob }>("/api/books/build-job", {
         book_id: state.form.buildBookId,
         title: state.form.buildTitle,
         text: state.importedBookText || state.form.buildText,
@@ -817,39 +879,122 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
         themes: state.form.buildThemes,
         overwrite: state.form.buildOverwrite,
         source_name: state.importedBookSourceName,
-        smart_index: smartIndexPayload()
+        smart_index: smartIndexPayload(),
+        vector_index: vectorIndexPayload()
+      });
+      const job = await waitForIndexJob(data.job.job_id);
+      const book = (job.result || {}) as BuildBookResult;
+      state.buildResult = `创建成功：${book.book_id || state.form.buildBookId}，章节 ${book.chapter_count || 0}，实体 ${
+        book.entities || 0
+      }，主题 ${book.themes || 0}，关系 ${book.relations || 0}，事件 ${book.events || 0}。`;
+      if (book.vector_index && typeof book.vector_index === "object") {
+        const vector = book.vector_index as { ok?: boolean; backend?: string; chunk_count?: number; error?: string };
+        state.buildResult += vector.ok
+          ? ` 向量索引已构建：${vector.backend || "auto"}，${vector.chunk_count || 0} 个 chunk。`
+          : ` 向量索引未完成：${vector.error || "未知错误"}。`;
       }
-    );
-    state.buildResult = `创建成功：${data.book.book_id}，章节 ${data.book.chapter_count}，实体 ${data.book.entities}，主题 ${data.book.themes}。`;
-    await loadBooks(data.book.book_id);
-    setStatus("书籍索引构建完成。");
+      await loadBooks(String(book.book_id || state.form.buildBookId));
+      setStatus("书籍索引构建完成。");
+    } catch (error) {
+      state.isIndexing = false;
+      throw error;
+    }
   }
 
   async function rebuildCurrentBookIndex() {
     if (!state.currentBookId || !confirm("重建会覆盖当前书的结构化索引。继续？")) {
       return;
     }
-    const data = await postJson<{ book: { book_id: string; chapter_count: number; entities: number } }>(
-      `/api/books/${encodeURIComponent(state.currentBookId)}/rebuild`,
-      {
+    setStatus("正在启动结构化索引重建任务...");
+    state.isIndexing = true;
+    state.indexJob = null;
+    try {
+      const data = await postJson<{ job: IndexJob }>(`/api/books/${encodeURIComponent(state.currentBookId)}/rebuild-job`, {
         entities: state.form.buildEntities,
         themes: state.form.buildThemes,
         smart_index: smartIndexPayload()
+      });
+      const job = await waitForIndexJob(data.job.job_id);
+      const book = job.result || {};
+      state.buildResult = `重建完成：${book.book_id || state.currentBookId}，章节 ${book.chapter_count || 0}，实体 ${
+        book.entities || 0
+      }，关系 ${book.relations || 0}，事件 ${book.events || 0}。`;
+      await loadBooks(state.currentBookId);
+      setStatus("结构化索引已重建。");
+    } catch (error) {
+      state.isIndexing = false;
+      throw error;
+    }
+  }
+
+  async function waitForIndexJob(jobId: string) {
+    try {
+      while (true) {
+        const data = await requestJson<{ job: IndexJob }>(`/api/jobs/${encodeURIComponent(jobId)}`);
+        state.indexJob = data.job;
+        const percent = Math.max(0, Math.min(100, Number(data.job.percent || 0)));
+        setStatus(`${data.job.stage || "索引任务"}：${data.job.message || ""} ${percent}%`);
+        if (data.job.status === "succeeded") {
+          return data.job;
+        }
+        if (data.job.status === "failed") {
+          throw new Error(data.job.error || data.job.message || "索引任务失败。");
+        }
+        await sleep(900);
       }
-    );
-    state.buildResult = `重建完成：${data.book.book_id}，章节 ${data.book.chapter_count}，实体 ${data.book.entities}。`;
-    await loadBooks(state.currentBookId);
-    setStatus("结构化索引已重建。");
+    } finally {
+      state.isIndexing = false;
+    }
+  }
+
+  function sleep(ms: number) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   function smartIndexPayload() {
+    const endpoint = state.form.smartIndexEndpoint.trim();
     return {
       enabled: state.form.smartIndexEnabled,
-      model_path: state.form.smartIndexModelPath,
-      endpoint: state.form.smartIndexEndpoint,
+      model: state.form.localQwenModelName.trim(),
+      model_path: state.form.smartIndexModelPath.trim(),
+      endpoint,
+      profile: state.form.smartIndexProfile,
       max_chapters: state.form.smartIndexMaxChapters ? Number(state.form.smartIndexMaxChapters) : 0,
+      batch_chapters: state.form.smartIndexBatchChapters ? Number(state.form.smartIndexBatchChapters) : 0,
       n_ctx: 4096,
-      max_tokens: 2048
+      max_tokens: state.form.smartIndexProfile === "fast" ? 1024 : 2048
+    };
+  }
+
+  function localQwenPayload() {
+    const endpoint = state.form.smartIndexEndpoint.trim();
+    const modelPath = state.form.smartIndexModelPath.trim();
+    return {
+      ...smartIndexPayload(),
+      enabled: state.form.localQwenEnabled && Boolean(endpoint || modelPath),
+      model: state.form.localQwenModelName.trim(),
+      model_path: endpoint ? "" : modelPath,
+      endpoint,
+      profile: "ondemand",
+      max_tokens: 1536
+    };
+  }
+
+  function vectorIndexPayload() {
+    return {
+      enabled: state.form.autoBuildVectorIndex,
+      model: state.form.vectorModel,
+      backend: state.form.vectorBackend,
+      limit_chunks: state.form.vectorLimit ? Number(state.form.vectorLimit) : null
+    };
+  }
+
+  function rerankPayload() {
+    return {
+      enabled: state.form.rerankEnabled,
+      model: state.form.rerankModel.trim(),
+      candidates: state.form.rerankCandidates ? Number(state.form.rerankCandidates) : 50,
+      batch_size: 8
     };
   }
 
@@ -902,6 +1047,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     const data = await postJson<{ search: SearchResult }>(`/api/books/${encodeURIComponent(state.currentBookId)}/search`, {
       query: state.form.searchQuery,
       retriever: state.form.retriever,
+      rerank_config: rerankPayload(),
       progress_chapter: state.form.progress ? Number(state.form.progress) : null,
       limit: state.form.searchLimit
     });

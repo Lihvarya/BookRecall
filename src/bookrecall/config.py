@@ -18,11 +18,19 @@ class SearchSettings:
 
 @dataclass(slots=True)
 class EmbeddingSettings:
-    model_name: str = "BAAI/bge-small-zh-v1.5"
+    model_name: str = "Qwen/Qwen3-Embedding-0.6B"
     batch_size: int = 64
     vector_dir_name: str = "vectors"
+
+
+@dataclass(slots=True)
+class RerankSettings:
+    model_name: str = "Qwen/Qwen3-Reranker-0.6B"
+    batch_size: int = 8
+    candidate_count: int = 20
 
 
 DEFAULT_CHUNK_SETTINGS = ChunkSettings()
 DEFAULT_SEARCH_SETTINGS = SearchSettings()
 DEFAULT_EMBEDDING_SETTINGS = EmbeddingSettings()
+DEFAULT_RERANK_SETTINGS = RerankSettings()

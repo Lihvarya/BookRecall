@@ -237,6 +237,7 @@ def _tool_search_evidence(retriever: LocalRetriever) -> Tool:
                     "chapter_number": hit.chapter_number,
                     "chapter_title": hit.chapter_title,
                     "child_text": hit.child_text,
+                    "parent_text": hit.parent_text,
                     "parent_id": hit.parent_id,
                     "score": hit.score,
                 }
@@ -594,13 +595,16 @@ def _tool_search_events(store: BookRecallStore) -> Tool:
 def _event_chain_summary(events: list[dict]) -> str:
     if not events:
         return ""
+    event_types = [str(event.get("event_type", "")) for event in events if event.get("event_type")]
+    special_types = [item for item in ("因果链", "道具流转", "伏笔/回收", "关系变化") if item in event_types]
+    prefix = f"命中{ '、'.join(special_types) }等阅读记忆链路。" if special_types else ""
     if len(events) == 1:
         event = events[0]
-        return f"第 {event['chapter_number']} 章的关键事件是：{event['summary']}"
+        return f"{prefix}第 {event['chapter_number']} 章的关键事件是：{event['summary']}"
     first = events[0]
     last = events[-1]
     return (
-        f"事件链从第 {first['chapter_number']} 章“{first['summary'][:42]}”"
+        f"{prefix}事件链从第 {first['chapter_number']} 章“{first['summary'][:42]}”"
         f"推进到第 {last['chapter_number']} 章“{last['summary'][:42]}”。"
     )
 

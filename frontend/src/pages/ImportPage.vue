@@ -50,12 +50,40 @@ function run(action: () => Promise<void>) {
             class="field"
             placeholder="最多智能处理章节数；0 为全部"
           />
+          <input
+            v-model="state.form.smartIndexBatchChapters"
+            type="number"
+            min="1"
+            max="6"
+            class="field"
+            placeholder="实体抽取合批章节数；推荐 2"
+          />
         </div>
       </div>
       <div class="mt-4 flex flex-wrap gap-3">
-        <button class="primary-button" type="button" @click="run(() => store.buildBookFromPanel())">开始建库</button>
-        <button class="ghost-button" type="button" @click="run(() => store.rebuildCurrentBookIndex())">重建当前书结构化索引</button>
-        <button class="danger-button" type="button" @click="run(() => store.deleteCurrentBook())">删除当前书数据</button>
+        <button class="primary-button" type="button" :disabled="state.isIndexing" @click="run(() => store.buildBookFromPanel())">
+          {{ state.isIndexing ? "索引中..." : "开始建库" }}
+        </button>
+        <button class="ghost-button" type="button" :disabled="state.isIndexing" @click="run(() => store.rebuildCurrentBookIndex())">
+          重建当前书结构化索引
+        </button>
+        <button class="danger-button" type="button" :disabled="state.isIndexing" @click="run(() => store.deleteCurrentBook())">
+          删除当前书数据
+        </button>
+      </div>
+      <div v-if="state.indexJob" class="index-progress-card mt-4">
+        <div class="side-head">
+          <strong>{{ state.indexJob.stage || "索引任务" }}</strong>
+          <span class="pill">{{ Math.round(Number(state.indexJob.percent || 0)) }}%</span>
+        </div>
+        <div class="progress-track mt-3">
+          <span :style="{ width: `${Math.max(0, Math.min(100, Number(state.indexJob.percent || 0)))}%` }"></span>
+        </div>
+        <p>{{ state.indexJob.message || "正在处理索引任务..." }}</p>
+        <small v-if="state.indexJob.total">
+          {{ state.indexJob.current || 0 }} / {{ state.indexJob.total }} · {{ state.indexJob.status }}
+        </small>
+        <small v-else>{{ state.indexJob.status }}</small>
       </div>
       <div class="empty-state mt-4 text-left" v-html="state.buildResult"></div>
     </div>

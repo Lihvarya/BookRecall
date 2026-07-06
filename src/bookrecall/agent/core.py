@@ -4,9 +4,18 @@ from __future__ import annotations
 
 from time import perf_counter
 
+from ..answer_validation import validate_answer_with_llm
 from ..cloud import OpenAICompatibleReasoner
 from ..config import DEFAULT_SEARCH_SETTINGS
+from ..dynamic_index import build_dynamic_index_records
 from ..models import EvidenceCard, MemoryCard
+from ..query_understanding import (
+    JsonCompleter,
+    QueryUnderstanding,
+    understand_query_with_llm,
+    understand_query_with_rules,
+)
+from ..rerank import rerank_evidence_hits
 from ..retrieval import LocalRetriever, Retriever
 from ..storage import BookRecallStore
 from .policies.base import Decision, DecisionPolicy
@@ -24,10 +33,12 @@ class BookRecallAgent:
         policy: DecisionPolicy | None = None,
         retriever: Retriever | None = None,
         reasoner: OpenAICompatibleReasoner | None = None,
+        query_understanding_client: JsonCompleter | None = None,
     ) -> None:
         self.store = store
         self.retriever = retriever or LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
         self.reasoner = reasoner or OpenAICompatibleReasoner()
+        self.query_understanding_client = query_understanding_client
         self._injected_policy = policy
 
     def _select_policy(self) -> DecisionPolicy:
@@ -137,16 +148,28 @@ class BookRecallAgent:
         if effective is None:
             effective = self.store.get_max_chapter(book_id)
 
-        matched = self._match_entities(book_id, question, self.store.list_entities(book_id))
+        known_entities = self.store.list_entities(book_id)
+        matched = self._match_entities(book_id, question, known_entities)
         matched_themes = self.store.match_theme_candidates(book_id, question)
         recent_turns: list[dict[str, object]] = []
         if session_id:
             recent_turns = self.store.list_agent_turns(book_id, user_id, session_id, limit=4)
+        recent_entity = self._recent_session_entity(recent_turns)
         if not matched:
-            recent_entity = self._recent_session_entity(recent_turns)
             if recent_entity:
                 matched = [recent_entity]
         user_preferences = self.store.get_user_preferences(book_id, user_id)
+        understanding, understanding_error = self._understand_query(
+            book_id=book_id,
+            question=question,
+            matched_entities=matched,
+            matched_themes=matched_themes,
+            known_entities=known_entities,
+            recent_entities=[recent_entity] if recent_entity else [],
+            progress_chapter=int(effective or 0),
+        )
+        matched = self._merge_understood_entities(book_id, matched, understanding.entities)
+        matched_themes = self._merge_understood_themes(book_id, matched_themes, understanding.themes)
 
         state = AgentState(
             book_id=book_id,
@@ -157,11 +180,87 @@ class BookRecallAgent:
             matched_entities=matched,
             matched_themes=matched_themes,
             primary_entity=matched[0] if matched else None,
+            query_understanding=understanding.to_dict(),
+            query_understanding_error=understanding_error,
             recent_turns=recent_turns,
             user_preferences=user_preferences,
         )
-        state.intent = "semantic_search"
+        state.intent = _safe_understood_intent(understanding.intent, matched, matched_themes)
         return state
+
+    def _understand_query(
+        self,
+        *,
+        book_id: str,
+        question: str,
+        matched_entities: list[str],
+        matched_themes: list[str],
+        known_entities: list[str],
+        recent_entities: list[str],
+        progress_chapter: int,
+    ) -> tuple[QueryUnderstanding, str]:
+        if self.query_understanding_client is None:
+            return (
+                understand_query_with_rules(
+                    question,
+                    matched_entities=matched_entities,
+                    matched_themes=matched_themes,
+                ),
+                "",
+        )
+        try:
+            known_themes = [str(row["name"]) for row in self.store.list_themes_with_aliases(book_id)]
+            return (
+                understand_query_with_llm(
+                    question,
+                    self.query_understanding_client,
+                    known_entities=known_entities,
+                    known_themes=known_themes,
+                    recent_entities=recent_entities,
+                    progress_chapter=progress_chapter,
+                    max_chapter=self.store.get_max_chapter(book_id),
+                ),
+                "",
+            )
+        except Exception as exc:  # noqa: BLE001 - local understanding must never break QA
+            return (
+                understand_query_with_rules(
+                    question,
+                    matched_entities=matched_entities,
+                    matched_themes=matched_themes,
+                ),
+                str(exc),
+            )
+
+    def _merge_understood_entities(
+        self,
+        book_id: str,
+        matched: list[str],
+        understood_entities: list[str],
+    ) -> list[str]:
+        result = list(matched)
+        for raw in understood_entities:
+            candidates = self._match_entities(book_id, raw, [])
+            if not candidates:
+                resolved = self.store.resolve_entity_name(book_id, raw)
+                candidates = [resolved] if resolved else []
+            for candidate in candidates:
+                if candidate and candidate not in result:
+                    result.append(candidate)
+        return result
+
+    def _merge_understood_themes(
+        self,
+        book_id: str,
+        matched: list[str],
+        understood_themes: list[str],
+    ) -> list[str]:
+        result = list(matched)
+        for raw in understood_themes:
+            for theme in self.store.match_theme_candidates(book_id, raw):
+                if theme not in result:
+                    result.append(theme)
+        return result
 
     @staticmethod
     def _recent_session_entity(recent_turns: list[dict[str, object]]) -> str | None:
@@ -195,6 +294,8 @@ class BookRecallAgent:
         *,
         elapsed_ms: float | None = None,
     ) -> None:
+        if tool_name == "search_evidence":
+            result = self._maybe_rerank_evidence(state, call, result)
         state.called_tools.add(tool_name)
         trace = _trace_for(state.step, tool_name, call, result, elapsed_ms=elapsed_ms)
         trace._observation = result  # type: ignore[attr-defined]
@@ -209,9 +310,10 @@ class BookRecallAgent:
                 state.primary_entity = canonical
                 if canonical not in state.matched_entities:
                     state.matched_entities.insert(0, canonical)
-            from .policies.rule_based import classify_intent
+            if not state.query_understanding or state.query_understanding.get("source") == "rules":
+                from .policies.rule_based import classify_intent
 
-            state.intent = classify_intent(state.question, state.matched_entities, state.matched_themes)
+                state.intent = classify_intent(state.question, state.matched_entities, state.matched_themes)
 
         if tool_name == "lookup_first_appearance":
             self._add_evidence(state, result, reason="首次提及该实体的正文片段")
@@ -270,6 +372,45 @@ class BookRecallAgent:
                     str(hit.get("child_text", "")),
                     "与当前问题最相关的检索命中",
                 )
+
+    def _maybe_rerank_evidence(self, state: AgentState, call, result: dict) -> dict:
+        if self.query_understanding_client is None:
+            return result
+        hits = result.get("hits")
+        if not isinstance(hits, list) or len(hits) <= 1:
+            return self._maybe_dynamic_index_evidence(state, result)
+        query = str(call.arguments.get("query") or state.question)
+        reranked = rerank_evidence_hits(query, hits, self.query_understanding_client)
+        updated = dict(result)
+        updated["hits"] = reranked.hits
+        updated["rerank"] = reranked.metadata()
+        return self._maybe_dynamic_index_evidence(state, updated)
+
+    def _maybe_dynamic_index_evidence(self, state: AgentState, result: dict) -> dict:
+        if self.query_understanding_client is None:
+            return result
+        hits = result.get("hits")
+        if not isinstance(hits, list) or not hits:
+            return result
+        entity_records, relation_records, event_records, report = build_dynamic_index_records(
+            question=state.question,
+            hits=hits,
+            client=self.query_understanding_client,
+            known_entities=self.store.list_entities(state.book_id),
+            max_hits=5,
+        )
+        updated = dict(result)
+        if report.get("used"):
+            writes = self.store.upsert_dynamic_index_records(
+                book_id=state.book_id,
+                entity_records=entity_records,
+                relation_records=relation_records,
+                event_records=event_records,
+            )
+            report = dict(report)
+            report["writes"] = writes
+        updated["dynamic_index"] = report
+        return updated
 
     def _add_evidence(self, state: AgentState, result: dict, reason: str) -> None:
         chapter = result.get("first_chapter_number")
@@ -349,6 +490,10 @@ class BookRecallAgent:
         elif state.intent in {"theme_explore", "compare", "causal", "semantic_search"}:
             evidence = evidence[: DEFAULT_SEARCH_SETTINGS.top_k_parents]
         evidence = _apply_preferred_evidence_depth(evidence, state.user_preferences)
+        validation = self._validate_answer(state, evidence)
+        suggestions = list(state.suggestions or [])
+        if validation.get("suggested_note") and validation.get("suggested_note") not in suggestions:
+            suggestions.append(str(validation["suggested_note"]))
 
         return MemoryCard(
             question=state.question,
@@ -359,9 +504,34 @@ class BookRecallAgent:
             entity_name=state.primary_entity,
             summary=state.summary,
             evidence=evidence,
-            suggestions=state.suggestions or [],
+            suggestions=suggestions,
             user_preferences=_public_preferences(state.user_preferences),
+            query_understanding=_public_query_understanding(state),
+            answer_validation=validation,
         )
+
+    def _validate_answer(self, state: AgentState, evidence: list[EvidenceCard]) -> dict[str, object]:
+        if self.query_understanding_client is None:
+            return {"source": "skipped", "supported": True, "spoiler_safe": True, "speculation_risk": "low"}
+        validation = validate_answer_with_llm(
+            question=state.question,
+            answer=state.answer or "",
+            progress_chapter=state.progress_chapter,
+            evidence=[
+                {
+                    "chapter_number": item.chapter_number,
+                    "chapter_title": item.chapter_title,
+                    "excerpt": item.excerpt,
+                    "reason": item.reason,
+                }
+                for item in evidence
+            ],
+            client=self.query_understanding_client,
+        )
+        data = validation.to_dict()
+        if validation.risky and not data.get("suggested_note"):
+            data["suggested_note"] = "这条回答的证据支撑可能不充分，建议结合下方原文片段核对。"
+        return data
 
     def _persist_session_turn(self, state: AgentState, card: MemoryCard) -> None:
         if not state.session_id:
@@ -456,7 +626,18 @@ def _summarize_observation(result: dict) -> str:
     if "chapters" in result:
         return f"chapters={result.get('chapters', [])[:5]}"
     if "hits" in result:
-        return f"hits={len(result.get('hits', []))}"
+        rerank = result.get("rerank")
+        dynamic = result.get("dynamic_index")
+        dynamic_text = ""
+        if isinstance(dynamic, dict) and dynamic.get("used"):
+            dynamic_text = (
+                f", dynamic=e{dynamic.get('entities', 0)}/"
+                f"r{dynamic.get('relations', 0)}/v{dynamic.get('events', 0)}"
+            )
+        if isinstance(rerank, dict):
+            status = "on" if rerank.get("used") else "off"
+            return f"hits={len(result.get('hits', []))}, rerank={status}{dynamic_text}"
+        return f"hits={len(result.get('hits', []))}{dynamic_text}"
     if "canonical_name" in result:
         return f"canonical={result.get('canonical_name')}"
     if "summary" in result:
@@ -480,3 +661,18 @@ def _public_preferences(preferences: dict[str, object]) -> dict[str, object]:
         "custom_prompt": str(preferences.get("custom_prompt") or ""),
     }
     return {key: value for key, value in result.items() if value}
+
+
+def _safe_understood_intent(intent: str, matched_entities: list[str], matched_themes: list[str]) -> str:
+    if intent in {"first_appearance", "entity_timeline", "relation_lookup"} and not matched_entities:
+        return "semantic_search"
+    if intent == "theme_explore" and not matched_themes:
+        return "semantic_search"
+    return intent or "semantic_search"
+
+
+def _public_query_understanding(state: AgentState) -> dict[str, object]:
+    result = dict(state.query_understanding or {})
+    if state.query_understanding_error:
+        result["error"] = state.query_understanding_error
+    return result
