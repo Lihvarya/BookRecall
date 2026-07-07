@@ -21,6 +21,8 @@ class FakeSmartClient:
                     {"name": "林澈", "type": "人物", "aliases": [], "evidence": "林澈与黑衣人对峙", "confidence": 0.9},
                     {"name": "黑衣人", "type": "人物", "aliases": ["黑袍人"], "evidence": "黑衣人出现", "confidence": 0.9},
                     {"name": "就是", "type": "其他", "aliases": [], "evidence": "就是", "confidence": 0.99},
+                    {"name": "自由", "type": "概念", "aliases": [], "evidence": "自由残缺变", "confidence": 0.99},
+                    {"name": "自由残缺变", "type": "功法", "aliases": [], "evidence": "自由残缺变是白袍蛊仙提到的一记杀招", "confidence": 0.92},
                 ]
             }
         return {
@@ -126,7 +128,9 @@ class SmartIndexTest(unittest.TestCase):
 
         self.assertIn("林澈", entities)
         self.assertIn("黑衣人", entities)
+        self.assertIn("自由残缺变", entities)
         self.assertNotIn("就是", entities)
+        self.assertNotIn("自由", entities)
 
     def test_llm_entity_reviewer_can_batch_chapters(self) -> None:
         chapters = parse_chapters(
@@ -243,6 +247,21 @@ class SmartIndexTest(unittest.TestCase):
 
         for bad in ["就是", "没有", "他的", "时间", "心中", "手段", "之前"]:
             self.assertNotIn(bad, entities)
+
+    def test_auto_discover_entities_does_not_promote_frequency_ngrams_by_default(self) -> None:
+        text = "自由自由自由自由自由自由自由自由。自由残缺变是白袍蛊仙提到的一记杀招。"
+
+        entities = auto_discover_entities(text, top_k=20)
+
+        self.assertEqual(entities, {})
+
+    def test_auto_discover_entities_keeps_explicit_rare_technique(self) -> None:
+        text = "第1章\n\n白袍蛊仙提到【自由残缺变】，这是只出现一次的杀招。"
+
+        entities = auto_discover_entities(text, top_k=20)
+
+        self.assertIn("自由残缺变", entities)
+        self.assertNotIn("自由", entities)
 
 
 if __name__ == "__main__":

@@ -197,6 +197,7 @@ class BookRecallStore:
                 progress_chapter INTEGER NOT NULL,
                 matched_entities_json TEXT NOT NULL,
                 trace_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -209,6 +210,7 @@ class BookRecallStore:
         self._ensure_column("user_preferences", "focus", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("user_preferences", "custom_prompt", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("user_preferences", "updated_at", "TEXT DEFAULT CURRENT_TIMESTAMP")
+        self._ensure_column("agent_memory", "evidence_json", "TEXT NOT NULL DEFAULT '[]'")
         self.connection.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, ddl: str) -> None:
@@ -1208,6 +1210,7 @@ class BookRecallStore:
                 progress_chapter,
                 matched_entities_json,
                 trace_json,
+                evidence_json,
                 created_at
             FROM agent_memory
             WHERE book_id = ? AND user_id = ? AND session_id = ?
@@ -1242,7 +1245,7 @@ class BookRecallStore:
             latest = self.connection.execute(
                 """
                 SELECT turn_id, turn_index, question, intent, entity_name, answer, summary,
-                       progress_chapter, matched_entities_json, trace_json, created_at
+                       progress_chapter, matched_entities_json, trace_json, evidence_json, created_at
                 FROM agent_memory
                 WHERE book_id = ? AND user_id = ? AND session_id = ?
                 ORDER BY turn_index DESC, turn_id DESC
@@ -1269,7 +1272,7 @@ class BookRecallStore:
         row = self.connection.execute(
             """
             SELECT turn_id, turn_index, question, intent, entity_name, answer, summary, progress_chapter,
-                   matched_entities_json, trace_json, created_at
+                   matched_entities_json, trace_json, evidence_json, created_at
             FROM agent_memory
             WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
             """,
@@ -1298,7 +1301,7 @@ class BookRecallStore:
         rows = self.connection.execute(
             """
             SELECT turn_id, turn_index, question, intent, entity_name, answer, summary, progress_chapter,
-                   matched_entities_json, trace_json, created_at
+                   matched_entities_json, trace_json, evidence_json, created_at
             FROM agent_memory
             WHERE book_id = ? AND user_id = ? AND session_id = ? AND turn_index < ?
             ORDER BY turn_index ASC, turn_id ASC
@@ -1319,6 +1322,7 @@ class BookRecallStore:
         for turn in source_turns:
             trace = turn.get("trace")
             matched_entities = turn.get("matched_entities")
+            evidence = turn.get("evidence")
             self.append_agent_turn(
                 book_id=book_id,
                 user_id=user_id,
@@ -1331,6 +1335,7 @@ class BookRecallStore:
                 progress_chapter=int(turn.get("progress_chapter") or 0),
                 matched_entities=[str(item) for item in matched_entities] if isinstance(matched_entities, list) else [],
                 trace=[dict(item) for item in trace] if isinstance(trace, list) else [],
+                evidence=[dict(item) for item in evidence] if isinstance(evidence, list) else [],
             )
             copied += 1
         return copied
@@ -1349,6 +1354,7 @@ class BookRecallStore:
         progress_chapter: int,
         matched_entities: list[str],
         trace: list[dict[str, object]],
+        evidence: list[dict[str, object]] | None = None,
     ) -> int:
         row = self.connection.execute(
             """
@@ -1373,9 +1379,10 @@ class BookRecallStore:
                 summary,
                 progress_chapter,
                 matched_entities_json,
-                trace_json
+                trace_json,
+                evidence_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 book_id,
@@ -1390,6 +1397,7 @@ class BookRecallStore:
                 progress_chapter,
                 json.dumps(matched_entities, ensure_ascii=False),
                 json.dumps(trace, ensure_ascii=False),
+                json.dumps(evidence or [], ensure_ascii=False),
             ),
         )
         self.connection.commit()
@@ -1418,7 +1426,7 @@ class BookRecallStore:
         row = self.connection.execute(
             """
             SELECT turn_id, turn_index, question, intent, entity_name, answer, summary, progress_chapter,
-                   matched_entities_json, trace_json, created_at
+                   matched_entities_json, trace_json, evidence_json, created_at
             FROM agent_memory
             WHERE turn_id = ? AND book_id = ? AND user_id = ? AND session_id = ?
             """,
@@ -1625,6 +1633,7 @@ def _agent_turn_from_row(row: sqlite3.Row) -> dict[str, object]:
         "progress_chapter": int(row["progress_chapter"]),
         "matched_entities": _loads_json_list(row["matched_entities_json"]),
         "trace": _loads_json_list(row["trace_json"]),
+        "evidence": _loads_json_list(row["evidence_json"]) if "evidence_json" in row.keys() else [],
         "created_at": str(row["created_at"]),
     }
 

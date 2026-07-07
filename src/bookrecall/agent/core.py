@@ -621,6 +621,15 @@ class BookRecallAgent:
             progress_chapter=state.progress_chapter,
             matched_entities=state.matched_entities,
             trace=self._serialize_trace(state.trace),
+            evidence=[
+                {
+                    "chapter_number": item.chapter_number,
+                    "chapter_title": item.chapter_title,
+                    "excerpt": item.excerpt,
+                    "reason": item.reason,
+                }
+                for item in card.evidence
+            ],
         )
 
     @staticmethod

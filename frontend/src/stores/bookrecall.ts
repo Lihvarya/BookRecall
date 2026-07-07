@@ -56,6 +56,7 @@ interface FormState {
   vectorModel: string;
   vectorBackend: string;
   vectorLimit: string | number;
+  vectorBatchSize: string | number;
   rerankEnabled: boolean;
   rerankModel: string;
   rerankCandidates: string | number;
@@ -213,6 +214,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       vectorModel: "Qwen/Qwen3-Embedding-0.6B",
       vectorBackend: "auto",
       vectorLimit: "",
+      vectorBatchSize: 64,
       rerankEnabled: true,
       rerankModel: "Qwen/Qwen3-Reranker-0.6B",
       rerankCandidates: 20,
@@ -354,6 +356,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     state.form.autoBuildVectorIndex = saved.auto_build_vector_index === undefined ? state.form.autoBuildVectorIndex : Boolean(saved.auto_build_vector_index);
     state.form.vectorModel = String(saved.vector_model || state.form.vectorModel);
     state.form.vectorBackend = String(saved.vector_backend || state.form.vectorBackend);
+    state.form.vectorBatchSize = String(saved.vector_batch_size || state.form.vectorBatchSize);
     state.form.rerankEnabled = saved.rerank_enabled === undefined ? state.form.rerankEnabled : Boolean(saved.rerank_enabled);
     state.form.rerankModel = String(saved.rerank_model || state.form.rerankModel);
     state.form.rerankCandidates = String(saved.rerank_candidates || state.form.rerankCandidates);
@@ -387,6 +390,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
         auto_build_vector_index: state.form.autoBuildVectorIndex,
         vector_model: state.form.vectorModel,
         vector_backend: state.form.vectorBackend,
+        vector_batch_size: state.form.vectorBatchSize,
         rerank_enabled: state.form.rerankEnabled,
         rerank_model: state.form.rerankModel,
         rerank_candidates: state.form.rerankCandidates
@@ -541,6 +545,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     state.form.preferenceFocus = preferences.preferences?.focus || "";
     state.form.preferenceCustom = preferences.preferences?.custom_prompt || "";
     state.currentTurns = session.turns || [];
+    state.currentTrace = latestTurnTrace(state.currentTurns);
     state.sessions = sessions.sessions || [];
     state.stats = stats.stats || {};
     state.themes = themes.themes || [];
@@ -616,6 +621,9 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
 
   async function switchSession(sessionId: string) {
     state.currentSessionId = sessionId;
+    state.answerCard = null;
+    state.sessionDigest = null;
+    state.currentTrace = [];
     saveLocalPreferences();
     await loadBookDetails();
   }
@@ -835,6 +843,15 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     )}</pre>`;
   }
 
+  function focusReaderPanel() {
+    if (window.location.hash !== "#index") {
+      window.location.hash = "#index";
+    }
+    window.setTimeout(() => {
+      document.getElementById("reader-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 80);
+  }
+
   async function openChapter(chapterNumber: number, excerpt = "") {
     if (!state.currentBookId || !chapterNumber) {
       return;
@@ -842,12 +859,15 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     state.reader.title = `第 ${chapterNumber} 章加载中...`;
     state.reader.meta = "loading";
     state.reader.content = '<div class="empty-state">正在载入章节原文。</div>';
+    focusReaderPanel();
     const data = await requestJson<{
       chapter: { chapter_number: number; title?: string; content: string };
     }>(`/api/books/${encodeURIComponent(state.currentBookId)}/chapters/${chapterNumber}`);
     state.reader.title = `第 ${data.chapter.chapter_number} 章 ${data.chapter.title || ""}`;
     state.reader.meta = excerpt ? "已尝试高亮证据片段" : "章节原文";
     state.reader.content = renderHighlightedContent(data.chapter.content || "", excerpt);
+    focusReaderPanel();
+    setStatus(`已打开第 ${data.chapter.chapter_number} 章原文。`);
   }
 
   async function readSelectedBookFile(event: Event) {
@@ -991,7 +1011,8 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       enabled: state.form.autoBuildVectorIndex,
       model: state.form.vectorModel,
       backend: state.form.vectorBackend,
-      limit_chunks: state.form.vectorLimit ? Number(state.form.vectorLimit) : null
+      limit_chunks: state.form.vectorLimit ? Number(state.form.vectorLimit) : null,
+      batch_size: state.form.vectorBatchSize ? Number(state.form.vectorBatchSize) : null
     };
   }
 
@@ -1025,7 +1046,8 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       {
         model: state.form.vectorModel,
         backend: state.form.vectorBackend,
-        limit_chunks: state.form.vectorLimit ? Number(state.form.vectorLimit) : null
+        limit_chunks: state.form.vectorLimit ? Number(state.form.vectorLimit) : null,
+        batch_size: state.form.vectorBatchSize ? Number(state.form.vectorBatchSize) : null
       }
     );
     state.vectorResult = `成功构建 ${data.vector_index.chunk_count} chunks，后端 ${data.vector_index.backend}。`;
@@ -1170,6 +1192,12 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
   function nextTurnIndex() {
     const indexes = state.currentTurns.map((turn: SessionTurn) => Number(turn.turn_index || 0));
     return Math.max(0, ...indexes) + 1;
+  }
+
+  function latestTurnTrace(turns: SessionTurn[]): TraceItem[] {
+    const sorted = [...turns].sort((a, b) => Number(a.turn_index || 0) - Number(b.turn_index || 0));
+    const latest = sorted[sorted.length - 1];
+    return latest?.trace || [];
   }
 
   function buildThinkingTrace(summary: string): TraceItem[] {

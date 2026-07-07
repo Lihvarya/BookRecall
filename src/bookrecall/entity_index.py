@@ -35,6 +35,15 @@ _STOPWORDS: set[str] = {
     "起来", "下去", "过来", "过去", "出来", "进去", "所有人", "其他人", "年轻人",
 }
 
+_ABSTRACT_THEME_WORDS: set[str] = {
+    "自由", "命运", "选择", "权力", "秩序", "混乱", "信仰", "人性", "神性", "文明",
+    "记忆", "身份", "牺牲", "救赎", "复仇", "成长", "孤独", "真相", "谎言",
+}
+
+_EXTERNAL_WORK_CONTEXT_WORDS: tuple[str, ...] = (
+    "作者", "小说", "网文", "版本", "校对", "全文", "书评", "读者", "写作", "创作", "起点",
+)
+
 DEFAULT_THEME_TERMS: tuple[str, ...] = (
     "自由意志",
     "命运",
@@ -70,9 +79,11 @@ EVENT_TYPE_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 
 def _is_candidate_name(token: str) -> bool:
-    if len(token) < 2:
+    if not _valid_entity_surface(token):
         return False
     if token in _STOPWORDS:
+        return False
+    if token in _ABSTRACT_THEME_WORDS:
         return False
     if not any(ch >= "一" and ch <= "鿿" for ch in token):
         return False
@@ -86,6 +97,21 @@ def _is_candidate_name(token: str) -> bool:
     if token.endswith(("的", "了", "着", "过", "中", "里", "上", "下")) and len(token) <= 3:
         return False
     return True
+
+
+def _valid_entity_surface(token: str) -> bool:
+    if not (2 <= len(token) <= 20):
+        return False
+    if any(ch.isspace() for ch in token):
+        return False
+    if re.search(r"[，。！？；：、“”‘’（）()《》【】\[\]{}<>]", token):
+        return False
+    return True
+
+
+def _looks_like_external_work_reference(text: str, start: int, end: int) -> bool:
+    context = text[max(0, start - 48) : min(len(text), end + 48)]
+    return any(word in context for word in _EXTERNAL_WORK_CONTEXT_WORDS)
 
 
 def discover_entities_by_frequency(text: str, *, top_k: int = 60) -> dict[str, list[str]]:
@@ -144,20 +170,26 @@ def load_theme_lexicon(path: str | None) -> dict[str, list[str]]:
     return load_entity_lexicon(path)
 
 
-def auto_discover_entities(text: str, *, top_k: int = 60) -> dict[str, list[str]]:
-    """自动挖掘候选实体：强调符实体（【】《》「」）+ 高频 n-gram 专名。
+def auto_discover_entities(text: str, *, top_k: int = 60, include_frequency: bool = False) -> dict[str, list[str]]:
+    """自动挖掘候选实体。
 
-    两者合并去重，长的优先。强调符实体通常是人手用括号强调的关键名词，准确度最高；
-    高频 n-gram 补充那些未加强调但反复出现的角色/蛊虫/门派名。
+    默认只信任显式强调符实体（【】/「」/少量《》），不再用高频 n-gram 自动扩展。
+    高频 n-gram 很容易把“自由、时候、心中”这类普通词污染成实体；低频专名漏掉时，
+    由 search_exact_text、embedding/rerank 和问答期动态索引补足。
     """
     found: set[str] = set()
     for pattern in AUTO_ENTITY_PATTERNS:
         for match in pattern.finditer(text):
             candidate = match.group(1).strip()
+            if not _is_candidate_name(candidate):
+                continue
+            if pattern.pattern.startswith("《") and _looks_like_external_work_reference(text, match.start(), match.end()):
+                continue
             if 1 < len(candidate) <= 20:
                 found.add(candidate)
-    frequency_based = discover_entities_by_frequency(text, top_k=top_k)
-    found.update(frequency_based.keys())
+    if include_frequency:
+        frequency_based = discover_entities_by_frequency(text, top_k=top_k)
+        found.update(frequency_based.keys())
     ordered = sorted(found, key=lambda item: (-len(item), item))
     return {item: [] for item in ordered}
 
@@ -285,7 +317,7 @@ def build_relation_records(
     settings: ChunkSettings,
 ) -> list[RelationRecord]:
     relation_mentions: dict[tuple[str, str, str], list[RelationMention]] = {}
-    entity_names = [record.name for record in entity_records]
+    entity_names = [record.name for record in entity_records if _is_candidate_name(record.name)]
 
     for chapter in chapters:
         for sentence in _iter_relation_windows(chapter.content, settings.max_excerpt_chars):
@@ -366,14 +398,16 @@ def build_event_records(
     entity_records: list[EntityRecord],
     settings: ChunkSettings,
 ) -> list[EventRecord]:
-    entity_names = [record.name for record in entity_records]
+    entity_names = [record.name for record in entity_records if _is_candidate_name(record.name)]
     records: list[EventRecord] = []
     seen: set[tuple[int, str]] = set()
     for chapter in chapters:
         for sentence in _iter_event_sentences(chapter.content):
             event_type = _infer_event_type(sentence)
             entities = [name for name in entity_names if name in sentence]
-            if event_type == "事件" and len(entities) < 2:
+            if event_type == "事件" or not entities:
+                continue
+            if not _looks_eventful(sentence):
                 continue
             key = (chapter.number, sentence)
             if key in seen:
@@ -425,6 +459,10 @@ def _infer_event_type(sentence: str) -> str:
         if any(keyword in sentence for keyword in keywords):
             return event_type
     return "事件"
+
+
+def _looks_eventful(sentence: str) -> bool:
+    return _infer_event_type(sentence) != "事件"
 
 
 def _event_summary(sentence: str, max_chars: int = 72) -> str:

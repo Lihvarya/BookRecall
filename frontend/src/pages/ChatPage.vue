@@ -3,7 +3,7 @@ import { computed, ref } from "vue";
 import { storeToRefs } from "pinia";
 import AgentTracePanel from "@/components/AgentTracePanel.vue";
 import { useBookRecallStore } from "@/stores/bookrecall";
-import type { EvidenceItem, SessionTurn } from "@/types";
+import type { EvidenceItem, SessionTurn, TraceItem } from "@/types";
 
 const store = useBookRecallStore();
 const { state, traceSummary } = storeToRefs(store);
@@ -11,6 +11,14 @@ const { state, traceSummary } = storeToRefs(store);
 const showTrace = ref(false);
 
 const orderedTurns = computed(() => [...state.value.currentTurns].sort((a, b) => a.turn_index - b.turn_index));
+
+const showStandaloneEvidence = computed(() => {
+  if (!state.value.answerCard?.evidence?.length) {
+    return false;
+  }
+  const latest = orderedTurns.value[orderedTurns.value.length - 1];
+  return !latest || !turnEvidence(latest).length;
+});
 
 const activeSession = computed(() => {
   return state.value.sessions.find((session) => session.session_id === state.value.currentSessionId);
@@ -37,6 +45,25 @@ function evidenceText(item: EvidenceItem) {
   return item.excerpt || item.child_text || "";
 }
 
+function turnEvidence(turn: SessionTurn) {
+  const evidence = turn.evidence || [];
+  if (evidence.length) {
+    return evidence;
+  }
+  const latest = orderedTurns.value[orderedTurns.value.length - 1];
+  if (latest?.turn_id === turn.turn_id && state.value.answerCard?.evidence?.length) {
+    return state.value.answerCard.evidence;
+  }
+  return [];
+}
+
+function turnTools(turn: SessionTurn) {
+  const names = (turn.trace || [])
+    .map((item: TraceItem) => item.tool_name || "")
+    .filter((name) => name && name !== "agent_planning" && name !== "answer_synthesis");
+  return [...new Set(names)];
+}
+
 function run(action: () => Promise<void>) {
   action().catch((error: Error) => store.reportError(error, "对话操作失败"));
 }
@@ -55,6 +82,9 @@ function askQuestion() {
 }
 
 function turnAction(action: string, turn: SessionTurn) {
+  if (action === "trace") {
+    showTrace.value = true;
+  }
   store.handleSessionAction(action, turn).catch((error: Error) => store.reportError(error, "会话操作失败"));
 }
 
@@ -151,6 +181,25 @@ function askWithSuggestion(suggestion: string) {
             <div class="bubble">
               <p>{{ turn.answer }}</p>
               <small>{{ turn.summary || "已写入当前会话记忆" }}</small>
+              <div v-if="turnTools(turn).length" class="turn-trace-mini">
+                <span>本轮工具</span>
+                <strong>{{ turnTools(turn).join(" → ") }}</strong>
+              </div>
+              <section v-if="turnEvidence(turn).length" class="turn-evidence">
+                <strong>本轮证据</strong>
+                <div class="turn-evidence-grid">
+                  <article
+                    v-for="item in turnEvidence(turn)"
+                    :key="`${turn.turn_id}-${item.chapter_number}-${evidenceText(item).slice(0, 20)}`"
+                  >
+                    <span>第 {{ item.chapter_number }} 章</span>
+                    <p>{{ evidenceText(item) }}</p>
+                    <button type="button" @click="run(() => store.openChapter(item.chapter_number, evidenceText(item)))">
+                      打开原文
+                    </button>
+                  </article>
+                </div>
+              </section>
               <div class="turn-actions">
                 <button type="button" @click="turnAction('reask', turn)">重新提问</button>
                 <button type="button" @click="turnAction('trace', turn)">查看轨迹</button>
@@ -162,10 +211,10 @@ function askWithSuggestion(suggestion: string) {
           </div>
         </article>
 
-        <section v-if="state.answerCard?.evidence?.length" class="evidence-strip">
+        <section v-if="showStandaloneEvidence" class="evidence-strip">
           <strong>本轮证据</strong>
           <div class="evidence-grid">
-            <article v-for="item in state.answerCard.evidence" :key="`${item.chapter_number}-${evidenceText(item).slice(0, 20)}`">
+            <article v-for="item in state.answerCard?.evidence || []" :key="`${item.chapter_number}-${evidenceText(item).slice(0, 20)}`">
               <span>第 {{ item.chapter_number }} 章</span>
               <p>{{ evidenceText(item) }}</p>
               <button type="button" @click="run(() => store.openChapter(item.chapter_number, evidenceText(item)))">打开原文</button>

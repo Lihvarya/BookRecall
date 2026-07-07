@@ -17,7 +17,7 @@ from typing import Any
 from .models import Chapter, EventRecord, RelationMention, RelationRecord
 
 
-PIPELINE_VERSION = "2026-07-qwen-pipeline-v1"
+PIPELINE_VERSION = "2026-07-quality-gated-index-v2"
 
 
 class IndexPipelineCache:

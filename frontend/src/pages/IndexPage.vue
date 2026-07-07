@@ -56,10 +56,10 @@ const relationItems = computed(() => {
     </div>
     <RelationGraph :relations="state.relations" @focus="(entity) => (selectedEntity = entity)" />
     <div class="knowledge-grid index-knowledge-grid">
-      <KnowledgeList title="实体索引" :items="entityItems" empty-text="当前书还没有实体索引。" compact />
-      <KnowledgeList title="事件链" :items="eventItems" empty-text="当前书还没有事件链。" compact />
-      <KnowledgeList title="关系索引" :items="relationItems" empty-text="当前筛选下没有关系。" compact />
-      <section class="control-card reader-panel-card">
+      <KnowledgeList title="实体索引" :items="entityItems" empty-text="当前书还没有实体索引。" :default-open="false" compact />
+      <KnowledgeList title="事件链" :items="eventItems" empty-text="当前书还没有事件链。" :default-open="false" compact />
+      <KnowledgeList title="关系索引" :items="relationItems" empty-text="当前筛选下没有关系。" :default-open="false" compact />
+      <section id="reader-panel" class="control-card reader-panel-card">
         <h2>原文阅读器</h2>
         <div class="reader-card chapter-reader">
           <strong>{{ state.reader.title }}</strong>

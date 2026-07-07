@@ -176,6 +176,7 @@ export interface SessionTurn {
   entity_name?: string;
   matched_entities?: string[];
   trace?: TraceItem[];
+  evidence?: EvidenceItem[];
 }
 
 export interface SessionSummary {

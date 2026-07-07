@@ -206,6 +206,10 @@ function evidenceText(item: EvidenceItem) {
           <input v-model="state.form.vectorLimit" type="number" min="1" class="field" placeholder="Max Chunks，留空为全部" />
         </label>
         <label>
+          Embedding batch size
+          <input v-model="state.form.vectorBatchSize" type="number" min="1" max="256" class="field" placeholder="Default 64; RTX 3060 can try 96 / 128" />
+        </label>
+        <label>
           Reranker 模型
           <input v-model="state.form.rerankModel" class="field" placeholder="Qwen/Qwen3-Reranker-0.6B" />
         </label>

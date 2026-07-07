@@ -57,6 +57,15 @@ _BAD_ENTITY_WORDS = {
     "她的", "它的", "他们", "我们", "你们", "之中", "之间", "之内", "之外", "的时候",
 }
 
+_ABSTRACT_THEME_WORDS = {
+    "自由", "命运", "选择", "权力", "秩序", "混乱", "信仰", "人性", "神性", "文明",
+    "记忆", "身份", "牺牲", "救赎", "复仇", "成长", "孤独", "真相", "谎言",
+}
+
+_GENERIC_ENTITY_SUFFIXES = (
+    "的人", "的时候", "的事情", "的东西", "的地方", "之中", "之间", "之后", "之前",
+)
+
 
 def discover_entities_with_llm(
     chapters: list[Chapter],
@@ -98,15 +107,16 @@ def discover_entities_with_llm(
                 continue
             name = str(item.get("name", "")).strip()
             confidence = _float(item.get("confidence"), 0.0)
-            if confidence < min_confidence or not _valid_entity_name(name):
-                continue
             entity_type = str(item.get("type", "其他")).strip()
             if entity_type not in ENTITY_TYPES:
                 entity_type = "其他"
+            evidence = str(item.get("evidence", "")).strip()
+            if confidence < min_confidence or not _valid_entity_name(name, entity_type=entity_type, evidence=evidence):
+                continue
             aliases = [
                 str(alias).strip()
                 for alias in _as_list(item.get("aliases"))
-                if _valid_alias(str(alias), name)
+                if _valid_alias(str(alias), name, evidence=evidence)
             ]
             current = entities.setdefault(name, [])
             for alias in aliases:
@@ -126,7 +136,7 @@ def build_smart_relation_event_records(
     min_confidence: float = 0.58,
     progress_callback: Callable[[str, int, int, Chapter], None] | None = None,
 ) -> tuple[list[RelationRecord], list[EventRecord]]:
-    entity_names = [record.name for record in entity_records]
+    entity_names = [record.name for record in entity_records if _valid_entity_name(record.name)]
     entity_lookup = {name: name for name in entity_names}
     relation_mentions: dict[tuple[str, str, str], list[RelationMention]] = defaultdict(list)
     event_records: list[EventRecord] = []
@@ -348,6 +358,8 @@ def _parse_relation_item(
     relation_type = str(item.get("type", "共现/关联")).strip()
     if relation_type not in RELATION_TYPES:
         relation_type = "共现/关联"
+    if relation_type == "共现/关联":
+        return None
     if _float(item.get("confidence"), 0.0) < min_confidence:
         return None
     return source, target, relation_type, str(item.get("evidence", "")).strip()
@@ -366,6 +378,8 @@ def _parse_event_item(
     event_type = _infer_event_type(event_type, item)
     if event_type not in EVENT_TYPES:
         event_type = "事件"
+    if event_type == "事件":
+        return None
     entities: list[str] = []
     for raw in _as_list(item.get("entities")):
         name = entity_lookup.get(str(raw).strip())
@@ -384,6 +398,8 @@ def _parse_event_item(
     if not entities:
         return None
     summary = _compose_event_summary(event_type, item)
+    if not summary.strip() and not str(item.get("evidence", "")).strip():
+        return None
     return (
         event_type,
         summary,
@@ -449,11 +465,17 @@ def _safe_evidence(content: str, evidence: str, entities: list[str], max_chars: 
     return ""
 
 
-def _valid_entity_name(name: str) -> bool:
+def _valid_entity_name(name: str, *, entity_type: str = "", evidence: str = "") -> bool:
     cleaned = name.strip()
     if not (2 <= len(cleaned) <= 20):
         return False
     if cleaned in _BAD_ENTITY_WORDS:
+        return False
+    if cleaned in _ABSTRACT_THEME_WORDS and entity_type not in {"功法", "物品", "种族", "组织", "地点"}:
+        return False
+    if any(cleaned.endswith(suffix) for suffix in _GENERIC_ENTITY_SUFFIXES):
+        return False
+    if re.search(r"[，。！？；：、“”‘’（）()《》【】\[\]{}<>]", cleaned):
         return False
     if not any("\u4e00" <= ch <= "\u9fff" for ch in cleaned):
         return False
@@ -461,12 +483,14 @@ def _valid_entity_name(name: str) -> bool:
         return False
     if len(cleaned) <= 3 and any(ch in cleaned for ch in "的是了在有也就都很还没不"):
         return False
+    if evidence and cleaned not in evidence and len(cleaned) <= 4:
+        return False
     return True
 
 
-def _valid_alias(alias: str, canonical: str) -> bool:
+def _valid_alias(alias: str, canonical: str, *, evidence: str = "") -> bool:
     cleaned = alias.strip()
-    return cleaned != canonical and _valid_entity_name(cleaned)
+    return cleaned != canonical and _valid_entity_name(cleaned, evidence=evidence)
 
 
 def _as_list(value: object) -> list[object]:
