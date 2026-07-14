@@ -50,7 +50,7 @@ from .entity_index import (
 )
 from .local_llm import LocalChatClient, LocalLLMError, LocalLLMSettings
 from .parser import parse_chapters
-from .retrieval import LocalRetriever, Retriever
+from .retrieval import LocalRetriever, Retriever, invalidate_local_retriever_cache
 from .smart_index import build_smart_relation_event_records, discover_entities_with_llm
 from .storage import BookRecallStore
 
@@ -201,6 +201,12 @@ class BookRecallWebService:
         self.db_path = db_path
         self.jobs = IndexJobManager(self)
 
+    def _get_local_retriever(self, store: BookRecallStore, book_id: str, settings: SearchSettings) -> LocalRetriever:
+        return LocalRetriever(store, settings)
+
+    def _invalidate_retriever_cache(self, book_id: str) -> None:
+        invalidate_local_retriever_cache(self.db_path, book_id)
+
     def _open_store(self) -> BookRecallStore:
         store = BookRecallStore(self.db_path)
         store.initialize()
@@ -283,6 +289,7 @@ class BookRecallWebService:
                 event_records=index_payload["event_records"],
                 chapter_summaries=index_payload["chapter_summaries"],
             )
+            self._invalidate_retriever_cache(book_id)
             vector_result: dict[str, object] | None = None
             if isinstance(vector_index, dict) and bool(vector_index.get("enabled")):
                 if progress_callback:
@@ -369,6 +376,7 @@ class BookRecallWebService:
                 event_records=index_payload["event_records"],
                 chapter_summaries=index_payload["chapter_summaries"],
             )
+            self._invalidate_retriever_cache(book_id)
             return {
                 "book_id": book_id,
                 "title": info.title,
@@ -400,6 +408,7 @@ class BookRecallWebService:
             chunk_count = store.delete_book(book_id)
         finally:
             store.close()
+        self._invalidate_retriever_cache(book_id)
         vector_delete = delete_vector_index(default_vector_dir(self.db_path), book_id)
         return {
             "book_id": book_id,
@@ -1546,14 +1555,14 @@ class BookRecallWebService:
         rerank_enabled = bool((rerank_config or {}).get("enabled"))
         search_settings = _search_settings_for_rerank(rerank_config) if rerank_enabled else DEFAULT_SEARCH_SETTINGS
         if mode == "lexical":
-            base: Retriever = LocalRetriever(store, search_settings)
+            base: Retriever = self._get_local_retriever(store, book_id, search_settings)
             return self._wrap_reranker(base, rerank_config)
 
         vector_dir = default_vector_dir(self.db_path)
         info = get_vector_index_info(vector_dir, book_id)
         if info is None:
             if mode == "auto":
-                base = LocalRetriever(store, search_settings)
+                base = self._get_local_retriever(store, book_id, search_settings)
                 return self._wrap_reranker(base, rerank_config)
             raise LocalModelError("这本书还没有向量索引，请先运行 embed-build，或在网页端选择倒排检索。")
 
@@ -1567,7 +1576,7 @@ class BookRecallWebService:
             return self._wrap_reranker(base, rerank_config)
         except LocalModelError:
             if mode == "auto":
-                base = LocalRetriever(store, search_settings)
+                base = self._get_local_retriever(store, book_id, search_settings)
                 return self._wrap_reranker(base, rerank_config)
             raise
 

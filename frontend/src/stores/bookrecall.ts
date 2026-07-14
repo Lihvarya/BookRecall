@@ -105,6 +105,7 @@ interface BookRecallState {
   importedBookSourceName: string;
   status: string;
   isAsking: boolean;
+  isSearching: boolean;
   isIndexing: boolean;
   indexJob: IndexJob | null;
   lastError: {
@@ -116,6 +117,8 @@ interface BookRecallState {
   buildResult: string;
   vectorResult: string;
   searchResult: SearchResult | null;
+  searchError: string;
+  searchElapsedMs: number | null;
   sessionComparison: SessionComparison | null;
   sessionMerge: SessionMerge | null;
   sessionDigest: SessionDigest | null;
@@ -171,12 +174,15 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     importedBookSourceName: "",
     status: "系统准备就绪。",
     isAsking: false,
+    isSearching: false,
     isIndexing: false,
     indexJob: null,
     lastError: null,
     buildResult: "推荐选择本地 TXT 文件导入；页面只显示文件摘要，不预览全文。",
     vectorResult: "默认架构：Qwen3-Embedding-0.6B 粗召回 + Qwen3-Reranker-0.6B 精排；旧索引需重建后才会切到 Qwen embedding。",
     searchResult: null as SearchResult | null,
+    searchError: "",
+    searchElapsedMs: null,
     sessionComparison: null as SessionComparison | null,
     sessionMerge: null as SessionMerge | null,
     sessionDigest: null as SessionDigest | null,
@@ -1069,18 +1075,41 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
   }
 
   async function searchEvidence() {
-    if (!state.currentBookId || !state.form.searchQuery) {
+    const query = state.form.searchQuery.trim();
+    if (!state.currentBookId) {
+      state.searchResult = { hits: [] };
+      state.searchError = "请先选择一本书。";
       return;
     }
-    const data = await postJson<{ search: SearchResult }>(`/api/books/${encodeURIComponent(state.currentBookId)}/search`, {
-      query: state.form.searchQuery,
-      retriever: state.form.retriever,
-      rerank_config: rerankPayload(),
-      progress_chapter: state.form.progress ? Number(state.form.progress) : null,
-      limit: state.form.searchLimit
-    });
-    state.searchResult = data.search || {};
-    setStatus("召回层测试完成。");
+    if (!query) {
+      state.searchResult = { hits: [] };
+      state.searchError = "请输入需要检索的关键词或问题。";
+      return;
+    }
+    state.isSearching = true;
+    state.searchError = "";
+    state.searchElapsedMs = null;
+    state.searchResult = null;
+    const startedAt = performance.now();
+    setStatus("正在执行召回测试...");
+    try {
+      const data = await postJson<{ search: SearchResult }>(`/api/books/${encodeURIComponent(state.currentBookId)}/search`, {
+        query,
+        retriever: state.form.retriever,
+        rerank_config: rerankPayload(),
+        progress_chapter: state.form.progress ? Number(state.form.progress) : null,
+        limit: state.form.searchLimit
+      });
+      state.searchResult = data.search || { hits: [] };
+      const hitCount = state.searchResult.hits?.length || 0;
+      setStatus(`召回测试完成，命中 ${hitCount} 条证据。`);
+    } catch (error) {
+      state.searchError = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      state.searchElapsedMs = Math.round(performance.now() - startedAt);
+      state.isSearching = false;
+    }
   }
 
   async function saveUserPreferences() {

@@ -399,8 +399,8 @@ class BookRecallAgent:
                     state,
                     int(hit["chapter_number"]),
                     str(hit.get("chapter_title", "")),
-                    str(hit.get("child_text", "")),
-                    "与当前问题最相关的检索命中",
+                    _expanded_search_excerpt(hit),
+                    "与当前问题最相关的检索命中及相邻上下文",
                 )
 
         if tool_name == "search_exact_text":
@@ -734,6 +734,27 @@ def _apply_preferred_evidence_depth(evidence: list[EvidenceCard], preferences: d
     if style in {"detailed", "详细"}:
         return evidence[: DEFAULT_SEARCH_SETTINGS.top_k_parents]
     return evidence
+
+
+def _expanded_search_excerpt(hit: dict, *, before_chars: int = 180, after_chars: int = 480) -> str:
+    child = str(hit.get("child_text") or "").strip()
+    parent = str(hit.get("parent_text") or "").strip()
+    if not parent or not child:
+        return child or parent
+    position = parent.find(child)
+    if position < 0:
+        anchor = child[:80]
+        position = parent.find(anchor) if anchor else -1
+    if position < 0:
+        return child
+    start = max(0, position - before_chars)
+    end = min(len(parent), position + len(child) + after_chars)
+    excerpt = parent[start:end].strip()
+    if start > 0:
+        excerpt = "..." + excerpt
+    if end < len(parent):
+        excerpt += "..."
+    return excerpt
 
 
 def _public_preferences(preferences: dict[str, object]) -> dict[str, object]:

@@ -615,6 +615,34 @@ button {
   @apply rounded-xl p-3;
 }
 
+.retrieval-feedback {
+  @apply flex items-center gap-3 rounded-xl border border-line bg-white/70 px-3 py-2.5 text-xs;
+}
+
+.retrieval-feedback strong {
+  @apply block text-sm text-ink;
+}
+
+.retrieval-feedback p {
+  @apply mt-0.5 leading-5 text-muted;
+}
+
+.retrieval-feedback-loading {
+  @apply border-primary/20 bg-primarySoft/45;
+}
+
+.retrieval-feedback-error {
+  @apply border-danger/25 bg-dangerSoft/50;
+}
+
+.retrieval-spinner {
+  @apply h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-primary/20 border-t-primary;
+}
+
+.retrieval-result-meta {
+  @apply flex flex-wrap items-center gap-2 text-[11px] font-black text-muted;
+}
+
 .local-model-card {
   @apply overflow-hidden bg-gradient-to-br from-white/80 via-white/70 to-primarySoft/60;
 }

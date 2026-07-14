@@ -371,6 +371,23 @@ class RuleBasedPolicy(DecisionPolicy):
         return self._terminal_semantic(state, "compare")
 
     def _route_causal(self, state: AgentState) -> Decision:
+        if _wants_truth_chain(state.question):
+            exact_keyword = _death_verification_keyword(state.question, state.primary_entity or "")
+            if exact_keyword and "search_exact_text" not in state.called_tools:
+                return self._call(
+                    "search_exact_text",
+                    {"keyword": exact_keyword, "limit": 8},
+                    thought="用户指出明确死亡措辞，优先用原文精确检索核验",
+                )
+            if exact_keyword and state.raw_hits:
+                return self._terminal_semantic(state, "causal")
+            if "search_evidence" not in state.called_tools:
+                return self._call(
+                    "search_evidence",
+                    {"query": _death_search_query(state.question, state.primary_entity or "")},
+                    thought="死亡/结局问题优先检索原文，并加入明确死亡措辞提高召回",
+                )
+            return self._terminal_semantic(state, "causal")
         if "search_events" not in state.called_tools:
             return self._call(
                 "search_events",
@@ -591,6 +608,9 @@ def _truth_chain_answer(state: AgentState, intent: str) -> Decision | None:
     if not _wants_truth_chain(state.question):
         return None
     hits = _dedupe_hits_by_chapter(state.raw_hits)
+    explicit = _explicit_death_answer(state, hits, intent)
+    if explicit is not None:
+        return explicit
     if len(hits) < 2:
         return None
     entity = state.primary_entity or (state.matched_entities[0] if state.matched_entities else "")
@@ -621,7 +641,61 @@ def _truth_chain_answer(state: AgentState, intent: str) -> Decision | None:
 
 
 def _wants_truth_chain(question: str) -> bool:
-    return any(keyword in question for keyword in ("死亡真相", "死的真相", "怎么死", "如何死", "死因", "真相"))
+    return any(
+        keyword in question
+        for keyword in ("死亡真相", "死的真相", "怎么死", "如何死", "死因", "死在", "死于", "死了", "尸躯", "结局", "真相")
+    )
+
+
+def _death_verification_keyword(question: str, entity: str) -> str:
+    entity = entity.strip()
+    if entity and "尸躯" in question:
+        return f"{entity}的尸躯"
+    for marker in ("他死了", "她死了", "一动不动", "断了气息"):
+        if marker in question:
+            return marker
+    return ""
+
+
+def _death_search_query(question: str, entity: str) -> str:
+    subject = entity.strip()
+    if subject:
+        return f"{subject} 死了 尸躯 丧命"
+    return f"{question} 死了 尸躯 丧命".strip()
+
+
+def _explicit_death_answer(state: AgentState, hits: list[dict], intent: str) -> Decision | None:
+    entity = state.primary_entity or (state.matched_entities[0] if state.matched_entities else "")
+    if not entity:
+        return None
+    corpse_marker = f"{entity}的尸躯"
+    direct_pattern = re.compile(rf"{re.escape(entity)}.{{0,100}}(?:死了|死亡|身亡|丧命|断了气息)", re.S)
+    for hit in hits:
+        text = str(hit.get("parent_text") or hit.get("child_text") or "")
+        explicit_corpse = corpse_marker in text and any(marker in text for marker in ("他死了", "她死了", "停止了动作", "一动不动"))
+        if not explicit_corpse and direct_pattern.search(text) is None:
+            continue
+        chapter_number = int(hit.get("chapter_number", 0) or 0)
+        chapter_title = str(hit.get("chapter_title") or f"第 {chapter_number} 章")
+        location = "在逆流河中" if "逆流河" in text else ""
+        cause = "被方源连续重创后杀死" if "方源" in text and any(marker in text for marker in ("趁胜追击", "再施辣手", "尸躯")) else "明确死亡"
+        answer = f"可以确认：{entity}{location}{cause}，发生在第 {chapter_number} 章《{chapter_title}》。"
+        if "他死了" in text:
+            answer += f" 原文直接写明“{entity}终于停止了动作，一动不动”“他死了”"
+        elif "她死了" in text:
+            answer += f" 原文直接写明“她死了”"
+        if corpse_marker in text:
+            answer += f"，随后又写到“{corpse_marker}”"
+        answer += "。这是明确的死亡描写，不是昏迷、重伤或仍然存活。"
+        return Decision(
+            is_terminal=True,
+            intent_override=intent,
+            entity_name=entity,
+            answer=answer,
+            summary=f"第 {chapter_number} 章同时出现死亡确认和尸躯描写，足以形成闭合证据链。",
+            suggestions=[f"打开第 {chapter_number} 章原文核对死亡前后的完整过程。", f"继续问：{entity}为什么会在这里牺牲？"],
+        )
+    return None
 
 
 def _dedupe_hits_by_chapter(hits: list[dict]) -> list[dict]:

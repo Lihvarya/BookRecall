@@ -235,15 +235,38 @@ function evidenceText(item: EvidenceItem) {
       <div class="form-grid">
         <input v-model="state.form.searchQuery" class="field" placeholder="输入关键词或自然语言问题" />
         <input v-model="state.form.searchLimit" type="number" min="1" max="20" class="field" />
-        <button class="secondary-button" type="button" @click="run(() => store.searchEvidence())">检索证据</button>
+        <button class="secondary-button" type="button" :disabled="state.isSearching" @click="run(() => store.searchEvidence())">
+          {{ state.isSearching ? "正在检索..." : "检索证据" }}
+        </button>
       </div>
-      <div v-if="state.searchResult?.hits?.length" class="evidence-grid mt-4">
-        <article v-for="hit in state.searchResult.hits" :key="`${hit.chapter_number}-${evidenceText(hit).slice(0, 12)}`">
+      <div v-if="state.isSearching" class="retrieval-feedback retrieval-feedback-loading mt-3">
+        <span class="retrieval-spinner"></span>
+        <div>
+          <strong>正在召回证据</strong>
+          <p>首次加载 Embedding 或 Reranker 模型可能需要更长时间，请勿重复点击。</p>
+        </div>
+      </div>
+      <div v-else-if="state.searchError" class="retrieval-feedback retrieval-feedback-error mt-3">
+        <div>
+          <strong>召回测试失败</strong>
+          <p>{{ state.searchError }}</p>
+        </div>
+      </div>
+      <template v-else-if="state.searchResult">
+        <div class="retrieval-result-meta mt-3">
+          <span class="pill">{{ state.searchResult.hits?.length || 0 }} 条证据</span>
+          <span>{{ state.searchResult.effective_retriever || state.searchResult.retriever || "未知检索器" }}</span>
+          <span v-if="state.searchElapsedMs !== null">{{ (state.searchElapsedMs / 1000).toFixed(2) }} 秒</span>
+        </div>
+        <div v-if="state.searchResult.hits?.length" class="evidence-grid mt-3">
+          <article v-for="(hit, index) in state.searchResult.hits" :key="`${hit.chapter_number}-${index}-${evidenceText(hit).slice(0, 12)}`">
           <span>第 {{ hit.chapter_number }} 章</span>
           <p>{{ evidenceText(hit) }}</p>
           <button type="button" @click="run(() => store.openChapter(hit.chapter_number, evidenceText(hit)))">打开原文</button>
-        </article>
-      </div>
+          </article>
+        </div>
+        <div v-else class="empty-state mt-3">没有召回到证据。可尝试缩短关键词、切换检索方式，或暂时关闭本地重排。</div>
+      </template>
     </div>
   </section>
 </template>

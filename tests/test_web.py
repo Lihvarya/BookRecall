@@ -620,6 +620,29 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertLessEqual(max(item["chapter_number"] for item in search["hits"]), 2)
         self.assertTrue(any("黑衣人" in item["child_text"] for item in search["hits"]))
 
+    def test_search_endpoint_reuses_lexical_retriever(self) -> None:
+        payload = {
+            "query": "黑衣人",
+            "retriever": "lexical",
+            "limit": 5,
+        }
+        original = BookRecallStore.iter_search_rows
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def counted_iter_search_rows(store, book_id, max_chapter=None):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            return original(store, book_id, max_chapter=max_chapter)
+
+        with patch.object(BookRecallStore, "iter_search_rows", new=counted_iter_search_rows):
+            first = self._post_json("/api/books/sample/search", payload)
+            second = self._post_json("/api/books/sample/search", payload)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(first["search"]["hits"], second["search"]["hits"])
+
     def test_search_endpoint_embedding(self) -> None:
         with patch("bookrecall.web.SentenceTransformerEmbedder", TinyWebEmbedder):
             self._post_json(

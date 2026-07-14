@@ -424,6 +424,40 @@ class BookRecallAgentTest(unittest.TestCase):
         self.assertIn("影壁", card.answer)
         self.assertIn("尸体", card.answer)
 
+    def test_death_answer_expands_child_boundary_and_accepts_explicit_death(self) -> None:
+        queries: list[str] = []
+
+        class BoundaryRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                queries.append(query)
+                child = "方源连续重击林澈，最后两指戳穿林澈的眼睛。"
+                parent = (
+                    "影无邪等人向上游逃去。"
+                    + child
+                    + "林澈遭受重创，鲜血喷涌。方源趁胜追击，再施辣手，林澈终于停止了动作，一动不动。"
+                    "他死了。方源甩掉林澈的尸躯，继续向上游追去。碧晨天俯瞰逆流河。"
+                )
+                return [
+                    SearchHit(
+                        score=1.0,
+                        chapter_number=3,
+                        chapter_title="慷慨赴死",
+                        parent_id="p3-death",
+                        child_text=child,
+                        parent_text=parent,
+                    )
+                ]
+
+        agent = BookRecallAgent(self.store, retriever=BoundaryRetriever())
+        card = agent.ask_card(book_id="sample", question="林澈是怎么死的？", progress_chapter=3)
+
+        self.assertTrue(any("尸躯" in query and "丧命" in query for query in queries))
+        self.assertIn("第 3 章", card.answer)
+        self.assertIn("他死了", card.answer)
+        self.assertIn("尸躯", card.answer)
+        self.assertIn("逆流河", card.answer)
+        self.assertIn("他死了", card.evidence[0].excerpt)
+
     def test_local_llm_synthesizes_final_answer_from_evidence(self) -> None:
         class FakeRetriever:
             def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:

@@ -1,5 +1,7 @@
 import math
 import re
+import threading
+from pathlib import Path
 from typing import Protocol
 
 from .config import SearchSettings
@@ -7,6 +9,21 @@ from .models import SearchHit
 from .storage import BookRecallStore
 
 WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+SearchRow = tuple[str, str, int, str, str, str]
+_SHARED_CACHE_LOCK = threading.Lock()
+_SHARED_ROWS_CACHE: dict[tuple[str, str], list[SearchRow]] = {}
+_SHARED_INDEX_CACHE: dict[tuple[str, str], dict[str, set[str]]] = {}
+
+
+def _shared_cache_key(store: BookRecallStore, book_id: str) -> tuple[str, str]:
+    return str(store.db_path.resolve()), book_id
+
+
+def invalidate_local_retriever_cache(db_path: str | Path, book_id: str) -> None:
+    cache_key = (str(Path(db_path).resolve()), book_id)
+    with _SHARED_CACHE_LOCK:
+        _SHARED_ROWS_CACHE.pop(cache_key, None)
+        _SHARED_INDEX_CACHE.pop(cache_key, None)
 
 
 def _tokenize(text: str) -> set[str]:
@@ -63,10 +80,22 @@ class LocalRetriever:
         self.store = store
         self.settings = settings
         self._index: dict[str, dict[str, set[str]]] = {}
-        self._rows_cache: dict[str, list[tuple[str, str, int, str, str, str]]] = {}
+        self._rows_cache: dict[str, list[SearchRow]] = {}
 
     def _ensure_index(self, book_id: str, max_chapter: int | None) -> None:
         cache_key = book_id
+        if cache_key in self._index and cache_key in self._rows_cache:
+            return
+
+        shared_key = _shared_cache_key(self.store, book_id)
+        with _SHARED_CACHE_LOCK:
+            shared_rows = _SHARED_ROWS_CACHE.get(shared_key)
+            shared_index = _SHARED_INDEX_CACHE.get(shared_key)
+        if shared_rows is not None and shared_index is not None:
+            self._rows_cache[cache_key] = shared_rows
+            self._index[cache_key] = shared_index
+            return
+
         rows = self._rows_cache.get(cache_key)
         if rows is None:
             raw = self.store.iter_search_rows(book_id, max_chapter=None)
@@ -83,9 +112,6 @@ class LocalRetriever:
             ]
             self._rows_cache[cache_key] = rows
 
-        if cache_key in self._index:
-            return  # 倒排表按全书构建一次即可
-
         inverted: dict[str, set[str]] = {}
         for chunk_id, _parent_id, _chapter_number, text, _title, _parent_text in rows:
             for token in _tokenize(text):
@@ -94,6 +120,10 @@ class LocalRetriever:
                     posting = set()
                     inverted[token] = posting
                 posting.add(chunk_id)
+        with _SHARED_CACHE_LOCK:
+            rows = _SHARED_ROWS_CACHE.setdefault(shared_key, rows)
+            inverted = _SHARED_INDEX_CACHE.setdefault(shared_key, inverted)
+        self._rows_cache[cache_key] = rows
         self._index[cache_key] = inverted
 
     def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
