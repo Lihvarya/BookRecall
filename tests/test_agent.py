@@ -458,6 +458,74 @@ class BookRecallAgentTest(unittest.TestCase):
         self.assertIn("逆流河", card.answer)
         self.assertIn("他死了", card.evidence[0].excerpt)
 
+    def test_death_fact_route_overrides_planner_and_rejects_wrong_synthesis(self) -> None:
+        planner_calls = 0
+
+        class WrongPlanner:
+            def next_action(self, state, registry):
+                nonlocal planner_calls
+                planner_calls += 1
+                raise AssertionError("死亡事实核验不应交给本地 Planner")
+
+        class BoundaryRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                child = "方源连续重击林澈，最后两指戳穿林澈的眼睛。"
+                parent = (
+                    child
+                    + "林澈遭受重创。方源趁胜追击，再施辣手，林澈终于停止了动作，一动不动。"
+                    "他死了。方源甩掉林澈的尸躯，继续向上游追去。碧晨天俯瞰逆流河。"
+                )
+                return [
+                    SearchHit(
+                        score=1.0,
+                        chapter_number=3,
+                        chapter_title="慷慨赴死",
+                        parent_id="p3-death-guard",
+                        child_text=child,
+                        parent_text=parent,
+                    )
+                ]
+
+        class WrongSynthesisClient:
+            def complete_json(self, prompt: str) -> dict:
+                if "最终答案整理器" in prompt:
+                    return {
+                        "answer": "林澈在第 2 章因愧疚崩溃而死。",
+                        "summary": "错误总结",
+                        "confidence": 0.9,
+                    }
+                if "答案校验器" in prompt:
+                    return {
+                        "supported": True,
+                        "spoiler_safe": True,
+                        "speculation_risk": "low",
+                        "issues": [],
+                        "suggested_note": "",
+                        "confidence": 0.9,
+                    }
+                return {
+                    "intent": "semantic_search",
+                    "entities": ["林澈"],
+                    "themes": [],
+                    "time_range": {"start_chapter": None, "end_chapter": None, "relative": ""},
+                    "spoiler_sensitive": True,
+                    "tools": ["search_evidence"],
+                    "confidence": 0.9,
+                }
+
+        agent = BookRecallAgent(
+            self.store,
+            policy=WrongPlanner(),
+            retriever=BoundaryRetriever(),
+            query_understanding_client=WrongSynthesisClient(),
+        )
+        card = agent.ask_card(book_id="sample", question="林澈怎么死的？", progress_chapter=3)
+
+        self.assertEqual(planner_calls, 0)
+        self.assertIn("第 3 章", card.answer)
+        self.assertNotIn("第 2 章", card.answer)
+        self.assertEqual(card.answer_synthesis.get("rejected"), "conflicts_with_explicit_death_evidence")
+
     def test_local_llm_synthesizes_final_answer_from_evidence(self) -> None:
         class FakeRetriever:
             def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:

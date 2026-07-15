@@ -20,7 +20,7 @@ from ..rerank import rerank_evidence_hits
 from ..retrieval import LocalRetriever, Retriever
 from ..storage import BookRecallStore
 from .policies.base import Decision, DecisionPolicy, ToolCall
-from .policies.rule_based import INTENT_LABELS, RuleBasedPolicy, _extract_exact_keyword
+from .policies.rule_based import INTENT_LABELS, RuleBasedPolicy, _extract_exact_keyword, _wants_truth_chain
 from .render import render_json, render_text, to_payload
 from .state import AgentState, ToolCallTrace
 from .tools import ToolRegistry, build_default_registry
@@ -68,6 +68,10 @@ class BookRecallAgent:
         state = self._init_state(book_id, question, user_id, progress_chapter, session_id)
         registry = build_default_registry(self.store, self.retriever)
         policy = self._select_policy()
+        if _wants_truth_chain(state.question):
+            policy = RuleBasedPolicy(reasoner=None)
+            state.intent = "causal"
+            state.query_understanding["policy_override"] = "deterministic_fact_verification"
         if self.force_exact_search:
             self._run_forced_exact_search(state, registry)
 
@@ -418,6 +422,7 @@ class BookRecallAgent:
                     str(hit.get("child_text", "")),
                     f"原文精确命中“{keyword}”",
                 )
+            state.evidence.sort(key=lambda item: 0 if item.reason.startswith("原文精确命中") else 1)
 
     def _maybe_rerank_evidence(self, state: AgentState, call, result: dict) -> dict:
         if self.query_understanding_client is None:
@@ -562,9 +567,10 @@ class BookRecallAgent:
         if self.query_understanding_client is None:
             state.answer_synthesis = {"used": False, "source": "skipped", "reason": "local_llm_disabled"}
             return
+        draft_answer = state.answer or ""
         synthesis = synthesize_answer_with_llm(
             question=state.question,
-            draft_answer=state.answer or "",
+            draft_answer=draft_answer,
             progress_chapter=state.progress_chapter,
             evidence=[
                 {
@@ -579,6 +585,12 @@ class BookRecallAgent:
         )
         state.answer_synthesis = synthesis.to_dict()
         if synthesis.used and synthesis.answer:
+            explicit_chapter = _explicit_death_evidence_chapter(evidence, state.primary_entity or "")
+            if explicit_chapter is not None and not _synthesis_respects_explicit_death(synthesis.answer, explicit_chapter):
+                state.answer_synthesis["used"] = False
+                state.answer_synthesis["rejected"] = "conflicts_with_explicit_death_evidence"
+                state.answer = draft_answer
+                return
             state.answer = synthesis.answer
             if synthesis.summary:
                 state.summary = synthesis.summary
@@ -755,6 +767,26 @@ def _expanded_search_excerpt(hit: dict, *, before_chars: int = 180, after_chars:
     if end < len(parent):
         excerpt += "..."
     return excerpt
+
+
+def _explicit_death_evidence_chapter(evidence: list[EvidenceCard], entity: str) -> int | None:
+    if not entity:
+        return None
+    corpse_marker = f"{entity}的尸躯"
+    direct_markers = (f"{entity}死了", f"{entity}身亡", f"{entity}丧命", f"{entity}断了气息")
+    for item in evidence:
+        text = item.excerpt
+        corpse_confirmation = corpse_marker in text and any(marker in text for marker in ("他死了", "她死了", "停止了动作", "一动不动"))
+        if corpse_confirmation or any(marker in text for marker in direct_markers):
+            return item.chapter_number
+    return None
+
+
+def _synthesis_respects_explicit_death(answer: str, chapter_number: int) -> bool:
+    normalized = answer.replace(" ", "")
+    chapter_markers = (f"第{chapter_number}章", f"{chapter_number}章")
+    contradictions = ("并未死亡", "没有死亡", "尚未死亡", "仍然存活", "还活着", "无法确认", "证据不足")
+    return any(marker in normalized for marker in chapter_markers) and not any(marker in normalized for marker in contradictions)
 
 
 def _public_preferences(preferences: dict[str, object]) -> dict[str, object]:

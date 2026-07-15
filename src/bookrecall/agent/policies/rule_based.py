@@ -20,6 +20,8 @@ def classify_intent(
         return "theme_explore"
     if matched_themes and not matched_entities:
         return "theme_explore"
+    if _wants_truth_chain(question):
+        return "causal"
     if matched_entities and any(keyword in question for keyword in relation_keywords):
         return "relation_lookup"
     if any(keyword in question for keyword in ("关键事件", "事件链", "主线", "发生了什么", "涉及哪些事件")):
@@ -69,6 +71,8 @@ class RuleBasedPolicy(DecisionPolicy):
         )
 
     def next_action(self, state: AgentState, registry: ToolRegistry) -> Decision:
+        if _wants_truth_chain(state.question):
+            state.intent = "causal"
         if state.step == 0:
             understood_intent = str((state.query_understanding or {}).get("intent") or "")
             if understood_intent and understood_intent != "semantic_search":
@@ -387,6 +391,13 @@ class RuleBasedPolicy(DecisionPolicy):
                     {"query": _death_search_query(state.question, state.primary_entity or "")},
                     thought="死亡/结局问题优先检索原文，并加入明确死亡措辞提高召回",
                 )
+            entity = state.primary_entity or (state.matched_entities[0] if state.matched_entities else "")
+            if entity and "search_exact_text" not in state.called_tools and not _hits_confirm_explicit_death(state.raw_hits, entity):
+                return self._call(
+                    "search_exact_text",
+                    {"keyword": f"{entity}的尸躯", "limit": 8},
+                    thought="语义召回未形成死亡闭环，精确核验实体尸躯原文",
+                )
             return self._terminal_semantic(state, "causal")
         if "search_events" not in state.called_tools:
             return self._call(
@@ -669,11 +680,16 @@ def _explicit_death_answer(state: AgentState, hits: list[dict], intent: str) -> 
     if not entity:
         return None
     corpse_marker = f"{entity}的尸躯"
-    direct_pattern = re.compile(rf"{re.escape(entity)}.{{0,100}}(?:死了|死亡|身亡|丧命|断了气息)", re.S)
+    direct_markers = (
+        f"{entity}死了",
+        f"{entity}身亡",
+        f"{entity}丧命",
+        f"{entity}断了气息",
+    )
     for hit in hits:
         text = str(hit.get("parent_text") or hit.get("child_text") or "")
         explicit_corpse = corpse_marker in text and any(marker in text for marker in ("他死了", "她死了", "停止了动作", "一动不动"))
-        if not explicit_corpse and direct_pattern.search(text) is None:
+        if not explicit_corpse and not any(marker in text for marker in direct_markers):
             continue
         chapter_number = int(hit.get("chapter_number", 0) or 0)
         chapter_title = str(hit.get("chapter_title") or f"第 {chapter_number} 章")
@@ -696,6 +712,18 @@ def _explicit_death_answer(state: AgentState, hits: list[dict], intent: str) -> 
             suggestions=[f"打开第 {chapter_number} 章原文核对死亡前后的完整过程。", f"继续问：{entity}为什么会在这里牺牲？"],
         )
     return None
+
+
+def _hits_confirm_explicit_death(hits: list[dict], entity: str) -> bool:
+    corpse_marker = f"{entity}的尸躯"
+    direct_markers = (f"{entity}死了", f"{entity}身亡", f"{entity}丧命", f"{entity}断了气息")
+    for hit in hits:
+        text = str(hit.get("parent_text") or hit.get("child_text") or "")
+        if corpse_marker in text and any(marker in text for marker in ("他死了", "她死了", "停止了动作", "一动不动")):
+            return True
+        if any(marker in text for marker in direct_markers):
+            return True
+    return False
 
 
 def _dedupe_hits_by_chapter(hits: list[dict]) -> list[dict]:
