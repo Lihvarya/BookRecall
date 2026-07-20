@@ -26,8 +26,10 @@ class EmbeddingSettings:
 @dataclass(slots=True)
 class RerankSettings:
     model_name: str = "Qwen/Qwen3-Reranker-0.6B"
-    batch_size: int = 8
-    candidate_count: int = 20
+    batch_size: int = 1
+    candidate_count: int = 6
+    max_chars: int = 384
+    max_length: int = 512
 
 
 DEFAULT_CHUNK_SETTINGS = ChunkSettings()

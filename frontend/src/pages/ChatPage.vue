@@ -64,6 +64,45 @@ function turnTools(turn: SessionTurn) {
   return [...new Set(names)];
 }
 
+function compactModelName(value?: string | null) {
+  const normalized = String(value || "").replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).pop() || "未知模型";
+}
+
+function turnRuntimePills(turn: SessionTurn) {
+  const runtime = turn.runtime;
+  if (!runtime || !Object.keys(runtime).length) {
+    return [];
+  }
+  const retrieval = runtime.retrieval || {};
+  const pills: string[] = [];
+  const policy = runtime.effective_policy || runtime.agent_policy;
+  if (policy) {
+    pills.push(`策略 · ${policy}`);
+  }
+  if (retrieval.vector_model) {
+    pills.push(`向量 · ${compactModelName(retrieval.vector_model)} / ${retrieval.vector_backend || "未知后端"}`);
+  } else {
+    pills.push(`召回 · ${retrieval.mode || runtime.retriever || retrieval.base_retriever || "未知"}`);
+  }
+  if (retrieval.reranker_enabled) {
+    pills.push(`重排 · ${compactModelName(retrieval.reranker_model)}`);
+  } else {
+    pills.push("重排 · 未启用");
+  }
+  if (runtime.cloud_reasoner_enabled) {
+    pills.push(`云端总结 · ${compactModelName(runtime.cloud_model)}`);
+  } else if (runtime.local_query_understanding_enabled) {
+    pills.push(`本地理解 · ${compactModelName(runtime.local_query_understanding_model)}`);
+  } else {
+    pills.push("总结 · 规则链路");
+  }
+  if (runtime.force_exact_search) {
+    pills.push("全文精确检索 · 已强制");
+  }
+  return pills;
+}
+
 function run(action: () => Promise<void>) {
   action().catch((error: Error) => store.reportError(error, "对话操作失败"));
 }
@@ -184,6 +223,12 @@ function askWithSuggestion(suggestion: string) {
               <div v-if="turnTools(turn).length" class="turn-trace-mini">
                 <span>本轮工具</span>
                 <strong>{{ turnTools(turn).join(" → ") }}</strong>
+              </div>
+              <div v-if="turnRuntimePills(turn).length" class="turn-runtime-mini">
+                <strong>实际执行链路</strong>
+                <div>
+                  <span v-for="item in turnRuntimePills(turn)" :key="item">{{ item }}</span>
+                </div>
               </div>
               <section v-if="turnEvidence(turn).length" class="turn-evidence">
                 <strong>本轮证据</strong>

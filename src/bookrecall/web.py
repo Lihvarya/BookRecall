@@ -4,6 +4,8 @@ import json
 import mimetypes
 import os
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -128,6 +130,77 @@ def _search_settings_for_rerank(config: dict[str, object] | None) -> SearchSetti
     )
 
 
+def _check_local_llm_config(config: dict[str, object]) -> dict[str, object]:
+    endpoint = str(config.get("endpoint") or "").strip()
+    model_name = str(config.get("model") or "").strip()
+    model_path = str(config.get("model_path") or "").strip()
+    if endpoint:
+        models_endpoint = _local_models_endpoint(endpoint)
+        request = urllib.request.Request(models_endpoint, headers={"Accept": "application/json"}, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            raise LocalLLMError(f"本地 Qwen models endpoint 返回 HTTP {exc.code}：{models_endpoint}") from exc
+        except urllib.error.URLError as exc:
+            raise LocalLLMError(f"无法连接本地 Qwen：{exc.reason}") from exc
+        raw_models = payload.get("data") if isinstance(payload, dict) else None
+        model_ids = [
+            str(item.get("id") or "").strip()
+            for item in raw_models
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ] if isinstance(raw_models, list) else []
+        return {
+            "component": "local_llm",
+            "mode": "endpoint",
+            "endpoint": endpoint,
+            "models_endpoint": models_endpoint,
+            "configured_model": model_name,
+            "available_models": model_ids[:20],
+            "configured_model_found": not model_name or model_name in model_ids or not model_ids,
+        }
+
+    if model_path:
+        path = Path(model_path).expanduser().resolve()
+        if not path.exists() or not path.is_file():
+            raise LocalLLMError(f"GGUF 文件不存在：{path}")
+        return {
+            "component": "local_llm",
+            "mode": "gguf_file",
+            "configured_model": model_name,
+            "resolved_model": str(path),
+            "local_path": True,
+            "file_size_mb": round(path.stat().st_size / 1024 / 1024, 2),
+            "load_tested": False,
+            "note": "为避免与 LM Studio 争抢 6GB 显存，本次只验证 GGUF 文件，不在 Web 进程内加载。",
+        }
+    raise LocalLLMError("请先填写本地 Qwen endpoint 或 GGUF 模型路径。")
+
+
+def _local_models_endpoint(endpoint: str) -> str:
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise LocalLLMError("本地 Qwen endpoint 必须是合法的 http(s) URL。")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        path = path[: -len("/chat/completions")]
+    if path.endswith("/models"):
+        models_path = path
+    elif path.endswith("/v1"):
+        models_path = f"{path}/models"
+    elif not path:
+        models_path = "/v1/models"
+    else:
+        models_path = f"{path}/v1/models"
+    return parsed._replace(path=models_path, params="", query="", fragment="").geturl()
+
+
+def _is_recommended_embedding_model(model_name: str) -> bool:
+    normalized = str(model_name or "").strip().replace("\\", "/").rstrip("/").lower()
+    recommended = DEFAULT_EMBEDDING_SETTINGS.model_name.replace("\\", "/").rstrip("/").lower()
+    return normalized == recommended or normalized.endswith(f"/{recommended.rsplit('/', 1)[-1]}")
+
+
 class IndexJobManager:
     def __init__(self, service: "BookRecallWebService") -> None:
         self.service = service
@@ -200,9 +273,51 @@ class BookRecallWebService:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self.jobs = IndexJobManager(self)
+        self._model_cache_lock = threading.Lock()
+        self._embedding_models: dict[str, SentenceTransformerEmbedder] = {}
+        self._reranker_models: dict[tuple[str, int, int, int], CrossEncoderReranker] = {}
 
     def _get_local_retriever(self, store: BookRecallStore, book_id: str, settings: SearchSettings) -> LocalRetriever:
         return LocalRetriever(store, settings)
+
+    def _get_embedding_model(self, model_name: str) -> SentenceTransformerEmbedder:
+        key = str(model_name or DEFAULT_EMBEDDING_SETTINGS.model_name).strip()
+        with self._model_cache_lock:
+            cached = self._embedding_models.get(key)
+            if cached is not None:
+                return cached
+            configure_local_model_cache(default_cache_root(self.db_path))
+            model = SentenceTransformerEmbedder(
+                key,
+                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
+            )
+            self._embedding_models[key] = model
+            return model
+
+    def _get_reranker_model(
+        self,
+        model_name: str,
+        *,
+        batch_size: int,
+        max_chars: int,
+        max_length: int,
+    ) -> CrossEncoderReranker:
+        normalized = str(model_name or DEFAULT_RERANK_SETTINGS.model_name).strip()
+        key = (normalized, int(batch_size), int(max_chars), int(max_length))
+        with self._model_cache_lock:
+            cached = self._reranker_models.get(key)
+            if cached is not None:
+                return cached
+            configure_local_model_cache(default_cache_root(self.db_path))
+            model = CrossEncoderReranker(
+                normalized,
+                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
+                batch_size=batch_size,
+                max_chars=max_chars,
+                max_length=max_length,
+            )
+            self._reranker_models[key] = model
+            return model
 
     def _invalidate_retriever_cache(self, book_id: str) -> None:
         invalidate_local_retriever_cache(self.db_path, book_id)
@@ -211,6 +326,74 @@ class BookRecallWebService:
         store = BookRecallStore(self.db_path)
         store.initialize()
         return store
+
+    def check_model(self, component: str, config: dict[str, object] | None = None) -> dict[str, object]:
+        normalized = str(component or "").strip().lower()
+        if normalized not in {"embedding", "reranker", "local_llm"}:
+            raise ValueError("component 只能是 embedding、reranker 或 local_llm。")
+        started = perf_counter()
+        try:
+            if normalized == "embedding":
+                result = self._check_embedding_model(config or {})
+            elif normalized == "reranker":
+                result = self._check_reranker_model(config or {})
+            else:
+                result = _check_local_llm_config(config or {})
+            result["ok"] = True
+        except Exception as exc:  # noqa: BLE001 - self-check should return a diagnostic result
+            result = {"ok": False, "component": normalized, "error": str(exc)}
+        result["elapsed_ms"] = round((perf_counter() - started) * 1000, 2)
+        return result
+
+    def _check_embedding_model(self, config: dict[str, object]) -> dict[str, object]:
+        model_name = str(config.get("model") or DEFAULT_EMBEDDING_SETTINGS.model_name).strip()
+        with self._model_cache_lock:
+            reused = model_name in self._embedding_models
+        model = self._get_embedding_model(model_name)
+        vectors = model.encode(["BookRecall 阅读记忆模型自检"], batch_size=1)
+        if not vectors or not vectors[0]:
+            raise LocalModelError("Embedding 模型没有返回有效向量。")
+        resolved = str(model.model_name)
+        return {
+            "component": "embedding",
+            "configured_model": model_name,
+            "resolved_model": resolved,
+            "local_path": Path(resolved).exists(),
+            "device": str(getattr(getattr(model, "_model", None), "device", "unknown")),
+            "dimension": len(vectors[0]),
+            "cache_reused": reused,
+        }
+
+    def _check_reranker_model(self, config: dict[str, object]) -> dict[str, object]:
+        model_name = str(config.get("model") or DEFAULT_RERANK_SETTINGS.model_name).strip()
+        batch_size = max(1, int(config.get("batch_size") or DEFAULT_RERANK_SETTINGS.batch_size))
+        max_chars = max(160, int(config.get("max_chars") or DEFAULT_RERANK_SETTINGS.max_chars))
+        max_length = max(256, int(config.get("max_length") or DEFAULT_RERANK_SETTINGS.max_length))
+        key = (model_name, batch_size, max_chars, max_length)
+        with self._model_cache_lock:
+            reused = key in self._reranker_models
+        model = self._get_reranker_model(
+            model_name,
+            batch_size=batch_size,
+            max_chars=max_chars,
+            max_length=max_length,
+        )
+        scores = model.score("星辰之匙有什么作用？", ["星辰之匙可以打开封印石门。"])
+        if not scores:
+            raise LocalModelError("Reranker 模型没有返回有效分数。")
+        resolved = str(model.model_name)
+        return {
+            "component": "reranker",
+            "configured_model": model_name,
+            "resolved_model": resolved,
+            "local_path": Path(resolved).exists(),
+            "device": str(getattr(getattr(model, "_model", None), "device", "unknown")),
+            "score": round(float(scores[0]), 6),
+            "batch_size": batch_size,
+            "max_chars": max_chars,
+            "max_length": max_length,
+            "cache_reused": reused,
+        }
 
     def list_books(self) -> list[dict[str, object]]:
         store = self._open_store()
@@ -447,10 +630,7 @@ class BookRecallWebService:
                     }
                 )
 
-            embedder = SentenceTransformerEmbedder(
-                model_name,
-                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
-            )
+            embedder = self._get_embedding_model(model_name)
             info = build_embedding_index(
                 store=store,
                 book_id=book_id,
@@ -638,16 +818,24 @@ class BookRecallWebService:
                     "chunk_count": info.chunk_count if info else 0,
                     "dimension": info.dimension if info else 0,
                     "path": info.path if info else None,
+                    "recommended_model": DEFAULT_EMBEDDING_SETTINGS.model_name,
+                    "recommended_model_match": _is_recommended_embedding_model(info.model_name) if info else None,
                 }
             )
 
         endpoint = os.getenv("BOOKRECALL_API_ENDPOINT") or "https://api.openai.com/v1/chat/completions"
         model = os.getenv("BOOKRECALL_MODEL") or "gpt-4o-mini"
+        with self._model_cache_lock:
+            model_runtime = {
+                "embedding_cached": len(self._embedding_models),
+                "reranker_cached": len(self._reranker_models),
+            }
         return {
             "dependencies": report,
             "vector_dir": str(vector_dir),
             "model_cache_dir": str(cache_dir),
             "vector_indexes": vector_indexes,
+            "model_runtime": model_runtime,
             "cloud": {
                 "env_key_available": bool(os.getenv("BOOKRECALL_API_KEY") or os.getenv("OPENAI_API_KEY")),
                 "endpoint": endpoint,
@@ -906,6 +1094,46 @@ class BookRecallWebService:
         finally:
             store.close()
 
+    def get_dynamic_index_audit(self, book_id: str, *, limit: int = 100) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            records = store.list_dynamic_index_audit(book_id, limit=limit)
+            stats = store.get_dynamic_index_audit_stats(book_id)
+            return {
+                "book_id": book_id,
+                "records": records,
+                "stats": stats,
+            }
+        finally:
+            store.close()
+
+    def review_dynamic_index_audit(
+        self,
+        *,
+        book_id: str,
+        audit_id: str,
+        action: str,
+        evidence: str | None = None,
+        summary: str | None = None,
+        confidence: float | None = None,
+        note: str = "",
+        expected_review_version: int | None = None,
+    ) -> dict[str, object]:
+        store = self._open_store()
+        try:
+            return store.review_dynamic_index_audit(
+                book_id=book_id,
+                audit_id=audit_id,
+                action=action,
+                evidence=evidence,
+                summary=summary,
+                confidence=confidence,
+                note=note,
+                expected_review_version=expected_review_version,
+            )
+        finally:
+            store.close()
+
     def list_themes(self, book_id: str) -> list[dict[str, object]]:
         store = self._open_store()
         try:
@@ -993,10 +1221,7 @@ class BookRecallWebService:
             if store.get_book(book_id) is None:
                 raise LocalModelError(f"没有找到 book_id={book_id}，请先创建书籍索引。")
             configure_local_model_cache(default_cache_root(self.db_path))
-            embedder = SentenceTransformerEmbedder(
-                model_name or DEFAULT_EMBEDDING_SETTINGS.model_name,
-                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
-            )
+            embedder = self._get_embedding_model(model_name or DEFAULT_EMBEDDING_SETTINGS.model_name)
             info = build_embedding_index(
                 store=store,
                 book_id=book_id,
@@ -1321,12 +1546,14 @@ class BookRecallWebService:
             if store.get_book(book_id) is None:
                 raise ValueError(f"没有找到 book_id={book_id}。")
             retriever = self._make_retriever(store, book_id, retriever_mode, rerank_config=rerank_config)
+            retrieval_runtime = self._retriever_runtime(retriever, book_id)
             hits = retriever.search(book_id, query, max_chapter=progress_chapter)[:limit]
             return {
                 "book_id": book_id,
                 "query": query,
                 "retriever": retriever_mode,
                 "effective_retriever": type(retriever).__name__,
+                "retrieval_runtime": retrieval_runtime,
                 "progress_chapter": progress_chapter,
                 "hits": [
                     {
@@ -1500,6 +1727,26 @@ class BookRecallWebService:
             reasoner = self._make_reasoner(cloud_config)
             query_understanding_client = _make_smart_index_client(local_llm_config)
             policy = self._make_policy(agent_policy, reasoner, query_understanding_client)
+            local_model = None
+            if query_understanding_client is not None:
+                local_config = local_llm_config or {}
+                local_model_path = str(local_config.get("model_path") or "").strip()
+                local_model = (
+                    str(local_config.get("model") or "").strip()
+                    or (Path(local_model_path).stem if local_model_path else "")
+                    or "local-qwen"
+                )
+            execution_runtime = {
+                "retriever": retriever_mode,
+                "retrieval": self._retriever_runtime(retriever, book_id),
+                "agent_policy": agent_policy,
+                "effective_policy": self._effective_policy_name(agent_policy, reasoner, query_understanding_client),
+                "cloud_reasoner_enabled": reasoner.enabled,
+                "cloud_model": reasoner.model if reasoner.enabled else None,
+                "local_query_understanding_enabled": query_understanding_client is not None,
+                "local_query_understanding_model": local_model,
+                "force_exact_search": force_exact_search,
+            }
             agent = BookRecallAgent(
                 store,
                 policy=policy,
@@ -1507,6 +1754,7 @@ class BookRecallWebService:
                 reasoner=reasoner,
                 query_understanding_client=query_understanding_client,
                 force_exact_search=force_exact_search,
+                execution_runtime=execution_runtime,
             )
             card = agent.ask_card(
                 book_id=book_id,
@@ -1517,15 +1765,7 @@ class BookRecallWebService:
             )
             payload = agent.to_payload(card)
             payload["rendered_text"] = agent.render_text(card)
-            payload["runtime"] = {
-                "retriever": retriever_mode,
-                "agent_policy": agent_policy,
-                "effective_policy": self._effective_policy_name(agent_policy, reasoner, query_understanding_client),
-                "cloud_reasoner_enabled": reasoner.enabled,
-                "cloud_model": reasoner.model if reasoner.enabled else None,
-                "local_query_understanding_enabled": query_understanding_client is not None,
-                "force_exact_search": force_exact_search,
-            }
+            payload["runtime"] = execution_runtime
             if session_id:
                 session_data = {
                     "book_id": book_id,
@@ -1541,6 +1781,34 @@ class BookRecallWebService:
             return payload
         finally:
             store.close()
+
+    def _retriever_runtime(self, retriever: Retriever, book_id: str) -> dict[str, object]:
+        rerank_enabled = isinstance(retriever, RerankingRetriever)
+        base = retriever.base if rerank_enabled else retriever
+        result: dict[str, object] = {
+            "effective_retriever": type(retriever).__name__,
+            "base_retriever": type(base).__name__,
+            "reranker_enabled": rerank_enabled,
+        }
+        if isinstance(base, EmbeddingRetriever):
+            info = get_vector_index_info(default_vector_dir(self.db_path), book_id)
+            result.update(
+                {
+                    "mode": "embedding",
+                    "vector_model": info.model_name if info else str(base.embedder.model_name),
+                    "vector_backend": info.backend if info else "unknown",
+                    "vector_chunks": info.chunk_count if info else 0,
+                    "recommended_model_match": _is_recommended_embedding_model(info.model_name) if info else False,
+                }
+            )
+        else:
+            result["mode"] = "lexical"
+        if rerank_enabled:
+            result["reranker_model"] = str(retriever.reranker.model_name)
+            result["rerank_batch_size"] = int(retriever.reranker.batch_size)
+            result["rerank_max_chars"] = int(retriever.reranker.max_chars)
+            result["rerank_max_length"] = int(retriever.reranker.max_length)
+        return result
 
     def _make_retriever(
         self,
@@ -1567,11 +1835,7 @@ class BookRecallWebService:
             raise LocalModelError("这本书还没有向量索引，请先运行 embed-build，或在网页端选择倒排检索。")
 
         try:
-            configure_local_model_cache(default_cache_root(self.db_path))
-            embedder = SentenceTransformerEmbedder(
-                info.model_name,
-                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
-            )
+            embedder = self._get_embedding_model(info.model_name)
             base = EmbeddingRetriever(store, search_settings, index_dir=vector_dir, embedder=embedder)
             return self._wrap_reranker(base, rerank_config)
         except LocalModelError:
@@ -1584,11 +1848,11 @@ class BookRecallWebService:
         if not config or not bool(config.get("enabled")):
             return base
         try:
-            configure_local_model_cache(default_cache_root(self.db_path))
-            reranker = CrossEncoderReranker(
+            reranker = self._get_reranker_model(
                 str(config.get("model") or DEFAULT_RERANK_SETTINGS.model_name),
-                cache_dir=default_sentence_transformers_cache_dir(self.db_path),
                 batch_size=int(config.get("batch_size") or DEFAULT_RERANK_SETTINGS.batch_size),
+                max_chars=int(config.get("max_chars") or DEFAULT_RERANK_SETTINGS.max_chars),
+                max_length=int(config.get("max_length") or DEFAULT_RERANK_SETTINGS.max_length),
             )
             return RerankingRetriever(base, reranker, DEFAULT_SEARCH_SETTINGS)
         except Exception as exc:  # noqa: BLE001 - reranker is an optional precision layer
@@ -1728,6 +1992,17 @@ class BookRecallHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/books/") and path.endswith("/stats"):
             book_id = path[len("/api/books/") : -len("/stats")].strip("/")
             self._send_json({"book_id": book_id, "stats": self.service.get_book_stats(book_id)})
+            return
+
+        if path.startswith("/api/books/") and path.endswith("/dynamic-audit"):
+            book_id = path[len("/api/books/") : -len("/dynamic-audit")].strip("/")
+            query = parse_qs(parsed.query)
+            limit_raw = query.get("limit", ["100"])[0]
+            try:
+                limit = max(1, min(500, int(limit_raw)))
+            except ValueError:
+                limit = 100
+            self._send_json(self.service.get_dynamic_index_audit(book_id, limit=limit))
             return
 
         if path.startswith("/api/books/") and path.endswith("/themes"):
@@ -1870,6 +2145,23 @@ class BookRecallHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/models/check":
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                config = payload.get("config")
+                if not isinstance(config, dict):
+                    config = {}
+                self._send_json(
+                    {
+                        "check": self.service.check_model(
+                            component=str(payload.get("component") or "").strip(),
+                            config=config,
+                        )
+                    }
+                )
+                return
+
             if parsed.path == "/api/books/build-job":
                 payload = self._read_json_body()
                 if payload is None:
@@ -2064,6 +2356,38 @@ class BookRecallHandler(BaseHTTPRequestHandler):
                 else:
                     tags = []
                 self._send_json({"book": self.service.update_book_metadata(book_id, book_group=book_group, tags=tags)})
+                return
+
+            if parsed.path.startswith("/api/books/") and parsed.path.endswith("/dynamic-audit/review"):
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                book_id = parsed.path[len("/api/books/") : -len("/dynamic-audit/review")].strip("/")
+                audit_id = str(payload.get("audit_id") or "").strip()
+                action = str(payload.get("action") or "").strip().lower()
+                if not audit_id or not action:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "audit_id 和 action 不能为空。")
+                    return
+                confidence_raw = payload.get("confidence")
+                version_raw = payload.get("expected_review_version")
+                confidence = float(confidence_raw) if confidence_raw not in (None, "") else None
+                expected_version = int(version_raw) if version_raw not in (None, "") else None
+                evidence_raw = payload.get("evidence")
+                summary_raw = payload.get("summary")
+                self._send_json(
+                    {
+                        "review": self.service.review_dynamic_index_audit(
+                            book_id=book_id,
+                            audit_id=audit_id,
+                            action=action,
+                            evidence=str(evidence_raw) if evidence_raw is not None else None,
+                            summary=str(summary_raw) if summary_raw is not None else None,
+                            confidence=confidence,
+                            note=str(payload.get("note") or ""),
+                            expected_review_version=expected_version,
+                        )
+                    }
+                )
                 return
 
             if parsed.path.startswith("/api/books/") and parsed.path.endswith("/preferences"):

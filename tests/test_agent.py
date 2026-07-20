@@ -1,4 +1,5 @@
 import sys
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,7 @@ if str(SRC) not in sys.path:
 from bookrecall.agent import BookRecallAgent
 from bookrecall.chunking import build_chunk_hierarchy
 from bookrecall.config import DEFAULT_CHUNK_SETTINGS
-from bookrecall.entity_index import build_entity_records
+from bookrecall.entity_index import build_entity_records, build_theme_records
 from bookrecall.models import MemoryCard, SearchHit
 from bookrecall.parser import parse_chapters
 from bookrecall.storage import BookRecallStore
@@ -46,6 +47,7 @@ class BookRecallAgentTest(unittest.TestCase):
             {"星辰之匙": ["钥匙"], "黑衣人": ["黑袍人"], "林澈": []},
             DEFAULT_CHUNK_SETTINGS,
         )
+        theme_records = build_theme_records(chapters, {"自由": []}, DEFAULT_CHUNK_SETTINGS)
         self.store.replace_book(
             book_id="sample",
             title="测试书",
@@ -54,6 +56,7 @@ class BookRecallAgentTest(unittest.TestCase):
             parent_chunks=parents,
             child_chunks=children,
             entity_records=entity_records,
+            theme_records=theme_records,
         )
         self.agent = BookRecallAgent(self.store)
 
@@ -120,6 +123,23 @@ class BookRecallAgentTest(unittest.TestCase):
         self.assertIn("自由残缺变", card.evidence[0].excerpt)
         self.assertIn("原文精确命中", card.evidence[0].reason)
 
+    def test_long_proper_noun_automatically_outranks_short_entity(self) -> None:
+        class BlindRetriever:
+            def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+                return []
+
+        agent = BookRecallAgent(self.store, retriever=BlindRetriever())
+        card = agent.ask_card(
+            book_id="sample",
+            question="自由残缺变是什么？",
+            progress_chapter=3,
+        )
+
+        self.assertIsNone(card.entity_name)
+        self.assertEqual(card.query_understanding["forced_exact_keyword"], "自由残缺变")
+        self.assertEqual(card.query_understanding["exact_search_source"], "auto_long_proper_noun")
+        self.assertIn("自由残缺变", card.evidence[0].excerpt)
+
     def test_alias_resolution(self) -> None:
         card = self.agent.ask_card(
             book_id="sample",
@@ -161,6 +181,77 @@ class BookRecallAgentTest(unittest.TestCase):
         self.assertIn("第 3 章", second.answer)
         self.assertEqual(len(turns), 2)
         self.assertEqual(turns[-1]["entity_name"], "黑衣人")
+
+    def test_session_memory_persists_execution_runtime(self) -> None:
+        runtime = {
+            "effective_policy": "rule_based",
+            "retrieval": {
+                "mode": "embedding",
+                "vector_model": "Qwen/Qwen3-Embedding-0.6B",
+                "vector_backend": "faiss",
+                "reranker_enabled": True,
+                "reranker_model": "Qwen/Qwen3-Reranker-0.6B",
+            },
+        }
+        agent = BookRecallAgent(self.store, execution_runtime=runtime)
+
+        agent.ask_card(
+            book_id="sample",
+            question="星辰之匙第一次出现在哪一章？",
+            progress_chapter=3,
+            session_id="runtime-session",
+        )
+        turns = self.store.list_agent_turns("sample", "default", "runtime-session", limit=10)
+
+        self.assertEqual(turns[0]["runtime"], runtime)
+        copied = self.store.copy_agent_turns_to_session(
+            book_id="sample",
+            user_id="default",
+            source_turns=turns,
+            target_session_id="runtime-copy",
+        )
+        copied_turns = self.store.list_agent_turns("sample", "default", "runtime-copy", limit=10)
+        self.assertEqual(copied, 1)
+        self.assertEqual(copied_turns[0]["runtime"], runtime)
+
+    def test_initialize_migrates_agent_memory_runtime_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            legacy_path = str(Path(tempdir) / "legacy.db")
+            connection = sqlite3.connect(legacy_path)
+            connection.execute(
+                """
+                CREATE TABLE agent_memory (
+                    turn_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    turn_index INTEGER NOT NULL,
+                    question TEXT NOT NULL,
+                    intent TEXT NOT NULL,
+                    entity_name TEXT,
+                    answer TEXT NOT NULL,
+                    summary TEXT,
+                    progress_chapter INTEGER NOT NULL,
+                    matched_entities_json TEXT NOT NULL,
+                    trace_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            legacy_store = BookRecallStore(legacy_path)
+            legacy_store.initialize()
+            columns = {
+                str(row["name"]): str(row["dflt_value"])
+                for row in legacy_store.connection.execute("PRAGMA table_info(agent_memory)").fetchall()
+            }
+            legacy_store.close()
+
+        self.assertIn("runtime_json", columns)
+        self.assertEqual(columns["runtime_json"], "'{}'")
 
     def test_local_query_understanding_can_override_rule_intent(self) -> None:
         class FakeQueryClient:

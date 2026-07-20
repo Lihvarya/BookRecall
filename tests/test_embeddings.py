@@ -13,6 +13,7 @@ from bookrecall.chunking import build_chunk_hierarchy
 from bookrecall.config import DEFAULT_CHUNK_SETTINGS, DEFAULT_SEARCH_SETTINGS
 from bookrecall.embeddings import (
     EmbeddingRetriever,
+    RerankingRetriever,
     build_embedding_index,
     configure_local_model_cache,
     default_cache_root,
@@ -21,6 +22,7 @@ from bookrecall.embeddings import (
     get_vector_index_info,
 )
 from bookrecall.entity_index import build_entity_records
+from bookrecall.models import SearchHit
 from bookrecall.parser import parse_chapters
 from bookrecall.storage import BookRecallStore
 
@@ -52,6 +54,40 @@ class TinyEmbedder:
                 ]
             )
         return vectors
+
+
+class CapturingReranker:
+    max_chars = 60
+
+    def __init__(self) -> None:
+        self.documents: list[str] = []
+
+    def score(self, query: str, documents: list[str]) -> list[float]:
+        self.documents = documents
+        return [1.0, 0.5]
+
+
+class StaticRetriever:
+    def search(self, book_id: str, query: str, max_chapter: int | None = None) -> list[SearchHit]:
+        child = "关键命中片段"
+        return [
+            SearchHit(
+                score=0.8,
+                chapter_number=1,
+                chapter_title="答案",
+                parent_id="p1",
+                child_text=child,
+                parent_text=f"{'前文' * 80}{child}{'后文' * 80}",
+            ),
+            SearchHit(
+                score=0.7,
+                chapter_number=2,
+                chapter_title="背景",
+                parent_id="p2",
+                child_text="普通背景",
+                parent_text="普通背景" * 30,
+            ),
+        ]
 
 
 class FakeFaissIndex:
@@ -211,6 +247,20 @@ class EmbeddingIndexTest(unittest.TestCase):
         )
         hits = retriever.search("sample", "黑袍人再次", max_chapter=2)
         self.assertTrue(all(hit.chapter_number <= 2 for hit in hits))
+
+    def test_reranker_centers_context_on_matched_child(self) -> None:
+        reranker = CapturingReranker()
+        retriever = RerankingRetriever(
+            StaticRetriever(),
+            reranker,  # type: ignore[arg-type]
+            DEFAULT_SEARCH_SETTINGS,
+        )
+
+        hits = retriever.search("sample", "关键问题")
+
+        self.assertTrue(hits)
+        self.assertIn("关键命中片段", reranker.documents[0])
+        self.assertTrue(all(len(document) <= reranker.max_chars for document in reranker.documents))
 
     def test_default_cache_paths_follow_project_layout(self) -> None:
         db_path = Path(self.tempdir.name) / ".bookrecall" / "bookrecall.db"

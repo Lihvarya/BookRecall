@@ -12,6 +12,7 @@ from collections import defaultdict
 from typing import Any, Callable, Protocol
 
 from .config import ChunkSettings
+from .index_quality import event_supported, relation_supported
 from .models import Chapter, EntityRecord, EventRecord, RelationMention, RelationRecord
 
 
@@ -163,7 +164,14 @@ def build_smart_relation_event_records(
             if parsed is None:
                 continue
             source, target, relation_type, evidence = parsed
-            evidence = _safe_evidence(chapter.content, evidence, [source, target], settings.max_excerpt_chars)
+            evidence = _safe_relation_evidence(
+                chapter.content,
+                evidence,
+                source,
+                target,
+                relation_type,
+                settings.max_excerpt_chars,
+            )
             if not evidence:
                 continue
             ordered_source, ordered_target = sorted((source, target))
@@ -183,7 +191,7 @@ def build_smart_relation_event_records(
                 continue
             event_type, summary, evidence, entities = parsed_event
             evidence = _safe_evidence(chapter.content, evidence or summary, entities, settings.max_excerpt_chars)
-            if not evidence:
+            if not evidence or not event_supported(event_type, summary or evidence, evidence):
                 continue
             key = (chapter.number, evidence)
             if key in seen_events:
@@ -452,15 +460,46 @@ def _compose_event_summary(event_type: str, item: dict) -> str:
     return "；".join(parts)
 
 
-def _safe_evidence(content: str, evidence: str, entities: list[str], max_chars: int) -> str:
+def _safe_evidence(
+    content: str,
+    evidence: str,
+    entities: list[str],
+    max_chars: int,
+    *,
+    require_all: bool = False,
+) -> str:
     cleaned = " ".join(evidence.split()).strip()
-    if cleaned and cleaned in content:
+    required = [entity for entity in entities if entity]
+    if require_all:
+        evidence_has_entities = not required or all(entity in cleaned for entity in required)
+    else:
+        evidence_has_entities = not required or any(entity in cleaned for entity in required)
+    if cleaned and cleaned in content and evidence_has_entities:
         return _trim(cleaned, max_chars)
     for sentence in _split_sentences(content):
         if all(entity in sentence for entity in entities[:2]):
             return _trim(sentence, max_chars)
+    if require_all:
+        return ""
     for sentence in _split_sentences(content):
         if any(entity in sentence for entity in entities):
+            return _trim(sentence, max_chars)
+    return ""
+
+
+def _safe_relation_evidence(
+    content: str,
+    evidence: str,
+    source: str,
+    target: str,
+    relation_type: str,
+    max_chars: int,
+) -> str:
+    cleaned = " ".join(evidence.split()).strip()
+    if cleaned and cleaned in content and source in cleaned and target in cleaned and relation_supported(relation_type, cleaned):
+        return _trim(cleaned, max_chars)
+    for sentence in _split_sentences(content):
+        if source in sentence and target in sentence and relation_supported(relation_type, sentence):
             return _trim(sentence, max_chars)
     return ""
 

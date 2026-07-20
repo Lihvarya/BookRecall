@@ -19,6 +19,7 @@ if str(SRC) not in sys.path:
 from bookrecall.chunking import build_chunk_hierarchy
 from bookrecall.config import DEFAULT_CHUNK_SETTINGS
 from bookrecall.entity_index import build_entity_records, build_event_records, build_relation_records, build_theme_records
+from bookrecall.models import EntityMention, EntityRecord
 from bookrecall.parser import parse_chapters
 from bookrecall.storage import BookRecallStore
 from bookrecall.web import make_server
@@ -42,6 +43,7 @@ class TinyWebEmbedder:
     def __init__(self, model_name: str, *, cache_dir: str | Path | None = None) -> None:
         self.model_name = model_name
         self.cache_dir = cache_dir
+        self._model = type("TinyDevice", (), {"device": "cpu"})()
 
     def encode(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
         vectors: list[list[float]] = []
@@ -54,6 +56,38 @@ class TinyWebEmbedder:
                 ]
             )
         return vectors
+
+
+class TinyWebReranker:
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        cache_dir: str | Path | None = None,
+        batch_size: int = 1,
+        max_chars: int = 384,
+        max_length: int = 512,
+    ) -> None:
+        self.model_name = model_name
+        self.cache_dir = cache_dir
+        self.batch_size = batch_size
+        self.max_chars = max_chars
+        self.max_length = max_length
+        self._model = type("TinyDevice", (), {"device": "cpu"})()
+
+    def score(self, query: str, documents: list[str]) -> list[float]:
+        return [0.9 for _ in documents]
+
+
+class FakeModelsResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps({"data": [{"id": "qwen3.5-4b"}]}).encode("utf-8")
 
 
 class BookRecallWebTest(unittest.TestCase):
@@ -122,6 +156,52 @@ class BookRecallWebTest(unittest.TestCase):
                 return last_job
             time.sleep(0.05)
         self.fail(f"Timed out waiting for index job {job_id}: {last_job}")
+
+    def test_web_service_reuses_embedding_model_instance(self) -> None:
+        service = self.server.RequestHandlerClass.service
+        with patch("bookrecall.web.SentenceTransformerEmbedder", TinyWebEmbedder):
+            first = service._get_embedding_model("test-cached-embedder")
+            second = service._get_embedding_model("test-cached-embedder")
+
+        self.assertIs(first, second)
+
+    def test_model_self_check_endpoint_runs_embedding_inference(self) -> None:
+        with patch("bookrecall.web.SentenceTransformerEmbedder", TinyWebEmbedder):
+            data = self._post_json(
+                "/api/models/check",
+                {"component": "embedding", "config": {"model": "test-self-check"}},
+            )
+
+        result = data["check"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["dimension"], 3)
+        self.assertEqual(result["device"], "cpu")
+        self.assertFalse(result["cache_reused"])
+
+    def test_model_self_check_reuses_reranker_and_reports_limits(self) -> None:
+        service = self.server.RequestHandlerClass.service
+        config = {"model": "test-reranker", "batch_size": 1, "max_chars": 384, "max_length": 512}
+        with patch("bookrecall.web.CrossEncoderReranker", TinyWebReranker):
+            first = service.check_model("reranker", config)
+            second = service.check_model("reranker", config)
+
+        self.assertTrue(first["ok"])
+        self.assertFalse(first["cache_reused"])
+        self.assertTrue(second["cache_reused"])
+        self.assertEqual(second["max_length"], 512)
+
+    def test_local_llm_self_check_probes_models_endpoint(self) -> None:
+        service = self.server.RequestHandlerClass.service
+        with patch("bookrecall.web.urllib.request.urlopen", return_value=FakeModelsResponse()) as mocked:
+            result = service.check_model(
+                "local_llm",
+                {"endpoint": "http://127.0.0.1:1234/v1/chat/completions", "model": "qwen3.5-4b"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["configured_model_found"])
+        self.assertEqual(result["available_models"], ["qwen3.5-4b"])
+        self.assertEqual(mocked.call_args.args[0].full_url, "http://127.0.0.1:1234/v1/models")
 
     def test_build_book_job_endpoint_reports_progress(self) -> None:
         data = self._post_json(
@@ -267,6 +347,10 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertEqual(data["dependencies"]["langgraph"], importlib.util.find_spec("langgraph.graph") is not None)
         self.assertIn("model_cache_dir", data)
         self.assertIn("vector_indexes", data)
+        self.assertIn("model_runtime", data)
+        sample_index = next(item for item in data["vector_indexes"] if item["book_id"] == "sample")
+        self.assertEqual(sample_index["recommended_model"], "Qwen/Qwen3-Embedding-0.6B")
+        self.assertIsNone(sample_index["recommended_model_match"])
         providers = data["cloud"]["providers"]
         provider_ids = [item["id"] for item in providers]
         self.assertIn("deepseek", provider_ids)
@@ -475,6 +559,134 @@ class BookRecallWebTest(unittest.TestCase):
             any("黑衣人" in {item["source_entity"], item["target_entity"]} for item in relations["relations"])
         )
 
+    def test_dynamic_index_audit_endpoint_returns_provenance_and_legacy_stats(self) -> None:
+        store = BookRecallStore(self.db_path)
+        store.initialize()
+        store.connection.execute(
+            """
+            INSERT INTO events(event_id, book_id, chapter_number, chapter_title, event_type, summary, excerpt)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "sample:event:dynamic:2:legacy",
+                "sample",
+                2,
+                "阴影",
+                "因果链",
+                "旧版动态记录",
+                "旧版动态记录没有审计元数据。",
+            ),
+        )
+        store.connection.commit()
+        store.upsert_dynamic_index_records(
+            book_id="sample",
+            entity_records=[
+                EntityRecord(
+                    name="白袍蛊仙",
+                    first_chapter_number=3,
+                    mentions=[
+                        EntityMention(
+                            entity_name="白袍蛊仙",
+                            chapter_number=3,
+                            excerpt="自由残缺变是白袍蛊仙提到的一记杀招。",
+                            position_in_chapter=0,
+                        )
+                    ],
+                    confidence=0.91,
+                )
+            ],
+            source_query="自由残缺变是谁提到的？",
+            source_model="qwen3.5-4b",
+            quality_gate="grounded_v2",
+        )
+        store.close()
+
+        payload = self._get_json("/api/books/sample/dynamic-audit?limit=20")
+
+        self.assertEqual(payload["book_id"], "sample")
+        self.assertEqual(len(payload["records"]), 1)
+        record = payload["records"][0]
+        self.assertEqual(record["record_kind"], "entity_mention")
+        self.assertEqual(record["chapter_number"], 3)
+        self.assertEqual(record["confidence"], 0.91)
+        self.assertEqual(record["source_query"], "自由残缺变是谁提到的？")
+        self.assertEqual(record["source_model"], "qwen3.5-4b")
+        self.assertEqual(record["quality_gate"], "grounded_v2")
+        self.assertIn("白袍蛊仙", record["evidence"])
+        self.assertEqual(payload["stats"]["tracked_total"], 1)
+        self.assertEqual(payload["stats"]["legacy_untracked"]["event"], 1)
+
+    def test_dynamic_index_review_endpoint_corrects_confirms_and_rejects_record(self) -> None:
+        store = BookRecallStore(self.db_path)
+        store.initialize()
+        store.upsert_dynamic_index_records(
+            book_id="sample",
+            entity_records=[
+                EntityRecord(
+                    name="白袍蛊仙",
+                    first_chapter_number=3,
+                    mentions=[
+                        EntityMention(
+                            entity_name="白袍蛊仙",
+                            chapter_number=3,
+                            excerpt="自由残缺变是白袍蛊仙提到的一记杀招。",
+                            position_in_chapter=0,
+                        )
+                    ],
+                    confidence=0.91,
+                )
+            ],
+            source_query="自由残缺变是谁提到的？",
+            source_model="qwen3.5-4b",
+            quality_gate="grounded_v2",
+        )
+        store.close()
+        audit = self._get_json("/api/books/sample/dynamic-audit?limit=20")["records"][0]
+        self.assertEqual(audit["details"]["entity_name"], "白袍蛊仙")
+        self.assertTrue(audit["details"]["record_exists"])
+
+        corrected = self._post_json(
+            "/api/books/sample/dynamic-audit/review",
+            {
+                "audit_id": audit["audit_id"],
+                "action": "correct",
+                "evidence": "自由残缺变是白袍蛊仙亲口提及的杀招。",
+                "confidence": 0.98,
+                "note": "已按原文章节修正",
+                "expected_review_version": 0,
+            },
+        )["review"]
+        self.assertEqual(corrected["record"]["status"], "active")
+        self.assertEqual(corrected["record"]["review_version"], 1)
+        self.assertEqual(corrected["record"]["confidence"], 0.98)
+        self.assertIn("亲口提及", corrected["record"]["details"]["evidence"])
+
+        confirmed = self._post_json(
+            "/api/books/sample/dynamic-audit/review",
+            {
+                "audit_id": audit["audit_id"],
+                "action": "confirm",
+                "note": "人工确认通过",
+                "expected_review_version": 1,
+            },
+        )["review"]
+        self.assertEqual(confirmed["record"]["status"], "confirmed")
+        self.assertEqual(confirmed["stats"]["confirmed_total"], 1)
+
+        rejected = self._post_json(
+            "/api/books/sample/dynamic-audit/review",
+            {
+                "audit_id": audit["audit_id"],
+                "action": "reject",
+                "note": "复核后决定不纳入索引",
+                "expected_review_version": 2,
+            },
+        )["review"]
+        self.assertEqual(rejected["record"]["status"], "rejected")
+        self.assertTrue(rejected["cleanup"]["deleted_record"])
+        self.assertFalse(rejected["record"]["details"]["record_exists"])
+        self.assertEqual(rejected["stats"]["rejected_total"], 1)
+
     def test_book_metadata_endpoint(self) -> None:
         saved = self._post_json(
             "/api/books/sample/metadata",
@@ -598,6 +810,7 @@ class BookRecallWebTest(unittest.TestCase):
         sample_index = next(item for item in runtime["vector_indexes"] if item["book_id"] == "sample")
         self.assertTrue(sample_index["built"])
         self.assertEqual(sample_index["model_name"], "test-web-embedder")
+        self.assertFalse(sample_index["recommended_model_match"])
 
         deleted = self._post_json("/api/books/sample/vectors/delete", {})
         self.assertGreaterEqual(deleted["vector_index"]["deleted_count"], 1)
@@ -663,6 +876,10 @@ class BookRecallWebTest(unittest.TestCase):
         search = data["search"]
         self.assertEqual(search["retriever"], "embedding")
         self.assertEqual(search["effective_retriever"], "EmbeddingRetriever")
+        self.assertEqual(search["retrieval_runtime"]["mode"], "embedding")
+        self.assertEqual(search["retrieval_runtime"]["vector_backend"], "numpy")
+        self.assertEqual(search["retrieval_runtime"]["vector_model"], "test-web-embedder")
+        self.assertFalse(search["retrieval_runtime"]["reranker_enabled"])
         self.assertTrue(search["hits"])
 
     def test_delete_book_endpoint(self) -> None:
@@ -691,6 +908,7 @@ class BookRecallWebTest(unittest.TestCase):
             {
                 "book_id": "sample",
                 "user_id": "alice",
+                "session_id": "runtime-options",
                 "question": "黑袍人第一次出现在哪一章？",
                 "agent_policy": "rule_based",
                 "retriever": "auto",
@@ -705,7 +923,10 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertEqual(answer["runtime"]["agent_policy"], "rule_based")
         self.assertEqual(answer["runtime"]["effective_policy"], "rule_based")
         self.assertEqual(answer["runtime"]["retriever"], "auto")
+        self.assertEqual(answer["runtime"]["retrieval"]["mode"], "lexical")
+        self.assertFalse(answer["runtime"]["retrieval"]["reranker_enabled"])
         self.assertFalse(answer["runtime"]["cloud_reasoner_enabled"])
+        self.assertEqual(answer["session"]["turns"][-1]["runtime"], answer["runtime"])
         self.assertIn("rendered_text", answer)
 
     def test_session_memory_via_api(self) -> None:
@@ -739,6 +960,10 @@ class BookRecallWebTest(unittest.TestCase):
         self.assertGreaterEqual(second["trace"][0]["elapsed_ms"], 0)
         self.assertIn(second["trace"][0]["status"], {"ok", "blocked"})
         self.assertIn("blocked_by_spoiler", second["trace"][0])
+        self.assertEqual(second["session"]["turns"][-1]["runtime"], second["runtime"])
+
+        history = self._get_json("/api/books/sample/session?user=alice&session=thread-1&limit=10")
+        self.assertEqual(history["turns"][-1]["runtime"], second["runtime"])
 
     def test_rerun_session_from_turn_replaces_following_turns(self) -> None:
         first = self._post_json(

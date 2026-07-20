@@ -3,10 +3,18 @@ from pathlib import Path
 
 from .agent import BookRecallAgent
 from .chunking import build_chunk_hierarchy
-from .config import DEFAULT_CHUNK_SETTINGS, DEFAULT_EMBEDDING_SETTINGS, DEFAULT_SEARCH_SETTINGS
+from .config import (
+    DEFAULT_CHUNK_SETTINGS,
+    DEFAULT_EMBEDDING_SETTINGS,
+    DEFAULT_RERANK_SETTINGS,
+    DEFAULT_SEARCH_SETTINGS,
+    SearchSettings,
+)
 from .embeddings import (
+    CrossEncoderReranker,
     EmbeddingRetriever,
     LocalModelError,
+    RerankingRetriever,
     SentenceTransformerEmbedder,
     build_embedding_index,
     configure_local_model_cache,
@@ -15,6 +23,16 @@ from .embeddings import (
     default_vector_dir,
     dependency_report,
     get_vector_index_info,
+)
+from .evaluation import (
+    EvaluationDataError,
+    UnavailableRetriever,
+    evaluate_agents,
+    evaluate_retrievers,
+    load_evaluation_cases,
+    render_evaluation_report,
+    report_as_json,
+    threshold_failures,
 )
 from .entity_index import (
     auto_discover_entities,
@@ -28,7 +46,7 @@ from .entity_index import (
 )
 from .local_llm import LocalChatClient, LocalLLMSettings
 from .parser import parse_chapters
-from .retrieval import LocalRetriever
+from .retrieval import LocalRetriever, Retriever
 from .smart_index import build_smart_relation_event_records, discover_entities_with_llm
 from .storage import BookRecallStore
 from .web import run_server
@@ -385,6 +403,193 @@ def search_embeddings(args: argparse.Namespace) -> None:
         print(f"  {hit.child_text[:160].strip()}")
 
 
+def evaluate_retrieval(args: argparse.Namespace) -> None:
+    cases = load_evaluation_cases(args.dataset, book_id_override=args.book_id)
+    book_ids = {case.book_id for case in cases}
+    if len(book_ids) != 1:
+        raise EvaluationDataError("一次评测只能包含一本书；请拆分数据集，或使用 --book-id 统一覆盖。")
+    if args.top_k <= 0:
+        raise EvaluationDataError("--top-k 必须大于 0。")
+    if args.rerank_candidates <= 0:
+        raise EvaluationDataError("--rerank-candidates 必须大于 0。")
+    if args.rerank_batch_size <= 0:
+        raise EvaluationDataError("--rerank-batch-size 必须大于 0。")
+    if args.rerank_max_chars < 160:
+        raise EvaluationDataError("--rerank-max-chars 不能小于 160。")
+    if args.rerank_max_length < 256:
+        raise EvaluationDataError("--rerank-max-length 不能小于 256。")
+    for name, value in (("min-top1", args.min_top1), ("min-mrr", args.min_mrr)):
+        if value is not None and not 0.0 <= value <= 1.0:
+            raise EvaluationDataError(f"--{name} 必须在 0 到 1 之间。")
+
+    book_id = next(iter(book_ids))
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        if store.get_book(book_id) is None:
+            raise EvaluationDataError(f"数据库中没有找到 book_id={book_id}。")
+        retrievers = _make_evaluation_retrievers(args, store, book_id)
+        report = evaluate_retrievers(
+            cases,
+            retrievers,
+            dataset_name=str(Path(args.dataset).name),
+            top_k=args.top_k,
+        )
+    finally:
+        store.close()
+
+    print(report_as_json(report) if args.format == "json" else render_evaluation_report(report))
+    failures = threshold_failures(
+        report,
+        min_top1=args.min_top1,
+        min_mrr=args.min_mrr,
+        fail_on_error=args.fail_on_error,
+    )
+    if failures:
+        print("\n评测门禁失败：")
+        for failure in failures:
+            print(f"- {failure}")
+        raise SystemExit(1)
+
+
+def evaluate_agent_workflow(args: argparse.Namespace) -> None:
+    cases = load_evaluation_cases(args.dataset, book_id_override=args.book_id)
+    book_ids = {case.book_id for case in cases}
+    if len(book_ids) != 1:
+        raise EvaluationDataError("一次评测只能包含一本书；请拆分数据集，或使用 --book-id 统一覆盖。")
+    if args.top_k <= 0:
+        raise EvaluationDataError("--top-k 必须大于 0。")
+    if args.rerank_candidates <= 0 or args.rerank_batch_size <= 0:
+        raise EvaluationDataError("Reranker 候选数和批大小必须大于 0。")
+    if args.rerank_max_chars < 160:
+        raise EvaluationDataError("--rerank-max-chars 不能小于 160。")
+    if args.rerank_max_length < 256:
+        raise EvaluationDataError("--rerank-max-length 不能小于 256。")
+    for name, value in (("min-top1", args.min_top1), ("min-mrr", args.min_mrr)):
+        if value is not None and not 0.0 <= value <= 1.0:
+            raise EvaluationDataError(f"--{name} 必须在 0 到 1 之间。")
+
+    book_id = next(iter(book_ids))
+    store = BookRecallStore(args.db)
+    try:
+        store.initialize()
+        if store.get_book(book_id) is None:
+            raise EvaluationDataError(f"数据库中没有找到 book_id={book_id}。")
+        retrievers = _make_evaluation_retrievers(args, store, book_id)
+        agents = {
+            f"agent:{method}": BookRecallAgent(store, retriever=retriever)
+            for method, retriever in retrievers.items()
+        }
+        report = evaluate_agents(
+            cases,
+            agents,
+            dataset_name=str(Path(args.dataset).name),
+            top_k=args.top_k,
+        )
+    finally:
+        store.close()
+
+    print(report_as_json(report) if args.format == "json" else render_evaluation_report(report))
+    failures = threshold_failures(
+        report,
+        min_top1=args.min_top1,
+        min_mrr=args.min_mrr,
+        fail_on_error=args.fail_on_error,
+        fail_on_spoiler=args.fail_on_spoiler,
+    )
+    if failures:
+        print("\n评测门禁失败：")
+        for failure in failures:
+            print(f"- {failure}")
+        raise SystemExit(1)
+
+
+def _make_evaluation_retrievers(
+    args: argparse.Namespace,
+    store: BookRecallStore,
+    book_id: str,
+) -> dict[str, Retriever]:
+    requested = [item.strip().lower() for item in str(args.retrievers).split(",") if item.strip()]
+    allowed = {"lexical", "embedding", "embedding-rerank", "lexical-rerank"}
+    unknown = [item for item in requested if item not in allowed]
+    if not requested:
+        raise EvaluationDataError("--retrievers 至少需要一个检索器。")
+    if unknown:
+        raise EvaluationDataError(f"未知评测检索器：{', '.join(unknown)}。")
+    requested = list(dict.fromkeys(requested))
+
+    candidate_count = max(args.top_k, args.rerank_candidates)
+    candidate_settings = SearchSettings(
+        top_k_children=max(DEFAULT_SEARCH_SETTINGS.top_k_children, candidate_count * 2),
+        top_k_parents=candidate_count,
+    )
+    output_settings = SearchSettings(
+        top_k_children=max(DEFAULT_SEARCH_SETTINGS.top_k_children, args.top_k),
+        top_k_parents=args.top_k,
+    )
+    lexical = LocalRetriever(store, candidate_settings)
+
+    needs_embedding = any(item.startswith("embedding") for item in requested)
+    embedding: Retriever | None = None
+    if needs_embedding:
+        index_dir = args.vector_dir or default_vector_dir(args.db)
+        info = get_vector_index_info(index_dir, book_id)
+        if info is None:
+            embedding = UnavailableRetriever("未找到本书向量索引，请先运行 embed-build。")
+        else:
+            try:
+                configure_local_model_cache(default_cache_root(args.db))
+                embedder = SentenceTransformerEmbedder(
+                    info.model_name,
+                    cache_dir=default_sentence_transformers_cache_dir(args.db),
+                )
+                embedding = EmbeddingRetriever(
+                    store,
+                    candidate_settings,
+                    index_dir=index_dir,
+                    embedder=embedder,
+                )
+            except Exception as exc:  # noqa: BLE001 - report unavailability per method
+                embedding = UnavailableRetriever(f"Embedding 检索器加载失败：{exc}")
+
+    reranker: CrossEncoderReranker | Exception | None = None
+    if any(item.endswith("-rerank") for item in requested):
+        try:
+            configure_local_model_cache(default_cache_root(args.db))
+            reranker = CrossEncoderReranker(
+                args.reranker_model,
+                cache_dir=default_sentence_transformers_cache_dir(args.db),
+                batch_size=args.rerank_batch_size,
+                max_chars=args.rerank_max_chars,
+                max_length=args.rerank_max_length,
+            )
+        except Exception as exc:  # noqa: BLE001 - report unavailability per method
+            reranker = exc
+
+    retrievers: dict[str, Retriever] = {}
+    for method in requested:
+        if method == "lexical":
+            retrievers[method] = lexical
+        elif method == "embedding":
+            retrievers[method] = embedding or UnavailableRetriever("Embedding 检索器未初始化。")
+        elif method == "lexical-rerank":
+            if isinstance(reranker, Exception):
+                retrievers[method] = UnavailableRetriever(f"Reranker 加载失败：{reranker}")
+            elif reranker is None:
+                retrievers[method] = UnavailableRetriever("Reranker 未初始化。")
+            else:
+                retrievers[method] = RerankingRetriever(lexical, reranker, output_settings)
+        elif isinstance(embedding, UnavailableRetriever):
+            retrievers[method] = UnavailableRetriever(embedding.reason)
+        elif isinstance(reranker, Exception):
+            retrievers[method] = UnavailableRetriever(f"Reranker 加载失败：{reranker}")
+        elif embedding is None or reranker is None:
+            retrievers[method] = UnavailableRetriever("Embedding 或 Reranker 未初始化。")
+        else:
+            retrievers[method] = RerankingRetriever(embedding, reranker, output_settings)
+    return retrievers
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BookRecall 阅读记忆助手 MVP")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -488,6 +693,99 @@ def build_parser() -> argparse.ArgumentParser:
     embed_search_cmd.add_argument("--vector-dir", help="向量索引目录，默认与数据库同目录下的 vectors")
     embed_search_cmd.set_defaults(func=search_embeddings)
 
+    eval_retrieval_cmd = subparsers.add_parser("eval-retrieval", help="用标注问题集评测本地召回质量")
+    eval_retrieval_cmd.add_argument("--dataset", required=True, help="JSONL 或 JSON 评测数据集路径")
+    eval_retrieval_cmd.add_argument("--book-id", help="覆盖数据集中的 book_id，适合在不同本地书籍 ID 上复用问题集")
+    eval_retrieval_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    eval_retrieval_cmd.add_argument(
+        "--retrievers",
+        default="lexical,embedding",
+        help="逗号分隔：lexical、embedding、lexical-rerank、embedding-rerank",
+    )
+    eval_retrieval_cmd.add_argument("--top-k", type=int, default=4, help="统计前 K 个 Parent 命中，默认 4")
+    eval_retrieval_cmd.add_argument("--vector-dir", help="向量索引目录，默认与数据库同目录下的 vectors")
+    eval_retrieval_cmd.add_argument(
+        "--reranker-model",
+        default=DEFAULT_RERANK_SETTINGS.model_name,
+        help="CrossEncoder Reranker 模型名或本地目录",
+    )
+    eval_retrieval_cmd.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=DEFAULT_RERANK_SETTINGS.candidate_count,
+        help="进入 Reranker 的候选数",
+    )
+    eval_retrieval_cmd.add_argument(
+        "--rerank-batch-size",
+        type=int,
+        default=DEFAULT_RERANK_SETTINGS.batch_size,
+        help="Reranker 批大小",
+    )
+    eval_retrieval_cmd.add_argument(
+        "--rerank-max-chars",
+        type=int,
+        default=DEFAULT_RERANK_SETTINGS.max_chars,
+        help="每条候选送入 Reranker 的最大字符数",
+    )
+    eval_retrieval_cmd.add_argument(
+        "--rerank-max-length",
+        type=int,
+        default=DEFAULT_RERANK_SETTINGS.max_length,
+        help="Reranker tokenizer 最大序列长度",
+    )
+    eval_retrieval_cmd.add_argument("--format", choices=("text", "json"), default="text", help="评测报告格式")
+    eval_retrieval_cmd.add_argument("--min-top1", type=float, help="Top1 最低门禁，未达到时退出码为 1")
+    eval_retrieval_cmd.add_argument("--min-mrr", type=float, help="MRR 最低门禁，未达到时退出码为 1")
+    eval_retrieval_cmd.add_argument("--fail-on-error", action="store_true", help="任一检索器执行错误时令门禁失败")
+    eval_retrieval_cmd.set_defaults(func=evaluate_retrieval)
+
+    eval_agent_cmd = subparsers.add_parser("eval-agent", help="评测规则 Agent 的工具路由、最终证据和防剧透")
+    eval_agent_cmd.add_argument("--dataset", required=True, help="JSONL 或 JSON 评测数据集路径")
+    eval_agent_cmd.add_argument("--book-id", help="覆盖数据集中的 book_id")
+    eval_agent_cmd.add_argument("--db", default=".bookrecall/bookrecall.db", help="SQLite 数据库路径")
+    eval_agent_cmd.add_argument(
+        "--retrievers",
+        default="lexical",
+        help="逗号分隔：lexical、embedding、lexical-rerank、embedding-rerank",
+    )
+    eval_agent_cmd.add_argument("--top-k", type=int, default=4, help="统计最终前 K 条证据，默认 4")
+    eval_agent_cmd.add_argument("--vector-dir", help="向量索引目录，默认与数据库同目录下的 vectors")
+    eval_agent_cmd.add_argument(
+        "--reranker-model",
+        default=DEFAULT_RERANK_SETTINGS.model_name,
+        help="CrossEncoder Reranker 模型名或本地目录",
+    )
+    eval_agent_cmd.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=DEFAULT_RERANK_SETTINGS.candidate_count,
+        help="进入 Reranker 的候选数",
+    )
+    eval_agent_cmd.add_argument(
+        "--rerank-batch-size",
+        type=int,
+        default=DEFAULT_RERANK_SETTINGS.batch_size,
+        help="Reranker 批大小",
+    )
+    eval_agent_cmd.add_argument(
+        "--rerank-max-chars",
+        type=int,
+        default=DEFAULT_RERANK_SETTINGS.max_chars,
+        help="每条候选送入 Reranker 的最大字符数",
+    )
+    eval_agent_cmd.add_argument(
+        "--rerank-max-length",
+        type=int,
+        default=DEFAULT_RERANK_SETTINGS.max_length,
+        help="Reranker tokenizer 最大序列长度",
+    )
+    eval_agent_cmd.add_argument("--format", choices=("text", "json"), default="text", help="评测报告格式")
+    eval_agent_cmd.add_argument("--min-top1", type=float, help="Top1 最低门禁，未达到时退出码为 1")
+    eval_agent_cmd.add_argument("--min-mrr", type=float, help="MRR 最低门禁，未达到时退出码为 1")
+    eval_agent_cmd.add_argument("--fail-on-error", action="store_true", help="任一 Agent 执行错误时令门禁失败")
+    eval_agent_cmd.add_argument("--fail-on-spoiler", action="store_true", help="任一证据越过 max_chapter 时令门禁失败")
+    eval_agent_cmd.set_defaults(func=evaluate_agent_workflow)
+
     return parser
 
 
@@ -498,6 +796,8 @@ def main() -> None:
         args.func(args)
     except LocalModelError as exc:
         parser.exit(2, f"本地小模型不可用：{exc}\n")
+    except EvaluationDataError as exc:
+        parser.exit(2, f"评测数据无效：{exc}\n")
 
 
 if __name__ == "__main__":

@@ -13,11 +13,40 @@ export interface RuntimeStatus {
   vector_dir?: string;
   model_cache_dir?: string;
   vector_indexes?: VectorIndexSummary[];
+  model_runtime?: {
+    embedding_cached?: number;
+    reranker_cached?: number;
+  };
   cloud?: {
     providers?: CloudProvider[];
   };
   agent_policies?: RuntimeOption[];
   retrievers?: RuntimeOption[];
+}
+
+export interface ModelCheckResult {
+  ok: boolean;
+  component: "embedding" | "reranker" | "local_llm" | string;
+  configured_model?: string;
+  resolved_model?: string;
+  local_path?: boolean;
+  device?: string;
+  dimension?: number;
+  score?: number;
+  batch_size?: number;
+  max_chars?: number;
+  max_length?: number;
+  cache_reused?: boolean;
+  mode?: string;
+  endpoint?: string;
+  models_endpoint?: string;
+  available_models?: string[];
+  configured_model_found?: boolean;
+  file_size_mb?: number;
+  load_tested?: boolean;
+  note?: string;
+  elapsed_ms?: number;
+  error?: string;
 }
 
 export interface DiagnosticsStatus {
@@ -85,6 +114,35 @@ export interface VectorIndexSummary {
   chunk_count?: number;
   dimension?: number;
   path?: string;
+  recommended_model?: string;
+  recommended_model_match?: boolean | null;
+}
+
+export interface RetrievalRuntime {
+  effective_retriever?: string;
+  base_retriever?: string;
+  mode?: "lexical" | "embedding" | string;
+  vector_model?: string;
+  vector_backend?: string;
+  vector_chunks?: number;
+  recommended_model_match?: boolean;
+  reranker_enabled?: boolean;
+  reranker_model?: string;
+  rerank_batch_size?: number;
+  rerank_max_chars?: number;
+  rerank_max_length?: number;
+}
+
+export interface AnswerRuntime {
+  retriever?: string;
+  retrieval?: RetrievalRuntime;
+  agent_policy?: string;
+  effective_policy?: string;
+  cloud_reasoner_enabled?: boolean;
+  cloud_model?: string | null;
+  local_query_understanding_enabled?: boolean;
+  local_query_understanding_model?: string | null;
+  force_exact_search?: boolean;
 }
 
 export interface IndexJob {
@@ -142,6 +200,66 @@ export interface RelationSummary {
   mention_count: number;
 }
 
+export interface DynamicAuditRecord {
+  audit_id: string;
+  record_kind: "entity_mention" | "relation_mention" | "event" | string;
+  record_id: string;
+  chapter_number: number;
+  confidence: number;
+  source_type: string;
+  source_query: string;
+  source_model: string;
+  quality_gate: string;
+  evidence: string;
+  status: string;
+  original_evidence?: string;
+  review_note?: string;
+  reviewed_at?: string;
+  review_version: number;
+  details?: DynamicAuditDetails;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface DynamicAuditDetails {
+  record_exists?: boolean;
+  mutable?: boolean;
+  label?: string;
+  entity_name?: string;
+  source_entity?: string;
+  target_entity?: string;
+  relation_type?: string;
+  event_type?: string;
+  summary?: string;
+  chapter_number?: number;
+  chapter_title?: string;
+  evidence?: string;
+  entities?: string[];
+}
+
+export interface DynamicAuditStats {
+  tracked: Record<string, number>;
+  by_status: Record<string, number>;
+  dynamic_totals: Record<string, number>;
+  legacy_untracked: Record<string, number>;
+  tracked_total: number;
+  legacy_untracked_total: number;
+  pending_total: number;
+  confirmed_total: number;
+  rejected_total: number;
+}
+
+export interface DynamicAuditReviewResult {
+  action: "confirm" | "correct" | "reject" | string;
+  record: DynamicAuditRecord;
+  cleanup?: {
+    deleted_record?: boolean;
+    deleted_parent?: boolean;
+    protected_existing_record?: boolean;
+  };
+  stats: DynamicAuditStats;
+}
+
 export interface EvidenceItem {
   chapter_number: number;
   chapter_title?: string;
@@ -177,6 +295,7 @@ export interface SessionTurn {
   matched_entities?: string[];
   trace?: TraceItem[];
   evidence?: EvidenceItem[];
+  runtime?: AnswerRuntime;
 }
 
 export interface SessionSummary {
@@ -282,7 +401,7 @@ export interface AnswerCard {
   query_understanding?: Record<string, unknown>;
   answer_synthesis?: Record<string, unknown>;
   answer_validation?: Record<string, unknown>;
-  runtime?: Record<string, unknown>;
+  runtime?: AnswerRuntime;
   session?: {
     session_id?: string;
     turns?: SessionTurn[];
@@ -298,5 +417,6 @@ export interface UserPreferences {
 export interface SearchResult {
   retriever?: string;
   effective_retriever?: string;
+  retrieval_runtime?: RetrievalRuntime;
   hits?: EvidenceItem[];
 }

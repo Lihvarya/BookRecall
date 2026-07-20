@@ -523,9 +523,7 @@ def _semantic_suggestions(question: str) -> list[str]:
 
 
 def _extract_exact_keyword(question: str, preferred: str = "") -> str:
-    preferred = preferred.strip()
-    if preferred:
-        return preferred.strip("“”\"'《》【】[]()（）")
+    preferred = preferred.strip().strip("“”\"'《》【】[]()（）")
     quoted = re.findall(r"[“\"'《【\[]([^”\"'》】\]]{2,24})[”\"'》】\]]", question)
     for item in quoted:
         item = item.strip()
@@ -560,6 +558,12 @@ def _extract_exact_keyword(question: str, preferred: str = "") -> str:
         "关系",
         "线索",
         "条件",
+        "的观点",
+        "观点",
+        "前后",
+        "有什么",
+        "含义",
+        "意义",
         "吗",
         "呢",
     )
@@ -571,7 +575,13 @@ def _extract_exact_keyword(question: str, preferred: str = "") -> str:
             break
     cut = cut.strip(" 的 了 和 与 在 中 里")
     if 2 <= len(cut) <= 24:
-        return cut
+        if not preferred:
+            return cut
+        if cut.startswith(preferred) and len(cut) >= len(preferred) + 2:
+            return cut
+        return preferred
+    if preferred:
+        return preferred
     tokens = [token.strip(" 的 了 和 与 在 中 里") for token in text.split(" ") if token.strip()]
     candidates = [token for token in tokens if 2 <= len(token) <= 24]
     if not candidates:

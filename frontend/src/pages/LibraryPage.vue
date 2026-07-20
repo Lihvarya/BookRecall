@@ -1,10 +1,22 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { storeToRefs } from "pinia";
 import { useBookRecallStore } from "@/stores/bookrecall";
-import type { EvidenceItem } from "@/types";
+import type { EvidenceItem, ModelCheckResult } from "@/types";
 
 const store = useBookRecallStore();
 const { state, groups, visibleBooks, currentVectorIndex, dependencyCards } = storeToRefs(store);
+const modelCheckLabels: Record<string, string> = {
+  embedding: "Embedding",
+  reranker: "Reranker",
+  local_llm: "本地 Qwen"
+};
+const modelCheckItems = computed(() =>
+  Object.entries(state.value.modelChecks).filter((item): item is [string, ModelCheckResult] => Boolean(item[1]))
+);
+const currentVectorNeedsRebuild = computed(
+  () => Boolean(currentVectorIndex.value?.built) && currentVectorIndex.value?.recommended_model_match === false
+);
 
 function run(action: () => Promise<void>) {
   action().catch((error: Error) => store.reportError(error, "书库工作台操作失败"));
@@ -17,6 +29,26 @@ function openBook(bookId: string) {
 
 function evidenceText(item: EvidenceItem) {
   return item.excerpt || item.child_text || "";
+}
+
+function modelCheckSummary(result: ModelCheckResult) {
+  if (!result.ok) {
+    return result.error || "自检失败";
+  }
+  const parts = [result.resolved_model || result.configured_model || result.mode || "已连接"];
+  if (result.device) parts.push(`设备 ${result.device}`);
+  if (result.dimension) parts.push(`${result.dimension} 维`);
+  if (result.score !== undefined) parts.push(`分数 ${result.score}`);
+  if (result.available_models?.length) parts.push(`服务模型 ${result.available_models.join(", ")}`);
+  if (result.cache_reused !== undefined) parts.push(result.cache_reused ? "复用缓存" : "首次加载");
+  if (result.elapsed_ms !== undefined) parts.push(`${(result.elapsed_ms / 1000).toFixed(2)} 秒`);
+  return parts.join(" · ");
+}
+
+function compactModelName(value?: string) {
+  if (!value) return "未知模型";
+  const parts = value.replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts[parts.length - 1] || value;
 }
 </script>
 
@@ -35,7 +67,7 @@ function evidenceText(item: EvidenceItem) {
       </article>
       <article>
         <span class="pill">Vector</span>
-        <strong>{{ currentVectorIndex?.built ? "已构建" : "未构建" }}</strong>
+        <strong>{{ currentVectorNeedsRebuild ? "需重建" : currentVectorIndex?.built ? "已构建" : "未构建" }}</strong>
         <small>{{ currentVectorIndex?.backend || "等待索引" }}</small>
       </article>
     </div>
@@ -188,6 +220,24 @@ function evidenceText(item: EvidenceItem) {
           <span :class="ready ? 'ok' : 'bad'">{{ ready ? "可用" : "缺失" }}</span>
         </article>
       </div>
+      <div class="mt-3 flex flex-wrap gap-3">
+        <button class="ghost-button" type="button" :disabled="Boolean(state.checkingModel)" @click="run(() => store.checkModel('embedding'))">
+          {{ state.checkingModel === "embedding" ? "检查中..." : "自检 Embedding" }}
+        </button>
+        <button class="ghost-button" type="button" :disabled="Boolean(state.checkingModel)" @click="run(() => store.checkModel('reranker'))">
+          {{ state.checkingModel === "reranker" ? "检查中..." : "自检 Reranker" }}
+        </button>
+        <button class="ghost-button" type="button" :disabled="Boolean(state.checkingModel)" @click="run(() => store.checkModel('local_llm'))">
+          {{ state.checkingModel === "local_llm" ? "检查中..." : "自检本地 Qwen" }}
+        </button>
+      </div>
+      <div v-if="modelCheckItems.length" class="dependency-grid mt-3">
+        <article v-for="[component, result] in modelCheckItems" :key="component">
+          <strong>{{ modelCheckLabels[component] || component }}</strong>
+          <span :class="result.ok ? 'ok' : 'bad'">{{ result.ok ? "通过" : "失败" }}</span>
+          <small>{{ modelCheckSummary(result) }}</small>
+        </article>
+      </div>
       <div class="form-grid mt-5">
         <label>
           Embedding 模型
@@ -215,7 +265,7 @@ function evidenceText(item: EvidenceItem) {
         </label>
         <label>
           重排候选数
-          <input v-model="state.form.rerankCandidates" type="number" min="4" max="100" class="field" placeholder="推荐 50" />
+          <input v-model="state.form.rerankCandidates" type="number" min="4" max="100" class="field" placeholder="3060 推荐 6" />
         </label>
         <label class="check-line">
           <input v-model="state.form.rerankEnabled" type="checkbox" />
@@ -225,7 +275,19 @@ function evidenceText(item: EvidenceItem) {
       </div>
       <div class="mt-3 flex flex-wrap gap-3">
         <span class="pill">{{ currentVectorIndex?.built ? "当前书向量索引已构建" : "当前书向量索引未构建" }}</span>
+        <span v-if="currentVectorIndex?.built" class="pill">
+          {{ compactModelName(currentVectorIndex.model_name) }} · {{ currentVectorIndex.backend }} · {{ currentVectorIndex.chunk_count || 0 }} chunks
+        </span>
         <button class="danger-button" type="button" @click="run(() => store.deleteCurrentVectorIndex())">删除当前书向量索引</button>
+      </div>
+      <div v-if="currentVectorNeedsRebuild" class="retrieval-feedback retrieval-feedback-error mt-3">
+        <div>
+          <strong>当前书仍使用旧向量模型</strong>
+          <p>
+            索引记录为 {{ currentVectorIndex?.model_name }}，当前推荐 {{ currentVectorIndex?.recommended_model }}。
+            问答会继续按旧索引自己的模型加载，不会混算，但需要重建后才会真正切换到 Qwen3 Embedding。
+          </p>
+        </div>
       </div>
       <div class="empty-state mt-4 text-left">{{ state.vectorResult }}</div>
     </div>
@@ -256,6 +318,13 @@ function evidenceText(item: EvidenceItem) {
         <div class="retrieval-result-meta mt-3">
           <span class="pill">{{ state.searchResult.hits?.length || 0 }} 条证据</span>
           <span>{{ state.searchResult.effective_retriever || state.searchResult.retriever || "未知检索器" }}</span>
+          <span v-if="state.searchResult.retrieval_runtime?.vector_model">
+            {{ compactModelName(state.searchResult.retrieval_runtime.vector_model) }} ·
+            {{ state.searchResult.retrieval_runtime.vector_backend || "未知后端" }}
+          </span>
+          <span>
+            {{ state.searchResult.retrieval_runtime?.reranker_enabled ? "Reranker 已生效" : "Reranker 未生效" }}
+          </span>
           <span v-if="state.searchElapsedMs !== null">{{ (state.searchElapsedMs / 1000).toFixed(2) }} 秒</span>
         </div>
         <div v-if="state.searchResult.hits?.length" class="evidence-grid mt-3">

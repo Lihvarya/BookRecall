@@ -44,6 +44,7 @@ class EntityRecord:
     first_chapter_number: int
     aliases: list[str] = field(default_factory=list)
     mentions: list[EntityMention] = field(default_factory=list)
+    confidence: float | None = None
 
 
 @dataclass(slots=True)
@@ -62,6 +63,7 @@ class RelationRecord:
     relation_type: str
     first_chapter_number: int
     mentions: list[RelationMention] = field(default_factory=list)
+    confidence: float | None = None
 
 
 @dataclass(slots=True)
@@ -88,6 +90,7 @@ class EventRecord:
     summary: str
     excerpt: str
     entities: list[str] = field(default_factory=list)
+    confidence: float | None = None
 
 
 @dataclass(slots=True)

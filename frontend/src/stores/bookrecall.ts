@@ -9,9 +9,13 @@ import type {
   ChapterSummary,
   CloudProvider,
   DiagnosticsStatus,
+  DynamicAuditRecord,
+  DynamicAuditReviewResult,
+  DynamicAuditStats,
   EntitySummary,
   EventSummary,
   IndexJob,
+  ModelCheckResult,
   RelationSummary,
   RuntimeStatus,
   SearchResult,
@@ -88,6 +92,8 @@ interface BookRecallState {
   themes: ThemeSummary[];
   events: EventSummary[];
   relations: RelationSummary[];
+  dynamicAuditRecords: DynamicAuditRecord[];
+  dynamicAuditStats: DynamicAuditStats;
   chapters: ChapterSummary[];
   stats: Record<string, number>;
   sessions: SessionSummary[];
@@ -108,6 +114,8 @@ interface BookRecallState {
   isSearching: boolean;
   isIndexing: boolean;
   indexJob: IndexJob | null;
+  modelChecks: Record<string, ModelCheckResult | null>;
+  checkingModel: string;
   lastError: {
     message: string;
     context?: string;
@@ -157,6 +165,18 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     themes: [] as ThemeSummary[],
     events: [] as EventSummary[],
     relations: [] as RelationSummary[],
+    dynamicAuditRecords: [] as DynamicAuditRecord[],
+    dynamicAuditStats: {
+      tracked: {},
+      by_status: {},
+      dynamic_totals: {},
+      legacy_untracked: {},
+      tracked_total: 0,
+      legacy_untracked_total: 0,
+      pending_total: 0,
+      confirmed_total: 0,
+      rejected_total: 0
+    } as DynamicAuditStats,
     chapters: [] as ChapterSummary[],
     stats: {} as Record<string, number>,
     sessions: [] as SessionSummary[],
@@ -177,6 +197,8 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     isSearching: false,
     isIndexing: false,
     indexJob: null,
+    modelChecks: {} as Record<string, ModelCheckResult | null>,
+    checkingModel: "",
     lastError: null,
     buildResult: "推荐选择本地 TXT 文件导入；页面只显示文件摘要，不预览全文。",
     vectorResult: "默认架构：Qwen3-Embedding-0.6B 粗召回 + Qwen3-Reranker-0.6B 精排；旧索引需重建后才会切到 Qwen embedding。",
@@ -223,7 +245,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
       vectorBatchSize: 64,
       rerankEnabled: true,
       rerankModel: "Qwen/Qwen3-Reranker-0.6B",
-      rerankCandidates: 20,
+      rerankCandidates: 6,
       searchQuery: "",
       searchLimit: 6,
       policy: "auto",
@@ -520,7 +542,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     state.form.bookGroup = book.book_group || "";
     state.form.bookTags = (book.tags || []).join(", ");
     const bookPath = `/api/books/${encodeURIComponent(state.currentBookId)}`;
-    const [entities, chapters, progress, preferences, session, sessions, stats, themes, events, relations] =
+    const [entities, chapters, progress, preferences, session, sessions, stats, themes, events, relations, dynamicAudit] =
       await Promise.all([
         requestJson<{ entities: EntitySummary[] }>(`${bookPath}/entities`),
         requestJson<{ chapters: ChapterSummary[] }>(`${bookPath}/chapters?limit=80`),
@@ -541,7 +563,10 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
         requestJson<{ stats: Record<string, number> }>(`${bookPath}/stats`),
         requestJson<{ themes: ThemeSummary[] }>(`${bookPath}/themes`),
         requestJson<{ events: EventSummary[] }>(`${bookPath}/events?limit=20`),
-        requestJson<{ relations: RelationSummary[] }>(`${bookPath}/relations?limit=40`)
+        requestJson<{ relations: RelationSummary[] }>(`${bookPath}/relations?limit=40`),
+        requestJson<{ records: DynamicAuditRecord[]; stats: DynamicAuditStats }>(
+          `${bookPath}/dynamic-audit?limit=100`
+        )
       ]);
 
     state.entities = entities.entities || [];
@@ -557,8 +582,43 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     state.themes = themes.themes || [];
     state.events = events.events || [];
     state.relations = relations.relations || [];
+    state.dynamicAuditRecords = dynamicAudit.records || [];
+    state.dynamicAuditStats = dynamicAudit.stats || {
+      tracked: {},
+      by_status: {},
+      dynamic_totals: {},
+      legacy_untracked: {},
+      tracked_total: 0,
+      legacy_untracked_total: 0,
+      pending_total: 0,
+      confirmed_total: 0,
+      rejected_total: 0
+    };
     updateCompareOptions();
     setStatus(`已加载《${book.title}》。`);
+  }
+
+  async function reviewDynamicAudit(
+    record: DynamicAuditRecord,
+    action: "confirm" | "correct" | "reject",
+    changes: { evidence?: string; summary?: string; confidence?: number; note?: string } = {}
+  ) {
+    if (!state.currentBookId) {
+      throw new Error("请先选择一本书。");
+    }
+    const data = await postJson<{ review: DynamicAuditReviewResult }>(
+      `/api/books/${encodeURIComponent(state.currentBookId)}/dynamic-audit/review`,
+      {
+        audit_id: record.audit_id,
+        action,
+        expected_review_version: record.review_version || 0,
+        ...changes
+      }
+    );
+    await loadBookDetails();
+    const labels = { confirm: "已确认", correct: "已修正并退回待审核", reject: "已拒绝并安全清理" };
+    setStatus(`动态索引记录${labels[action]}。`);
+    return data.review;
   }
 
   function updateCompareOptions() {
@@ -1026,9 +1086,30 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     return {
       enabled: state.form.rerankEnabled,
       model: state.form.rerankModel.trim(),
-      candidates: state.form.rerankCandidates ? Number(state.form.rerankCandidates) : 50,
-      batch_size: 8
+      candidates: state.form.rerankCandidates ? Number(state.form.rerankCandidates) : 6,
+      batch_size: 1,
+      max_chars: 384,
+      max_length: 512
     };
+  }
+
+  async function checkModel(component: "embedding" | "reranker" | "local_llm") {
+    state.checkingModel = component;
+    state.modelChecks[component] = null;
+    setStatus(`正在自检 ${component}...`);
+    const config =
+      component === "embedding"
+        ? { model: state.form.vectorModel.trim() }
+        : component === "reranker"
+          ? rerankPayload()
+          : localQwenPayload();
+    try {
+      const data = await postJson<{ check: ModelCheckResult }>("/api/models/check", { component, config });
+      state.modelChecks[component] = data.check;
+      setStatus(data.check.ok ? `${component} 自检通过。` : `${component} 自检失败。`);
+    } finally {
+      state.checkingModel = "";
+    }
   }
 
   async function deleteCurrentBook() {
@@ -1299,6 +1380,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     selectAgentTool,
     runSelectedAgentTool,
     loadBookDetails,
+    reviewDynamicAudit,
     loadSessionList,
     loadCurrentSessionDigest,
     deleteCurrentSession,
@@ -1314,6 +1396,7 @@ export const useBookRecallStore = defineStore("bookrecall", () => {
     deleteCurrentBook,
     buildVectorIndex,
     deleteCurrentVectorIndex,
+    checkModel,
     searchEvidence,
     saveUserPreferences,
     saveBookMetadata,

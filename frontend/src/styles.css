@@ -392,6 +392,22 @@ button {
   @apply break-all font-mono text-[11px] text-muted;
 }
 
+.turn-runtime-mini {
+  @apply mt-2 rounded-2xl border border-[#dfe7dc] bg-[#f8faf6] px-3 py-2;
+}
+
+.turn-runtime-mini > strong {
+  @apply text-[11px] font-black text-primaryDark;
+}
+
+.turn-runtime-mini > div {
+  @apply mt-1.5 flex flex-wrap gap-1.5;
+}
+
+.turn-runtime-mini span {
+  @apply rounded-full border border-white/80 bg-white/85 px-2.5 py-1 text-[10px] font-bold leading-none text-[#536157] shadow-sm;
+}
+
 .turn-evidence {
   @apply mt-3 rounded-2xl border border-line bg-[#fbfcf8] p-3;
 }
@@ -703,6 +719,178 @@ button {
 
 .index-stats-grid .stat-card strong {
   @apply text-xl;
+}
+
+.dynamic-audit-card {
+  @apply rounded-[24px] p-4;
+}
+
+.dynamic-audit-head {
+  @apply flex cursor-pointer list-none flex-col justify-between gap-3 rounded-2xl px-2 py-1 outline-none transition-colors hover:bg-primarySoft/50 md:flex-row md:items-center;
+}
+
+.dynamic-audit-head::-webkit-details-marker {
+  display: none;
+}
+
+.dynamic-audit-head h2 {
+  @apply mb-0 text-lg;
+}
+
+.dynamic-audit-head small {
+  @apply text-[11px] font-bold text-muted;
+}
+
+.dynamic-audit-summary {
+  @apply flex flex-wrap items-center gap-2;
+}
+
+.dynamic-audit-toggle {
+  @apply text-[11px] font-black text-primaryDark;
+}
+
+.dynamic-audit-card[open] .dynamic-audit-toggle {
+  font-size: 0;
+}
+
+.dynamic-audit-card[open] .dynamic-audit-toggle::after {
+  @apply text-[11px];
+  content: "点击收起";
+}
+
+.audit-pill-warning {
+  @apply border-[#ead9ae] bg-[#fff8e7] text-[#8a6417];
+}
+
+.audit-pill-confirmed {
+  @apply border-[#bfe1cd] bg-[#eef9f2] text-[#26734c];
+}
+
+.audit-pill-rejected {
+  @apply border-[#eccaca] bg-dangerSoft text-danger;
+}
+
+.dynamic-audit-body {
+  @apply mt-4 border-t border-line pt-4;
+}
+
+.dynamic-audit-notice {
+  @apply flex flex-col gap-1 rounded-2xl border border-primary/15 bg-primarySoft/55 px-4 py-3 text-xs text-[#4e6257] md:flex-row md:items-center md:gap-3;
+}
+
+.dynamic-audit-notice strong {
+  @apply shrink-0 font-black text-primaryDark;
+}
+
+.dynamic-audit-metrics {
+  @apply my-3 grid grid-cols-1 gap-2 sm:grid-cols-3;
+}
+
+.dynamic-audit-metrics article {
+  @apply grid grid-cols-[1fr_auto] items-center gap-x-3 rounded-2xl border border-line bg-white/65 px-3 py-2;
+}
+
+.dynamic-audit-metrics span,
+.dynamic-audit-metrics small {
+  @apply text-[11px] font-bold text-muted;
+}
+
+.dynamic-audit-metrics strong {
+  @apply row-span-2 text-lg font-black text-primaryDark;
+}
+
+.dynamic-audit-records {
+  @apply grid max-h-[560px] gap-2 overflow-y-auto pr-1;
+}
+
+.dynamic-audit-record {
+  @apply rounded-2xl border border-line bg-[#fbfcf8]/90 p-3;
+}
+
+.dynamic-audit-record header {
+  @apply flex items-start justify-between gap-3;
+}
+
+.dynamic-audit-record header > div {
+  @apply flex flex-wrap items-center gap-1.5;
+}
+
+.dynamic-audit-record-title {
+  @apply mt-2 block break-words text-sm font-black text-ink;
+}
+
+.audit-confidence {
+  @apply text-[11px] font-black text-primaryDark;
+}
+
+.audit-status {
+  @apply rounded-full px-2.5 py-1 text-[10px] font-black;
+}
+
+.audit-status-active {
+  @apply bg-[#fff5dc] text-[#8a6417];
+}
+
+.audit-status-confirmed {
+  @apply bg-[#e8f7ee] text-[#26734c];
+}
+
+.audit-status-rejected {
+  @apply bg-dangerSoft text-danger;
+}
+
+.dynamic-audit-record blockquote {
+  @apply my-2 line-clamp-4 rounded-xl border-l-2 border-primary/40 bg-white/70 px-3 py-2 text-xs leading-5 text-[#3f4c43];
+}
+
+.dynamic-audit-record dl {
+  @apply grid grid-cols-1 gap-2 text-[11px] md:grid-cols-2 xl:grid-cols-4;
+}
+
+.dynamic-audit-record dl > div {
+  @apply min-w-0;
+}
+
+.dynamic-audit-record dt {
+  @apply font-black text-muted;
+}
+
+.dynamic-audit-record dd {
+  @apply mt-0.5 break-words text-[#344139];
+}
+
+.audit-review-note,
+.audit-protected-note {
+  @apply mt-2 rounded-xl bg-[#f2f5ef] px-3 py-2 text-[11px] leading-5 text-[#59675d];
+}
+
+.audit-protected-note {
+  @apply border border-[#ead9ae] bg-[#fff8e7] text-[#7a5a19];
+}
+
+.audit-record-actions {
+  @apply mt-3 flex flex-wrap gap-2 border-t border-line/70 pt-3;
+}
+
+.audit-correction-form {
+  @apply mt-3 space-y-3 rounded-2xl border border-primary/20 bg-primarySoft/35 p-3;
+}
+
+.audit-correction-form label {
+  @apply flex flex-col gap-1.5 text-[11px] font-black text-[#455249];
+}
+
+.audit-correction-form input,
+.audit-correction-form textarea {
+  @apply w-full rounded-xl border border-line bg-white px-3 py-2 text-xs font-normal leading-5 text-ink outline-none transition focus:border-primary/50 focus:ring-4 focus:ring-primary/10;
+}
+
+.audit-correction-form textarea {
+  @apply resize-y;
+}
+
+.audit-correction-row {
+  @apply grid grid-cols-1 gap-3 md:grid-cols-[140px_minmax(0,1fr)];
 }
 
 .stat-card span {

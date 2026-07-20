@@ -36,6 +36,7 @@ class BookRecallAgent:
         reasoner: OpenAICompatibleReasoner | None = None,
         query_understanding_client: JsonCompleter | None = None,
         force_exact_search: bool = False,
+        execution_runtime: dict[str, object] | None = None,
     ) -> None:
         self.store = store
         self.retriever = retriever or LocalRetriever(store, DEFAULT_SEARCH_SETTINGS)
@@ -43,6 +44,7 @@ class BookRecallAgent:
         self.query_understanding_client = query_understanding_client
         self._injected_policy = policy
         self.force_exact_search = force_exact_search
+        self.execution_runtime = dict(execution_runtime or {})
 
     def _select_policy(self) -> DecisionPolicy:
         if self._injected_policy is not None:
@@ -73,7 +75,12 @@ class BookRecallAgent:
             state.intent = "causal"
             state.query_understanding["policy_override"] = "deterministic_fact_verification"
         if self.force_exact_search:
-            self._run_forced_exact_search(state, registry)
+            self._run_forced_exact_search(state, registry, source="user")
+        elif _should_prioritize_exact_keyword(
+            state.question,
+            state.primary_entity or (state.matched_themes[0] if state.matched_themes else ""),
+        ):
+            self._run_forced_exact_search(state, registry, source="auto_long_proper_noun")
 
         llm_failures = 0
         max_llm_failures = 2
@@ -115,12 +122,13 @@ class BookRecallAgent:
         self._persist_session_turn(state, card)
         return card
 
-    def _run_forced_exact_search(self, state: AgentState, registry: ToolRegistry) -> None:
+    def _run_forced_exact_search(self, state: AgentState, registry: ToolRegistry, *, source: str) -> None:
         keyword = _extract_exact_keyword(state.question, state.primary_entity or "")
         if not keyword:
             return
         state.query_understanding["force_exact_search"] = True
         state.query_understanding["forced_exact_keyword"] = keyword
+        state.query_understanding["exact_search_source"] = source
         # A long proper noun such as “自由残缺变” should not be hijacked by the short theme “自由”.
         state.matched_themes = [theme for theme in state.matched_themes if theme == keyword or theme not in keyword]
         if state.intent == "theme_explore" and not state.matched_themes:
@@ -132,7 +140,11 @@ class BookRecallAgent:
         call = ToolCall(
             name="search_exact_text",
             arguments={"keyword": keyword, "limit": 16},
-            thought="用户开启强制原文检索，先全书精确定位该词出现上下文",
+            thought=(
+                "用户开启强制原文检索，先全书精确定位该词出现上下文"
+                if source == "user"
+                else "检测到完整专名被短实体覆盖，先按完整词做原文精确定位"
+            ),
         )
         started = perf_counter()
         result = tool.run(state, self._clamp_max_chapter(tool, call.arguments, state.progress_chapter))
@@ -457,6 +469,9 @@ class BookRecallAgent:
                 entity_records=entity_records,
                 relation_records=relation_records,
                 event_records=event_records,
+                source_query=state.question,
+                source_model=str(report.get("source_model") or ""),
+                quality_gate=str(report.get("quality_gate") or ""),
             )
             report = dict(report)
             report["writes"] = writes
@@ -642,6 +657,7 @@ class BookRecallAgent:
                 }
                 for item in card.evidence
             ],
+            runtime=self.execution_runtime,
         )
 
     @staticmethod
@@ -787,6 +803,23 @@ def _synthesis_respects_explicit_death(answer: str, chapter_number: int) -> bool
     chapter_markers = (f"第{chapter_number}章", f"{chapter_number}章")
     contradictions = ("并未死亡", "没有死亡", "尚未死亡", "仍然存活", "还活着", "无法确认", "证据不足")
     return any(marker in normalized for marker in chapter_markers) and not any(marker in normalized for marker in contradictions)
+
+
+def _should_prioritize_exact_keyword(question: str, primary_entity: str) -> bool:
+    primary = primary_entity.strip()
+    if not primary:
+        return False
+    keyword = _extract_exact_keyword(question, primary)
+    if keyword == primary or not keyword.startswith(primary):
+        return False
+    remainder = keyword[len(primary) :].strip()
+    if len(remainder) < 2:
+        return False
+    if any(connector in remainder for connector in ("和", "与", "跟", "及", "以及")):
+        return False
+    if any(generic in remainder for generic in ("观点", "前后", "变化", "含义", "意义", "作用", "用途")):
+        return False
+    return len(keyword) <= 24
 
 
 def _public_preferences(preferences: dict[str, object]) -> dict[str, object]:

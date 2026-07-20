@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -184,14 +185,16 @@ class SentenceTransformerEmbedder:
             self.model_name,
             cache_folder=str(self.cache_dir) if self.cache_dir is not None else None,
         )
+        self._encode_lock = threading.Lock()
 
     def encode(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
-        vectors = self._model.encode(
-            texts,
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        with self._encode_lock:
+            vectors = self._model.encode(
+                texts,
+                batch_size=batch_size,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
         return vectors.tolist()
 
 
@@ -202,6 +205,8 @@ class CrossEncoderReranker:
         *,
         cache_dir: str | Path | None = None,
         batch_size: int = DEFAULT_RERANK_SETTINGS.batch_size,
+        max_chars: int = DEFAULT_RERANK_SETTINGS.max_chars,
+        max_length: int = DEFAULT_RERANK_SETTINGS.max_length,
     ) -> None:
         if importlib.util.find_spec("sentence_transformers") is None:
             raise LocalModelError(
@@ -213,6 +218,8 @@ class CrossEncoderReranker:
         self.model_name = resolve_local_model_path(model_name)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         self.batch_size = batch_size
+        self.max_chars = max(160, int(max_chars))
+        self.max_length = max(256, int(max_length))
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -220,18 +227,22 @@ class CrossEncoderReranker:
                 self.model_name,
                 cache_folder=str(self.cache_dir) if self.cache_dir is not None else None,
                 trust_remote_code=True,
+                max_length=self.max_length,
             )
         except TypeError:
             self._model = CrossEncoder(
                 self.model_name,
                 cache_folder=str(self.cache_dir) if self.cache_dir is not None else None,
+                max_length=self.max_length,
             )
+        self._score_lock = threading.Lock()
 
     def score(self, query: str, documents: list[str]) -> list[float]:
         if not documents:
             return []
-        pairs = [(query, _clip_rerank_text(document)) for document in documents]
-        scores = self._model.predict(pairs, batch_size=self.batch_size)
+        pairs = [(query, _clip_rerank_text(document, self.max_chars)) for document in documents]
+        with self._score_lock:
+            scores = self._model.predict(pairs, batch_size=self.batch_size)
         return [_score_to_float(item) for item in scores]
 
 
@@ -250,7 +261,8 @@ class RerankingRetriever:
         candidates = self.base.search(book_id, query, max_chapter=max_chapter)
         if len(candidates) <= 1:
             return candidates[: self.settings.top_k_parents]
-        documents = [hit.parent_text or hit.child_text for hit in candidates]
+        max_chars = int(getattr(self.reranker, "max_chars", DEFAULT_RERANK_SETTINGS.max_chars))
+        documents = [_rerank_document(hit, max_chars) for hit in candidates]
         scores = self.reranker.score(query, documents)
         reranked: list[SearchHit] = []
         for hit, score in zip(candidates, scores):
@@ -268,7 +280,32 @@ class RerankingRetriever:
         return reranked[: self.settings.top_k_parents]
 
 
-def _clip_rerank_text(text: str, limit: int = 1400) -> str:
+def _rerank_document(hit: SearchHit, limit: int) -> str:
+    child = str(hit.child_text or "").strip()
+    parent = str(hit.parent_text or "").strip()
+    if not parent:
+        return _clip_rerank_text(child, limit)
+    if len(parent) <= limit:
+        return parent
+
+    anchor = child[: min(len(child), 120)]
+    position = parent.find(anchor) if anchor else -1
+    if position < 0:
+        if not child:
+            return parent[:limit]
+        remaining = max(0, limit - len(child) - 1)
+        return f"{child}\n{parent[:remaining]}"[:limit]
+
+    child_end = min(len(parent), position + len(child))
+    context_budget = max(0, limit - (child_end - position))
+    left = max(0, position - context_budget // 2)
+    right = min(len(parent), child_end + (context_budget - (position - left)))
+    if right - left < limit and left > 0:
+        left = max(0, right - limit)
+    return parent[left:right]
+
+
+def _clip_rerank_text(text: str, limit: int = DEFAULT_RERANK_SETTINGS.max_chars) -> str:
     normalized = str(text or "").strip()
     if len(normalized) <= limit:
         return normalized

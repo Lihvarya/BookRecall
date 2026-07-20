@@ -120,6 +120,37 @@ class NarrativeSmartClient:
         }
 
 
+class HallucinatingEventClient:
+    def complete_json(self, prompt: str) -> dict:
+        return {
+            "relations": [
+                {
+                    "source": "林澈",
+                    "target": "黑衣人",
+                    "type": "冲突",
+                    "evidence": "林澈和黑衣人同时站在雨中。",
+                    "confidence": 0.99,
+                }
+            ],
+            "events": [
+                {
+                    "type": "转折/后果",
+                    "summary": "林澈被黑衣人杀害死亡",
+                    "evidence": "林澈面对死亡，终于感到恐惧。",
+                    "entities": ["林澈", "黑衣人"],
+                    "confidence": 0.99,
+                },
+                {
+                    "type": "冲突/危机",
+                    "summary": "黑衣人袭击林澈",
+                    "evidence": "黑衣人突然袭击林澈，林澈受伤倒地。",
+                    "entities": ["林澈", "黑衣人"],
+                    "confidence": 0.9,
+                },
+            ],
+        }
+
+
 class SmartIndexTest(unittest.TestCase):
     def test_llm_entity_reviewer_filters_function_words(self) -> None:
         chapters = parse_chapters("第1章 阴影\n\n黑衣人在雨里出现，林澈与黑衣人对峙。")
@@ -229,6 +260,28 @@ class SmartIndexTest(unittest.TestCase):
         self.assertIn("流转：星辰之匙：黑衣人 -> 林澈", summaries)
         self.assertIn("因果：林澈发现星辰之匙的刻痕 -> 他决定打开石门", summaries)
         self.assertIn("伏笔回收：旧书提到星辰之匙能开门 -> 星辰之匙打开石门", summaries)
+
+    def test_smart_index_rejects_atmosphere_as_death_and_repairs_relation_evidence(self) -> None:
+        chapters = parse_chapters(
+            "第1章 雨夜\n\n"
+            "林澈和黑衣人同时站在雨中。林澈面对死亡，终于感到恐惧。"
+            "黑衣人突然袭击林澈，林澈受伤倒地。"
+        )
+        entity_records = build_entity_records(chapters, {"林澈": [], "黑衣人": []}, DEFAULT_CHUNK_SETTINGS)
+
+        relations, events = build_smart_relation_event_records(
+            chapters,
+            entity_records,
+            DEFAULT_CHUNK_SETTINGS,
+            HallucinatingEventClient(),
+        )
+
+        self.assertEqual(len(relations), 1)
+        self.assertIn("袭击", relations[0].mentions[0].excerpt)
+        self.assertNotIn("同时站在雨中", relations[0].mentions[0].excerpt)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].summary, "黑衣人袭击林澈")
+        self.assertNotIn("死亡", events[0].summary)
 
     def test_rule_relation_fallback_uses_sentence_window_not_whole_chapter(self) -> None:
         chapters = parse_chapters(

@@ -1,0 +1,3 @@
+{"id":"venerable-four-conditions","book_id":"gu","query":"成为尊者条件是什么？","relevant_chapters":[2099],"evidence_terms":["白荔仙元","三十万规模","无上大宗师","天道封锁"],"max_chapter":2099,"tags":["conditions","enumeration"],"note":"条件枚举问题，防止 Planner 召回无关尊者章节。"}
+{"id":"tai-bai-yun-sheng-death","book_id":"gu","query":"太白云生怎么死的？","relevant_chapters":[1287],"evidence_terms":["太白云生","方源","死了"],"max_chapter":1287,"tags":["death","fact"],"note":"死亡事实必须命中直接死亡章节，不能停留在早期冲突。"}
+{"id":"freedom-incomplete-transformation","book_id":"gu","query":"自由残缺变是什么？","relevant_chapters":[1969,1970,1971,1972],"evidence_terms":["自由残缺变"],"max_chapter":1972,"tags":["rare-entity","killer-move"],"note":"完整专名不能被拆成普通词“自由”。"}
